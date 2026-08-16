@@ -20,25 +20,24 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import collections, json, math, sys, urllib.request
+          import collections, json, urllib.request
 
           ROOT='https://huggingface.co/moonshotai/Kimi-K3/resolve/main/'
-          INDEX=ROOT+'model.safetensors.index.json'
+          # Known official shards. We need only their safetensors headers plus bounded
+          # BF16 windows; never the full 16-17 GB objects.
+          SHARDS=[
+              'model-00035-of-000096.safetensors',
+              'model-00038-of-000096.safetensors',
+              'model-00026-of-000096.safetensors',
+              'model-00015-of-000096.safetensors',
+          ]
           MAX_HEADER=64 << 20
           TARGET_SAMPLE=96 << 20
           PIECE=4 << 20
 
-          def get_full(url, limit=32<<20):
-              req=urllib.request.Request(url, headers={'User-Agent':'k3-lossless-research/1'})
-              with urllib.request.urlopen(req, timeout=60) as r:
-                  data=r.read(limit+1)
-                  if len(data)>limit:
-                      raise RuntimeError(f'refusing oversized non-range response from {url}')
-                  return data
-
           def get_range(url, start, end):
               req=urllib.request.Request(url, headers={
-                  'User-Agent':'k3-lossless-research/1',
+                  'User-Agent':'k3-lossless-research/2',
                   'Range':f'bytes={start}-{end}',
               })
               with urllib.request.urlopen(req, timeout=90) as r:
@@ -54,29 +53,17 @@ jobs:
                       raise RuntimeError(f'short/oversized range: wanted {want}, got {len(data)}')
                   return data
 
-          idx=json.loads(get_full(INDEX).decode())
-          wm=idx['weight_map']
-          # Rank shards by number of non-expert layer tensors so the sample covers trunk,
-          # not the MXFP4 routed-expert payload that the exact trunk never stores.
-          score=collections.Counter()
-          for name, shard in wm.items():
-              if name.startswith('language_model.model.layers.') and '.block_sparse_moe.experts.' not in name:
-                  score[shard]+=1
-          if not score:
-              raise RuntimeError('no non-expert layer tensors in weight map')
-          shards=[s for s,_ in score.most_common(4)]
-          print('candidate shards:',[(s,score[s]) for s in shards],flush=True)
-
           hist=[0]*256
           sampled=0
           tensors_used=[]
           layers_seen=set()
 
-          for shard in shards:
+          for shard in SHARDS:
               if sampled>=TARGET_SAMPLE: break
               url=ROOT+shard
               first=get_range(url,0,7)
               hlen=int.from_bytes(first,'little')
+              print(f'{shard}: header={hlen/1048576:.2f} MiB',flush=True)
               if hlen<=0 or hlen>MAX_HEADER:
                   raise RuntimeError(f'implausible safetensors header {hlen} bytes in {shard}')
               hdr=json.loads(get_range(url,8,8+hlen-1).decode())
@@ -91,35 +78,30 @@ jobs:
                   try: layer=int(name.split('.layers.',1)[1].split('.',1)[0])
                   except Exception: layer=-1
                   candidates.append((layer,-(b-a),name,a,b))
-              # Prefer a spread of layers, then large tensors within each layer.
               candidates.sort()
+              print(f'  non-expert BF16 candidates={len(candidates)}',flush=True)
               for layer,negsize,name,a,b in candidates:
                   if sampled>=TARGET_SAMPLE: break
-                  if layer in layers_seen and len(layers_seen)<8: continue
+                  if layer in layers_seen and len(layers_seen)<12: continue
                   size=b-a
                   take=min(PIECE,size)
                   take-=take&1
                   if take<=0: continue
-                  # Sample the middle, avoiding any systematic tensor-edge metadata effect.
                   rel=a+(size-take)//2
                   rel-=rel&1
                   blob=get_range(url,data_base+rel,data_base+rel+take-1)
-                  highs=blob[1::2]
-                  for x,n in collections.Counter(highs).items(): hist[x]+=n
+                  for x,n in collections.Counter(blob[1::2]).items(): hist[x]+=n
                   sampled+=len(blob)
                   layers_seen.add(layer)
                   tensors_used.append((shard,layer,name,len(blob)))
-                  print(f'sampled {len(blob)/1048576:.1f} MiB layer {layer}: {name}',flush=True)
+                  print(f'  sampled {len(blob)/1048576:.1f} MiB layer {layer}: {name}',flush=True)
 
           words=sum(hist)
           if words==0: raise RuntimeError('sample is empty')
           order=sorted(range(256),key=lambda x:(-hist[x],x))
           def coverage(k): return sum(hist[x] for x in order[:k])/words
           c7,c15,c22=coverage(7),coverage(15),coverage(22)
-          f1=1-c7
-          f15=1-c15
-          f22=1-c22
-          # Ratios are against raw 2-byte BF16 words, excluding tiny block headers/padding.
+          f1,f15,f22=1-c7,1-c15,1-c22
           dict15=.75 + f15/2
           dict7_literal=.6875 + f1/2
           tiered=.6875 + f1/4 + f22/2
@@ -127,19 +109,19 @@ jobs:
           print('\n=== REAL K3 BF16 HIGH-BYTE SAMPLE ===')
           print(f'sampled_bytes={sampled} ({sampled/1048576:.1f} MiB) words={words}')
           print(f'layers={sorted(layers_seen)} tensors={len(tensors_used)}')
-          print('top22:',[(f'0x{x:02x}',hist[x],hist[x]/words) for x in order[:22]])
+          print('top22:',[(f'0x{x:02x}',hist[x],round(hist[x]/words,8)) for x in order[:22]])
           print(f'top7_coverage={c7:.8f}')
           print(f'top15_coverage={c15:.8f}')
           print(f'top22_coverage={c22:.8f}')
           print(f'predicted_dict15_ratio={dict15:.6f}')
           print(f'predicted_dict7_literal_ratio={dict7_literal:.6f}')
           print(f'predicted_dict7_tiered_ratio={tiered:.6f}')
-          print(f'tiered_vs_dict15_bytes={(tiered/dict15):.6f}')
+          print(f'tiered_vs_dict15_bytes={tiered/dict15:.6f}')
           print(f'tiered_extra_saving_pct={100*(dict15-tiered):.3f}')
           if tiered >= dict15:
               print('DECISION: tiered 3-bit codec is NOT worth pursuing on this sample')
           elif c7 < .80:
-              print('DECISION: size wins, but primary escape rate is high; decoder benchmark required')
+              print('DECISION: size wins, primary escape rate high; benchmark decoder before integration')
           else:
               print('DECISION: pursue tiered 3-bit decoder benchmark')
           PY
