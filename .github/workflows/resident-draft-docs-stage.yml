@@ -1,0 +1,33 @@
+name: Stage resident draft docs
+
+on:
+  push:
+    branches: ['feature/resident-sampled-draft']
+    paths:
+      - 'tools/apply_resident_draft_docs_stage.py'
+      - '.github/workflows/resident-draft-docs-stage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/resident-sampled-draft
+      - name: Apply guarded docs patch
+        run: python3 tools/apply_resident_draft_docs_stage.py
+      - name: Docs contract
+        run: |
+          grep -q 'exact trunk and the proposal trunk are both resident' local/README.md
+          grep -q 'Permanent tiny-checkpoint CI' local/README.md
+          ! grep -q 'Draft + resident worker:' local/README.md
+      - name: Commit validated docs
+        run: |
+          git config user.name Speedstu
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add local/README.md
+          git diff --cached --quiet || git commit -m 'docs: document resident probability-correct draft inference'
+          git push origin HEAD:feature/resident-sampled-draft
