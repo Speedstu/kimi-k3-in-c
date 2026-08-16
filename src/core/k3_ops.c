@@ -1387,7 +1387,6 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
     const __m128i mx_half_units = _mm_setr_epi8(
          0,  1,  2,  3,  4,  6,  8, 12,
          0, -1, -2, -3, -4, -6, -8,-12);
-    const __m256d mx_half = _mm256_set1_pd(0.5);
 #endif
 
 #ifdef _OPENMP
@@ -1418,37 +1417,46 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                     mx_half_units, _mm_and_si128(_mm_srli_epi16(b, 4), mx_mask));
                 const __m128i q0 = _mm_unpacklo_epi8(lo, hi);
                 const __m128i q1 = _mm_unpackhi_epi8(lo, hi);
+
+                /* Widen eight signed half-units at once. Splitting each 256-bit int
+                 * vector into two 128-bit halves feeds the exact same four-double FMA
+                 * lanes as before, but halves the number of int8->int32 conversions. */
+                const __m256i i0 = _mm256_cvtepi8_epi32(q0);
+                const __m256i i1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q0, 8));
+                const __m256i i2 = _mm256_cvtepi8_epi32(q1);
+                const __m256i i3 = _mm256_cvtepi8_epi32(_mm_srli_si128(q1, 8));
                 __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
 
-                /* Same lane ownership as the old wf[] AVX2 loop:
-                 * v0 gets 0..3,8..11,16..19,24..27; v1 gets the interleaving fours.
-                 * int->double and *0.5 are exact for every E2M1 code, and x float->double
-                 * is exact too, so each FMA sees the same operands in the same order. */
-#define K3_MX_DO4(V, Q, SHIFT, XOFF) do {                                      \
-                    const __m128i qq = _mm_cvtepi8_epi32(                       \
-                        _mm_srli_si128((Q), (SHIFT)));                           \
-                    const __m256d qw = _mm256_mul_pd(                           \
-                        _mm256_cvtepi32_pd(qq), mx_half);                        \
-                    (V) = _mm256_fmadd_pd(qw,                                   \
-                        _mm256_cvtps_pd(_mm_loadu_ps(xg + (XOFF))), (V));        \
+                /* These integers are exactly 2*E2M1. Summing products at twice the
+                 * magnitude and multiplying the group scale by 0.5 is an exact binary
+                 * rescaling: all source floats convert exactly to double, the integer
+                 * products fit easily in double precision, and the FMA/reduction order
+                 * is unchanged. The scalar-vs-AVX2 parity gate covers both real shapes. */
+#define K3_MX_F4(V, I128, XOFF) do {                                          \
+                    (V) = _mm256_fmadd_pd(_mm256_cvtepi32_pd((I128)),          \
+                        _mm256_cvtps_pd(_mm_loadu_ps(xg + (XOFF))), (V));       \
                 } while (0)
-                K3_MX_DO4(v0, q0,  0,  0); K3_MX_DO4(v1, q0,  4,  4);
-                K3_MX_DO4(v0, q0,  8,  8); K3_MX_DO4(v1, q0, 12, 12);
-                K3_MX_DO4(v0, q1,  0, 16); K3_MX_DO4(v1, q1,  4, 20);
-                K3_MX_DO4(v0, q1,  8, 24); K3_MX_DO4(v1, q1, 12, 28);
-#undef K3_MX_DO4
+                K3_MX_F4(v0, _mm256_castsi256_si128(i0),       0);
+                K3_MX_F4(v1, _mm256_extracti128_si256(i0, 1),  4);
+                K3_MX_F4(v0, _mm256_castsi256_si128(i1),       8);
+                K3_MX_F4(v1, _mm256_extracti128_si256(i1, 1), 12);
+                K3_MX_F4(v0, _mm256_castsi256_si128(i2),      16);
+                K3_MX_F4(v1, _mm256_extracti128_si256(i2, 1), 20);
+                K3_MX_F4(v0, _mm256_castsi256_si128(i3),      24);
+                K3_MX_F4(v1, _mm256_extracti128_si256(i3, 1), 28);
+#undef K3_MX_F4
                 double a[4];
                 _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
-                const double sub = (a[0] + a[1]) + (a[2] + a[3]);
-                acc += sub * (double)K3_E8M0[sb];
+                const double sub2 = (a[0] + a[1]) + (a[2] + a[3]);
+                acc += sub2 * ((double)K3_E8M0[sb] * 0.5);
                 continue;
             }
 #endif
 
             /* Generic/scalar fallback: expand the group to floats first, then take a
-             * plain dot product. Kept unchanged for non-K3 geometry and partial tails.
-             * split exists so the second loop can vectorise, which it cannot do while
-             * a table lookup sits in the middle of the accumulation. */
+             * plain dot product. Kept unchanged for non-K3 geometry and partial tails;
+             * the split lets the second loop vectorise without a table lookup inside
+             * the accumulation. */
             float wf[64];                         /* group is 32 for K3; 64 is headroom */
             const int half = n >> 1;
             for (int j = 0; j < half; j++) {

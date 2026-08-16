@@ -2,7 +2,7 @@ name: MXFP4 direct decode parity
 
 on:
   push:
-    branches: [speedboost/mxfp4-direct-decode]
+    branches: ['speedboost/mxfp4-*']
     paths:
       - 'src/core/k3_ops.c'
       - 'benchmarks/bench_mxfp4_exact.c'
