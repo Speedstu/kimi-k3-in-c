@@ -1,0 +1,94 @@
+name: Batched KDA BF16 prefill parity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [speedboost/prefill-batched-kda-bf16]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'tools/patch_prefill_batched_kda_bf16.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-kda-bf16-parity.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Apply exact KDA BF16 prefill transform once
+        run: python tools/patch_prefill_batched_kda_bf16.py
+
+      - name: Strict AVX2 build and full weightless oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build streamed KDA fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3kda /tmp/k3kda-trunk /tmp/k3kda-out
+          mkdir -p /tmp/k3kda-out
+          python tools/make_tiny_checkpoint.py /tmp/k3kda \
+            --seed 2030 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3kda/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3kda /tmp/k3kda-trunk "$NLAYERS"
+
+      - name: Per-token KDA BF16 vs batched KDA BF16 are binary-identical
+        run: |
+          set -euo pipefail
+          D=/tmp/k3kda-out
+          BASE='/tmp/k3kda --trunk /tmp/k3kda-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38 --gen 1 --incremental --temperature 0'
+          for T in 1 4; do
+            /usr/bin/time -f "old_t${T}_wall=%e" -o "$D/old-t${T}.time" \
+              env K3_NO_PREFILL_BATCH_KDA_BF16=1 ./bin/k3 $BASE --threads "$T" \
+              --dump-logits "$D/old-t${T}.logits" --out "$D/old-t${T}.json" >"$D/old-t${T}.log" 2>&1
+            /usr/bin/time -f "batch_t${T}_wall=%e" -o "$D/batch-t${T}.time" \
+              ./bin/k3 $BASE --threads "$T" \
+              --dump-logits "$D/batch-t${T}.logits" --out "$D/batch-t${T}.json" >"$D/batch-t${T}.log" 2>&1
+            cmp "$D/old-t${T}.logits" "$D/batch-t${T}.logits"
+            python3 - "$T" <<'PY'
+          import json, sys
+          d='/tmp/k3kda-out'; t=sys.argv[1]
+          a=json.load(open(f'{d}/old-t{t}.json')); b=json.load(open(f'{d}/batch-t{t}.json'))
+          assert a['generated_ids'] == b['generated_ids'], (a['generated_ids'], b['generated_ids'])
+          assert a['full_ids'] == b['full_ids']
+          print(f'threads={t}: binary logits + ids PASS')
+          print(open(f'{d}/old-t{t}.time').read().strip())
+          print(open(f'{d}/batch-t{t}.time').read().strip())
+          PY
+          done
+          echo 'BATCHED KDA BF16 PREFILL EXACTNESS PASS (1 + 4 threads)'
+
+      - name: Persist generated source after gates pass
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/core/k3_ops.c; then
+            echo 'source already committed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/core/k3_ops.c
+          git commit -m 'perf: batch exact KDA BF16 prefill projections'
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
