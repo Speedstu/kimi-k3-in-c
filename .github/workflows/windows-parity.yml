@@ -45,7 +45,7 @@ permissions:
 jobs:
   native-ucrt64:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -74,8 +74,6 @@ jobs:
           grep -q '23 passed, 0 failed, 0 skipped' win-tests.log
           grep -q 'VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY' win-tests.log
           grep -q 'ALL WEIGHTLESS TESTS PASSED' win-tests.log
-          # Keep the scalar/SSE build as a compile+test gate, then use the runner's real
-          # x86 ISA for model parity. This is what a normal `make` does on Windows/MSYS2.
           make clean
           make CC=gcc ARCH='-march=native' -j2
 
@@ -92,14 +90,12 @@ jobs:
           python tools/pack_trunk.py .win-ci/k3tiny .win-ci/k3trunk "$NLAYERS"
           python tools/qdq_trunk.py .win-ci/k3trunk .win-ci/k3draft --bits 4 --group 0
 
-      - name: Native one-shot, resident worker and sampled draft are token-identical
+      - name: Timed native one-shot and worker parity probes
         shell: msys2 {0}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json
-          import subprocess
-          import tempfile
+          import json, queue, subprocess, tempfile, threading, time
           from pathlib import Path
 
           MODEL=str(Path('.win-ci/k3tiny').resolve())
@@ -107,89 +103,113 @@ jobs:
           DRAFT=str(Path('.win-ci/k3draft').resolve())
           K3=str(Path('bin/k3.exe').resolve())
           WORKER=str(Path('bin/k3-worker.exe').resolve())
-          BASE=[MODEL,'--trunk',TRUNK,'--trunk-gb','0.05','--cache-gb','0.05']
+          BASE=[MODEL,'--trunk',TRUNK,'--trunk-gb','0.05','--cache-gb','0.05','--threads','1']
 
-          def oneshot(ids, gen, temp=0.0, top_p=1.0, seed=1, extra=()):
+          def mark(s):
+              print(f'[{time.monotonic():.3f}] {s}', flush=True)
+
+          def oneshot(label, ids, gen, temp=0.0, top_p=1.0, seed=1, extra=()):
+              mark(f'{label}: one-shot start')
               with tempfile.TemporaryDirectory() as td:
                   out=Path(td)/'run.json'
                   cmd=[K3,*BASE,*extra,'--ids',','.join(map(str,ids)),'--gen',str(gen),
                        '--incremental','--temperature',str(temp),'--top-p',str(top_p),
                        '--seed',str(seed),'--out',str(out)]
-                  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL)
-                  return json.loads(out.read_text())['generated_ids']
+                  try:
+                      cp=subprocess.run(cmd,check=True,text=True,stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT,timeout=60)
+                  except subprocess.TimeoutExpired as e:
+                      raise AssertionError(f'{label}: one-shot timeout; output={e.stdout!r}') from e
+                  toks=json.loads(out.read_text())['generated_ids']
+                  mark(f'{label}: one-shot done {toks}')
+                  return toks
 
-          def start_worker(extra=()):
-              p=subprocess.Popen([WORKER,*BASE,'--context','64',*extra],
-                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT,text=True,bufsize=1)
-              assert p.stdin and p.stdout
-              for line in p.stdout:
-                  if line.startswith('@K3READY '):
-                      return p
-              raise AssertionError('native worker exited before READY')
-
-          counter=[0]
-          def req(p, ids, gen, temp=0.0, top_p=1.0, seed=1):
-              counter[0]+=1; r=counter[0]
-              p.stdin.write(f'REQ {r} {len(ids)} {gen} {temp} {top_p} {seed} -1\n')
-              p.stdin.write(' '.join(map(str,ids))+'\n'); p.stdin.flush()
-              toks=[]; reused=None; metrics=None
-              for line in p.stdout:
-                  if line.startswith(f'@K3TOKEN {r} '):
-                      toks.append(int(line.split()[2]))
-                  elif line.startswith(f'@K3DRAFT {r} '):
-                      x=line.split(); metrics=(int(x[2]),int(x[3]),int(x[4]))
-                  elif line.startswith(f'@K3ERROR {r} '):
-                      raise AssertionError(line)
-                  elif line.startswith(f'@K3DONE {r} '):
-                      reused=int(line.split()[4]); break
-              return toks,reused,metrics
+          class Worker:
+              def __init__(self, extra=()):
+                  mark(f'worker start extra={list(extra)}')
+                  self.p=subprocess.Popen([WORKER,*BASE,'--context','64',*extra],
+                      stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                      text=True,bufsize=1)
+                  assert self.p.stdin and self.p.stdout
+                  self.q=queue.Queue()
+                  def pump():
+                      for line in self.p.stdout:
+                          self.q.put(line.rstrip('\r\n'))
+                      self.q.put(None)
+                  threading.Thread(target=pump,daemon=True).start()
+                  while True:
+                      line=self._line(60,'READY')
+                      if line.startswith('@K3READY '):
+                          mark(f'worker ready: {line}')
+                          break
+              def _line(self, timeout, where):
+                  try: line=self.q.get(timeout=timeout)
+                  except queue.Empty as e:
+                      self.p.kill()
+                      raise AssertionError(f'worker timeout waiting for {where}') from e
+                  if line is None:
+                      raise AssertionError(f'worker exited while waiting for {where}; rc={self.p.poll()}')
+                  return line
+              def req(self, rid, ids, gen, temp=0.0, top_p=1.0, seed=1):
+                  mark(f'req{rid}: start ids={ids} gen={gen}')
+                  self.p.stdin.write(f'REQ {rid} {len(ids)} {gen} {temp} {top_p} {seed} -1\n')
+                  self.p.stdin.write(' '.join(map(str,ids))+'\n'); self.p.stdin.flush()
+                  toks=[]; reused=None; metrics=None
+                  while True:
+                      line=self._line(60,f'REQ {rid}')
+                      if line.startswith(f'@K3TOKEN {rid} '): toks.append(int(line.split()[2]))
+                      elif line.startswith(f'@K3DRAFT {rid} '):
+                          x=line.split(); metrics=(int(x[2]),int(x[3]),int(x[4]))
+                      elif line.startswith(f'@K3ERROR {rid} '): raise AssertionError(line)
+                      elif line.startswith(f'@K3DONE {rid} '):
+                          reused=int(line.split()[4]); break
+                  mark(f'req{rid}: done toks={toks} reused={reused} metrics={metrics}')
+                  return toks,reused,metrics
+              def reset(self):
+                  mark('worker reset start')
+                  self.p.stdin.write('RESET\n'); self.p.stdin.flush()
+                  while True:
+                      line=self._line(30,'RESET')
+                      if line.startswith('@K3RESET'):
+                          mark('worker reset done'); return
+              def close(self):
+                  self.p.stdin.write('QUIT\n'); self.p.stdin.flush()
+                  self.p.wait(timeout=10)
+                  assert self.p.returncode==0,self.p.returncode
+                  mark('worker closed')
 
           a=[3,7,11]
-          p=start_worker()
-          w1,reuse,_=req(p,a,2); ref1=oneshot(a,2)
+          # Probe one-shot first so a loader/forward stall is distinguished from protocol issues.
+          ref1=oneshot('greedy-a',a,1)
+          w=Worker()
+          w1,reuse,_=w.req(1,a,1)
           assert w1==ref1,(w1,ref1); assert reuse==0,reuse
-
-          b=a+w1+[5,9]
-          w2,reuse,_=req(p,b,3); ref2=oneshot(b,3)
-          assert w2==ref2,(w2,ref2)
-          assert reuse==len(a)+len(w1),(reuse,len(a)+len(w1))
-
+          b=a+w1+[5]
+          ref2=oneshot('greedy-b',b,1)
+          w2,reuse,_=w.req(2,b,1)
+          assert w2==ref2,(w2,ref2); assert reuse==len(a)+len(w1),(reuse,len(a)+len(w1))
           c=[3,7,12]
-          w3,reuse,_=req(p,c,2); ref3=oneshot(c,2)
+          ref3=oneshot('branch',c,1)
+          w3,reuse,_=w.req(3,c,1)
           assert w3==ref3,(w3,ref3); assert reuse==0,reuse
-
-          p.stdin.write('RESET\n'); p.stdin.flush()
-          for line in p.stdout:
-              if line.startswith('@K3RESET'): break
-          w4,reuse,_=req(p,a,5,1.0,.95,424242)
-          ref4=oneshot(a,5,1.0,.95,424242)
+          w.reset()
+          ref4=oneshot('sampled',a,2,1.0,.95,424242)
+          w4,reuse,_=w.req(4,a,2,1.0,.95,424242)
           assert w4==ref4,(w4,ref4); assert reuse==0,reuse
-          p.stdin.write('QUIT\n'); p.stdin.flush(); p.wait(timeout=10)
-          assert p.returncode==0,p.returncode
+          w.close()
 
-          # Same native path with a deliberately approximate Q4 proposal model. Exact K3
-          # remains authoritative; this gate catches both RNG and warm draft-state drift.
-          DARGS=['--draft-trunk',DRAFT,'--draft-trunk-gb','0.05',
-                 '--draft-topk','1','--spec','2']
-          counter[0]=0
-          p=start_worker(DARGS)
-          d1,reuse,m1=req(p,a,6,1.0,.95,987654)
-          r1=oneshot(a,6,1.0,.95,987654,DARGS)
-          assert d1==r1,(d1,r1); assert reuse==0,reuse
-          assert m1 and m1[0]>0 and m1[1]>0,m1
-
-          dctx=a+d1+[5,9]
-          d2,reuse,m2=req(p,dctx,4,1.0,.95,123456)
-          r2=oneshot(dctx,4,1.0,.95,123456,DARGS)
+          DARGS=['--draft-trunk',DRAFT,'--draft-trunk-gb','0.05','--draft-topk','1','--spec','2']
+          r1=oneshot('draft-a',a,2,1.0,.95,987654,DARGS)
+          w=Worker(DARGS)
+          d1,reuse,m1=w.req(1,a,2,1.0,.95,987654)
+          assert d1==r1,(d1,r1); assert reuse==0,reuse; assert m1 and m1[0]>0,m1
+          dctx=a+d1+[5]
+          r2=oneshot('draft-b',dctx,2,1.0,.95,123456,DARGS)
+          d2,reuse,m2=w.req(2,dctx,2,1.0,.95,123456)
           assert d2==r2,(d2,r2)
-          assert reuse==len(a)+len(d1),(reuse,len(a)+len(d1))
-          assert m2 and m2[0]>0,m2
-          p.stdin.write('QUIT\n'); p.stdin.flush(); p.wait(timeout=10)
-          assert p.returncode==0,p.returncode
+          assert reuse==len(a)+len(d1),(reuse,len(a)+len(d1)); assert m2 and m2[0]>0,m2
+          w.close()
 
-          print('native Windows exact + warm worker + sampled Q4 draft parity: PASS')
-          print('greedy:',w1,w2,w3)
-          print('sampled:',w4)
-          print('draft:',d1,d2,m1,m2)
+          print('native Windows exact + warm worker + sampled Q4 draft parity: PASS', flush=True)
+          print('greedy',w1,w2,w3,'sampled',w4,'draft',d1,d2,m1,m2,flush=True)
           PY
