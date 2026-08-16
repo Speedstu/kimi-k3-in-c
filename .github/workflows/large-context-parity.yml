@@ -1,0 +1,99 @@
+name: Large resident context parity
+
+on:
+  push:
+    branches: [main, 'feature/**']
+    paths:
+      - 'src/cli/k3_worker.c'
+      - '.github/workflows/large-context-parity.yml'
+  pull_request:
+    paths:
+      - 'src/cli/k3_worker.c'
+      - '.github/workflows/large-context-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  million-capacity-tiny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Dependencies and build
+        run: |
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+      - name: Generate tiny K3 and trunk
+        run: |
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11 >/dev/null
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3tiny-trunk "$NLAYERS" >/dev/null
+      - name: One-million position virtual capacity starts and decodes exactly
+        run: |
+          python - <<'PY'
+          import json, subprocess, tempfile
+          from pathlib import Path
+
+          model='/tmp/k3tiny'; trunk='/tmp/k3tiny-trunk'
+          base=[model,'--trunk',trunk,'--trunk-gb','.05','--cache-gb','.05']
+          with tempfile.NamedTemporaryFile(suffix='.json') as f:
+              subprocess.run(['./bin/k3',*base,'--ids','3,7,11,5,9','--gen','3',
+                              '--incremental','--temperature','0','--out',f.name],
+                             check=True,stdout=subprocess.DEVNULL)
+              ref=json.load(open(f.name))['generated_ids']
+
+          p=subprocess.Popen(['./bin/k3-worker',*base,'--context','1048576'],
+              stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+              text=True,bufsize=1)
+          assert p.stdin and p.stdout
+          ready=None
+          startup=[]
+          for line in p.stdout:
+              startup.append(line)
+              if line.startswith('@K3READY '):
+                  ready=line.split(); break
+          assert ready and int(ready[1])==1048576, ''.join(startup[-20:])
+
+          # On Linux the large MLA mappings are virtual/lazy. Record RSS/VmSize for the
+          # CI log instead of hard-coding a flaky threshold: the functional requirement
+          # is that a 1M capacity process starts and a short exact request succeeds.
+          status=Path(f'/proc/{p.pid}/status')
+          if status.exists():
+              vals={}
+              for line in status.read_text().splitlines():
+                  if line.startswith(('VmSize:','VmRSS:')):
+                      k,v=line.split(':',1); vals[k]=v.strip()
+              print('worker memory after 1M reservation:',vals)
+
+          p.stdin.write('REQ 1 5 3 0 1 1 -1\n3 7 11 5 9\n'); p.stdin.flush()
+          out=[]
+          for line in p.stdout:
+              if line.startswith('@K3TOKEN 1 '): out.append(int(line.split()[2]))
+              elif line.startswith('@K3ERROR 1 '): raise AssertionError(line)
+              elif line.startswith('@K3DONE 1 '): break
+          assert out==ref,(out,ref)
+          p.stdin.write('QUIT\n'); p.stdin.flush(); p.wait(timeout=10)
+          assert p.returncode==0
+          print('1M virtual-capacity exact decode: PASS',out)
+          PY
+      - name: Capacity above one million is refused before model allocation
+        run: |
+          set +e
+          ./bin/k3-worker /does/not/exist --trunk /does/not/exist --context 1048577 \
+            >/tmp/too-large.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+          grep -q '1048576' /tmp/too-large.log
+          echo 'over-limit guard: PASS'
