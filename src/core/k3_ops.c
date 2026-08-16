@@ -176,23 +176,22 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
-void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv)
+/* Internal form with caller-owned u scratch. The hot model path has a D-float
+ * slice that is dead after q has been pre-scaled, so using it here removes one
+ * calloc/free pair per KDA head and token without changing any arithmetic. */
+static void k3_kda_step_ws(float *S, float *o, const float *q, const float *k,
+                           const float *v, const float *alpha, float beta,
+                           int dk, int dv, float *u)
 {
-    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
+    /* 1. channel-wise decay */
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
         for (int j = 0; j < dv; j++) row[j] *= a;
     }
 
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    /* 2. read the state along k: u = S^T k */
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -200,8 +199,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         for (int j = 0; j < dv; j++) u[j] += ki * row[j];
     }
 
-    /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
+    /* 3. rank-one delta write */
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -209,7 +207,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
     }
 
-    /* 4. output from the ALREADY UPDATED state: o = S^T q */
+    /* 4. output from the already-updated state */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float qi = q[i];
@@ -217,6 +215,16 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
+}
+
+void k3_kda_step(float *S, float *o, const float *q, const float *k,
+                 const float *v, const float *alpha, float beta, int dk, int dv)
+{
+    /* Public compatibility wrapper. Standalone callers retain the old API; the model
+     * hot path below supplies existing scratch and performs no heap allocation. */
+    float *u = (float *)malloc((size_t)dv * sizeof(float));
+    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    k3_kda_step_ws(S, o, q, k, v, alpha, beta, dk, dv, u);
     free(u);
 }
 
@@ -536,6 +544,8 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
 {
     const int E = c->hidden, L = c->latent, I = c->moe_inter;
     const int SI = I * c->n_shared;
+    const int K = (w->topk_override > 0 && w->topk_override < c->topk)
+                ? w->topk_override : c->topk;
 
     float *z    = scratch;              /* [L]    latent input              */
     float *accL = z    + L;             /* [L]    weighted expert aggregate */
@@ -551,17 +561,17 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         float *ot = out + (size_t)t * E;
 
         /* 1. route on the FULL width, before the down-projection */
-        k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
+        k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
 
-        int nk = c->topk;
+        int nk = K;
         /* Draft cache-only routing: keep only the top-k experts already resident, and
          * renormalise their weights so the mixture still sums as intended. This makes a
          * draft token read ZERO new expert bytes. It is an approximation, which is exactly
          * what a draft is; the exact model verifies every proposed token. */
         if (w->cache_only && w->src && w->src->resident) {
             int m = 0; float wsum = 0.0f;
-            for (int j = 0; j < c->topk; j++) {
+            for (int j = 0; j < K; j++) {
                 if (w->src->resident(w->src, w->layer, idx[j], NULL)) {
                     idx[m] = idx[j]; wt[m] = wt[j]; wsum += wt[j]; m++;
                 }
@@ -696,7 +706,9 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                               const K3Cfg *c, int T, float *scratch)
 {
     const int E = c->hidden, Ll = c->latent, I = c->moe_inter;
-    const int SI = I * c->n_shared, K = c->topk;
+    const int SI = I * c->n_shared;
+    const int K = (w->topk_override > 0 && w->topk_override < c->topk)
+                ? w->topk_override : c->topk;
 
     /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
      * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
@@ -879,8 +891,10 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
         for (int t = 0; t < T; t++) {
             const size_t off = (size_t)t * P + (size_t)h * D;
             for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
-            k3_kda_step(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
-                        al + off, bt[(size_t)t * H + h], D, D);
+            /* q[off:off+D] is dead after the copy above. Reuse it as the recurrence's
+             * D-float u workspace, removing heap traffic from the real KDA hot path. */
+            k3_kda_step_ws(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
+                           al + off, bt[(size_t)t * H + h], D, D, q + off);
         }
     }
 

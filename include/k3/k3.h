@@ -377,6 +377,10 @@ typedef struct {
      * bytes. Never set on the exact model, whose output is authoritative; the draft merely
      * proposes and the exact model verifies. */
     int          cache_only;
+    /* Draft-only: reduce routed experts from config top-k to this value. Zero keeps the
+     * checkpoint's exact top-k. The exact model never sets this: only a speculative
+     * draft may use it, and every emitted token is still verified by exact K3. */
+    int          topk_override;
 } K3MoeW;
 
 size_t k3_moe_scratch(const K3Cfg *c);

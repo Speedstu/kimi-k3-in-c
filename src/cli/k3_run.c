@@ -341,6 +341,10 @@ static void usage(FILE *f)
 "                        Output remains exactly the exact model's greedy decode; the\n"
 "                        draft only proposes. Needs --incremental; implies --spec 4\n"
 "  --draft-trunk-gb X    trunk budget for the draft model (default 6)\n"
+"  --draft-topk K        draft-only routed expert count (default 4); exact K3 stays\n"
+"                        at checkpoint top-k and verifies every emitted token\n"
+"  --draft-cache-only    additionally restrict draft routing to resident experts;\n"
+"                        zero expert reads, but useful only with a large cache\n"
 "  --spec N              speculative decode: draft up to N tokens by n-gram lookup and\n"
 "                        verify them in ONE batched sweep. Output is identical to\n"
 "                        serial decode by construction; needs --incremental. An extra\n"
@@ -454,6 +458,7 @@ typedef struct {
     int         *mla_slot;   /* [n_layers] -> dense MLA index, or -1 */
     int          n_mla, kv_cap, cached;
     int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
+    int          draft_topk;   /* 0 exact; >0 proposal-only reduced expert top-k */
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -504,6 +509,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
             /* The draft routes only among resident experts, reading zero new expert bytes;
              * the exact model keeps true routing. This is what makes a draft step cheap. */
             w->lay[L].moe.cache_only = w->draft_mode;
+            w->lay[L].moe.topk_override = w->draft_topk;
         }
         if (w->kvc && w->mla_slot[L] >= 0) {
             const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
@@ -584,6 +590,8 @@ int main(int argc, char **argv)
     int tf_check = 0;
     const char *draft_dir = NULL;
     double draft_gb = 6.0;
+    int draft_topk = 4;
+    int draft_cache_only = 0;
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0;
@@ -604,6 +612,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc) draft_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--draft-topk") && i + 1 < argc) draft_topk = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--draft-cache-only")) draft_cache_only = 1;
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "auto")) budget_auto = 1;
@@ -721,6 +731,10 @@ int main(int argc, char **argv)
     K3Cfg c; static int fa[128];
     if (!real_cfg(&c, fa, 128, dir, cfg_path)) {
         fprintf(stderr, "ABORTED: the model config could not be read with confidence.\n");
+        return 2;
+    }
+    if (draft_dir && (draft_topk < 1 || draft_topk > c.topk)) {
+        fprintf(stderr, "--draft-topk must be in [1,%d], got %d\n", c.topk, draft_topk);
         return 2;
     }
     if (want_layers > 0 && want_layers < c.n_layers) {
@@ -1139,10 +1153,14 @@ int main(int argc, char **argv)
             dw.n_mla = w.n_mla;
             dw.kv_cap = w.kv_cap;
             dw.cached = 0;
-            dw.draft_mode = 1;   /* cache-only routing: draft tokens read no new experts */
-            printf("hybrid decode: draft trunk %s (%.1f GB budget) proposes up to %d "
-                   "tokens per sweep;\n               the exact model verifies every one "
-                   "before it is emitted\n\n", draft_dir, draft_gb, spec_n);
+            /* Reduced top-k is the default cheap draft. Cache-only remains opt-in:
+             * tiny expert caches were measured to destroy draft acceptance. */
+            dw.draft_mode = draft_cache_only;
+            dw.draft_topk = draft_topk;
+            printf("hybrid decode: draft trunk %s (%.1f GB budget), top-%d%s, proposes "
+                   "up to %d tokens per sweep;\n               the exact model verifies "
+                   "every one before it is emitted\n\n", draft_dir, draft_gb, draft_topk,
+                   draft_cache_only ? ", cache-only" : "", spec_n);
         }
     }
 
