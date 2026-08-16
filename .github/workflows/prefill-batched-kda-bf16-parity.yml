@@ -3,15 +3,18 @@ name: Batched KDA BF16 prefill parity
 on:
   workflow_dispatch:
   push:
-    branches: [speedboost/prefill-batched-kda-bf16]
     paths:
       - 'src/core/k3_ops.c'
-      - 'tools/patch_prefill_batched_kda_bf16.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-kda-bf16-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
       - 'tools/make_tiny_checkpoint.py'
       - '.github/workflows/prefill-batched-kda-bf16-parity.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   exactness:
@@ -19,14 +22,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.ref_name }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-
-      - name: Apply exact KDA BF16 prefill transform once
-        run: python tools/patch_prefill_batched_kda_bf16.py
 
       - name: Strict AVX2 build and full weightless oracle
         run: |
@@ -77,18 +75,3 @@ jobs:
           PY
           done
           echo 'BATCHED KDA BF16 PREFILL EXACTNESS PASS (1 + 4 threads)'
-
-      - name: Persist generated source after gates pass
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- src/core/k3_ops.c; then
-            echo 'source already committed'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/core/k3_ops.c
-          git commit -m 'perf: batch exact KDA BF16 prefill projections'
-          git fetch origin "${{ github.ref_name }}"
-          git rebase "origin/${{ github.ref_name }}"
-          git push origin HEAD:${{ github.ref_name }}
