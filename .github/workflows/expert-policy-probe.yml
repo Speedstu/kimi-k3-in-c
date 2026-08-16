@@ -5,6 +5,7 @@ on:
     branches: [speedboost/expert-policy-probe]
     paths:
       - 'tools/sim_cache_online_policies.py'
+      - 'tools/reconstruct_incremental_trace.py'
       - '.github/workflows/expert-policy-probe.yml'
 
 permissions:
@@ -20,5 +21,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install --quiet numpy
-      - name: Replay recorded full-checkpoint trace
+      - name: Replay recorded full-recompute trace
         run: python tools/sim_cache_online_policies.py tests/fixtures/expert_trace.bin
+      - name: Reconstruct and replay incremental-like token trace
+        run: python tools/reconstruct_incremental_trace.py tests/fixtures/expert_trace.bin
