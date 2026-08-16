@@ -15,7 +15,7 @@
  * owner already releases these arenas with free(), and _aligned_malloc would require a
  * different teardown API. When a native unbuffered Win32 backend lands, its buffers will
  * use a paired Win32 allocator rather than changing this compatibility contract. */
-static inline int posix_memalign(void **memptr, size_t alignment, size_t size)
+static inline int k3_posix_memalign(void **memptr, size_t alignment, size_t size)
 {
     (void)alignment;
     if (!memptr) return EINVAL;
@@ -24,6 +24,7 @@ static inline int posix_memalign(void **memptr, size_t alignment, size_t size)
     *memptr = p;
     return 0;
 }
+#define posix_memalign k3_posix_memalign
 #endif
 
 #endif /* K3_COMPAT_STDLIB_H */
