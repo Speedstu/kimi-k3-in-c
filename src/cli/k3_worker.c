@@ -221,9 +221,10 @@ int main(int argc, char **argv)
         }
         if (bad) { printf("@K3ERROR %llu 2\n", rid); continue; }
 
-        const int reused = history_len > 0 && np >= history_len &&
-                           memcmp(req, seq, (size_t)history_len * sizeof(int)) == 0;
-        if (!reused) {
+        const int reuse_tokens = (history_len > 0 && np >= history_len &&
+                                  memcmp(req, seq, (size_t)history_len * sizeof(int)) == 0)
+                                 ? history_len : 0;
+        if (!reuse_tokens) {
             worker_reset_state(&w, ks, kper, NL, &c);
             history_len = 0;
         }
@@ -268,7 +269,7 @@ int main(int argc, char **argv)
             continue;
         }
         history_len = T;
-        printf("@K3DONE %llu %d %d %d %.6f\n", rid, nout, w.cached, reused,
+        printf("@K3DONE %llu %d %d %d %.6f\n", rid, nout, w.cached, reuse_tokens,
                now_s() - started);
     }
 
