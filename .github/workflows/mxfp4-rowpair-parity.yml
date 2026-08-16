@@ -1,0 +1,88 @@
+name: MXFP4 row-pair parity
+
+on:
+  push:
+    branches: [speedboost/mxfp4-rowpair]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_mxfp4_rowpair_exact.c'
+      - '.github/workflows/mxfp4-rowpair-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_mxfp4_rowpair_exact.c'
+      - '.github/workflows/mxfp4-rowpair-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Strict AVX2 build and full tests
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build private-helper row-pair probe
+        run: |
+          set -euo pipefail
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS \
+             -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_test.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off \
+             benchmarks/bench_mxfp4_rowpair_exact.c /tmp/k3_ops_test.o \
+             -o /tmp/mx_rowpair_exact -lm -fopenmp -pthread
+
+      - name: Real shapes and scale-255 are bit-identical
+        run: |
+          set -euo pipefail
+          OMP_NUM_THREADS=1 /tmp/mx_rowpair_exact | tee /tmp/rowpair-1t.log
+          grep -q 'ROWPAIR EXACTNESS PASS' /tmp/rowpair-1t.log
+          OMP_NUM_THREADS=2 /tmp/mx_rowpair_exact | tee /tmp/rowpair-2t.log
+          grep -q 'ROWPAIR EXACTNESS PASS' /tmp/rowpair-2t.log
+          OMP_NUM_THREADS=4 /tmp/mx_rowpair_exact | tee /tmp/rowpair-4t.log
+          grep -q 'ROWPAIR EXACTNESS PASS' /tmp/rowpair-4t.log
+
+      - name: Generate streamed tiny K3
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3tiny /tmp/k3trunk /tmp/rowpair-tiny
+          mkdir -p /tmp/rowpair-tiny
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11,5,9
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3trunk "$NLAYERS"
+
+      - name: Same-binary streamed A/B exactness
+        run: |
+          set -euo pipefail
+          D=/tmp/rowpair-tiny
+          COMMON='/tmp/k3tiny --trunk /tmp/k3trunk --trunk-gb 0.05 --cache-gb 0.001 --ids 3,7,11,5,9 --gen 8 --incremental --threads 1 --temperature 0'
+          K3_NO_MX_ROWPAIR=1 ./bin/k3 $COMMON --dump-logits "$D/off.logits" --out "$D/off.json" >"$D/off.log" 2>&1
+          ./bin/k3 $COMMON --dump-logits "$D/on.logits" --out "$D/on.json" >"$D/on.log" 2>&1
+          cmp "$D/off.logits" "$D/on.logits"
+          python3 - <<'PY'
+          import json
+          d='/tmp/rowpair-tiny'
+          a=json.load(open(d+'/off.json')); b=json.load(open(d+'/on.json'))
+          assert a['generated_ids']==b['generated_ids'], (a['generated_ids'], b['generated_ids'])
+          assert a['full_ids']==b['full_ids']
+          print('rowpair exact ids:',a['generated_ids'])
+          PY
+          echo 'rowpair logits + 8-token parity: PASS'
