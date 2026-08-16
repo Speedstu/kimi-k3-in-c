@@ -74,7 +74,10 @@ jobs:
           grep -q '23 passed, 0 failed, 0 skipped' win-tests.log
           grep -q 'VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY' win-tests.log
           grep -q 'ALL WEIGHTLESS TESTS PASSED' win-tests.log
-          make CC=gcc ARCH='-msse2' -j2
+          # Keep the scalar/SSE build as a compile+test gate, then use the runner's real
+          # x86 ISA for model parity. This is what a normal `make` does on Windows/MSYS2.
+          make clean
+          make CC=gcc ARCH='-march=native' -j2
 
       - name: Generate native tiny K3 and Q4 draft
         shell: msys2 {0}
