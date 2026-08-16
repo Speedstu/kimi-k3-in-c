@@ -1,0 +1,54 @@
+name: Stage adaptive prefill settings
+
+on:
+  push:
+    branches: ['feature/adaptive-prefill-chunk']
+    paths:
+      - 'tools/apply_prefill_settings_stage.py'
+      - 'benchmarks/prefill-sweep.py'
+      - '.github/workflows/prefill-settings-stage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/adaptive-prefill-chunk
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply guarded settings patch
+        run: python3 tools/apply_prefill_settings_stage.py
+      - name: Syntax and lint
+        run: |
+          python -m pip install --quiet ruff
+          python -m py_compile local/k3_local.py benchmarks/prefill-sweep.py
+          ruff check local/k3_local.py benchmarks/prefill-sweep.py
+      - name: Structural settings contract
+        run: |
+          python - <<'PY'
+          import importlib.util,sys
+          from pathlib import Path
+          spec=importlib.util.spec_from_file_location('k3_prefill_stage','local/k3_local.py')
+          mod=importlib.util.module_from_spec(spec); sys.modules[spec.name]=mod
+          spec.loader.exec_module(mod)
+          cfg=mod.BackendConfig(model_dir=Path('/m'),trunk_dir=Path('/t'),binary=Path('/b'),
+              resident_worker=True,worker_binary=Path('/w'),worker_context=1024,
+              prefill_mb=384,prefill_chunk=123,trunk_gb=1,cache_gb=1)
+          obj=object.__new__(mod.ResidentCBackend); obj.cfg=cfg; obj.context=1024
+          cmd=obj._command()
+          assert cmd[cmd.index('--prefill-mb')+1]=='384'
+          assert cmd[cmd.index('--prefill-chunk')+1]=='123'
+          print('prefill settings command contract: PASS')
+          PY
+      - name: Commit validated settings
+        run: |
+          git config user.name Speedstu
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add local/k3_local.py
+          git diff --cached --quiet || git commit -m 'feat: expose adaptive resident prefill settings locally'
+          git push origin HEAD:feature/adaptive-prefill-chunk
