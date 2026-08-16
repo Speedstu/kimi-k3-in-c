@@ -1,0 +1,56 @@
+name: Probe persistent widening cost
+
+on:
+  push:
+    branches: [speedboost/persistent-widen-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Extract binder logic and exact tiny costs
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=widen-probe.txt
+          : > "$OUT"
+          echo '=== K3MemCtx / vector binding ===' >> "$OUT"
+          grep -n -A140 -B25 'K3MemCtx' src/model/k3_bind.c | head -220 >> "$OUT" || true
+          echo >> "$OUT"
+          echo '=== k3_layer_mem_extra_bytes ===' >> "$OUT"
+          grep -n -A80 -B20 'k3_layer_mem_extra_bytes' src/model/k3_bind.c >> "$OUT" || true
+          echo >> "$OUT"
+          echo '=== k3_bind_layer_mem ===' >> "$OUT"
+          grep -n -A180 -B20 'k3_bind_layer_mem' src/model/k3_bind.c | head -240 >> "$OUT" || true
+          echo >> "$OUT"
+          echo '=== config shape / generator constants ===' >> "$OUT"
+          grep -n -E 'hidden|num_hidden_layers|num_experts_per_token|kv_lora|q_lora|head_dim|intermediate|moe_inter' tools/make_tiny_checkpoint.py | head -120 >> "$OUT" || true
+          python - <<'PY' >> "$OUT"
+          from pathlib import Path
+          import re
+          s=Path('src/model/k3_bind.c').read_text()
+          m=re.search(r'size_t\s+k3_layer_mem_extra_bytes\s*\([^)]*\)\s*\{',s)
+          if m:
+              i=m.start(); depth=0; started=False
+              for j in range(m.end()-1,len(s)):
+                  if s[j]=='{': depth+=1; started=True
+                  elif s[j]=='}':
+                      depth-=1
+                      if started and depth==0:
+                          print('\n=== exact function body ===')
+                          print(s[i:j+1])
+                          break
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$OUT"
+          git commit -m 'ci: record persistent widening probe'
+          git push
