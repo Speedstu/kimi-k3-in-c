@@ -1,0 +1,153 @@
+name: Lazy draft resync parity
+
+on:
+  push:
+    branches: [speedboost/lazy-draft-resync]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply lazy resync transform
+        run: python tools/patch_lazy_draft_resync.py
+      - name: Strict AVX2 build and full oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+      - name: Build repetitive exact fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3lazy /tmp/k3lazy-trunk /tmp/k3lazy-out
+          mkdir -p /tmp/k3lazy-out
+          python tools/make_tiny_checkpoint.py /tmp/k3lazy --seed 2090 \
+            --prompt-ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3lazy/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3lazy /tmp/k3lazy-trunk "$NLAYERS"
+      - name: Lazy sync preserves exact output and reduces draft synchronization tokens
+        run: |
+          set -euo pipefail
+          D=/tmp/k3lazy-out
+          BASE='/tmp/k3lazy --trunk /tmp/k3lazy-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7 --gen 20 --incremental --threads 1 --temperature 0'
+          DRAFT='--draft-trunk /tmp/k3lazy-trunk --draft-trunk-gb 0.05 --draft-topk 2 --spec-auto --spec 8'
+          K3_DRAFT_EAGER_NGRAM_SYNC=1 ./bin/k3 $BASE $DRAFT --out "$D/eager.json" >"$D/eager.log" 2>&1
+          ./bin/k3 $BASE $DRAFT --out "$D/lazy.json" >"$D/lazy.log" 2>&1
+          python - <<'PY'
+          import json
+          e=json.load(open('/tmp/k3lazy-out/eager.json'))
+          l=json.load(open('/tmp/k3lazy-out/lazy.json'))
+          assert l['generated_ids'] == e['generated_ids'], (e['generated_ids'],l['generated_ids'])
+          assert l['full_ids'] == e['full_ids']
+          assert e['draft_ngram_eager_sync'] == 1 and l['draft_ngram_eager_sync'] == 0
+          assert e['draft_ngram_rounds'] > 1 and l['draft_ngram_rounds'] == e['draft_ngram_rounds'], (e,l)
+          assert l['draft_ngram_proposed'] == e['draft_ngram_proposed']
+          assert l['draft_ngram_accepted'] == e['draft_ngram_accepted']
+          assert l['draft_ngram_disabled'] == e['draft_ngram_disabled'] == 0
+          assert l['draft_model_steps'] == e['draft_model_steps']
+          assert l['draft_sync_tokens'] < e['draft_sync_tokens'], (l['draft_sync_tokens'],e['draft_sync_tokens'])
+          assert l['draft_sync_rounds'] < e['draft_sync_rounds'], (l['draft_sync_rounds'],e['draft_sync_rounds'])
+          saved=e['draft_sync_tokens']-l['draft_sync_tokens']
+          assert saved > 0
+          print('LAZY DRAFT RESYNC EXACT PARITY PASS')
+          print({'eager_sync_tokens':e['draft_sync_tokens'],'lazy_sync_tokens':l['draft_sync_tokens'],
+                 'eager_sync_rounds':e['draft_sync_rounds'],'lazy_sync_rounds':l['draft_sync_rounds'],
+                 'saved_sync_tokens':saved,'ngram_rounds':l['draft_ngram_rounds']})
+          PY
+      - name: Sampling path stays outside ngram lazy sync
+        run: |
+          set -euo pipefail
+          ./bin/k3 /tmp/k3lazy --trunk /tmp/k3lazy-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --ids 3,7,11,3,7,11,3,7 --gen 8 --incremental --threads 1 --temperature 1 \
+            --seed 12345 --draft-trunk /tmp/k3lazy-trunk --draft-trunk-gb 0.05 --draft-topk 2 \
+            --spec 4 --out /tmp/k3lazy-out/sample.json >/tmp/k3lazy-out/sample.log 2>&1
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/k3lazy-out/sample.json'))
+          assert x['draft_ngram_rounds'] == 0
+          assert x['draft_sync_tokens'] == 0
+          print('SAMPLED PATH UNCHANGED: PASS')
+          PY
+      - name: Persist validated source and make gate permanent
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/cli/k3_run.c
+          git commit -m 'perf: lazily resynchronise hybrid draft state' || true
+          rm -f tools/patch_lazy_draft_resync.py
+          cat > .github/workflows/lazy-draft-resync.yml <<'YAML'
+          name: Lazy draft resync parity
+          on:
+            workflow_dispatch:
+            pull_request:
+              paths:
+                - 'src/cli/k3_run.c'
+                - '.github/workflows/lazy-draft-resync.yml'
+          permissions:
+            contents: read
+          jobs:
+            exactness:
+              runs-on: ubuntu-latest
+              timeout-minutes: 35
+              steps:
+                - uses: actions/checkout@v7
+                - uses: actions/setup-python@v7
+                  with:
+                    python-version: '3.12'
+                - name: Strict AVX2 build and full oracle
+                  run: |
+                    set -euo pipefail
+                    make clean
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+                - name: Lazy sync is exact and removes sync work
+                  run: |
+                    set -euo pipefail
+                    python -m pip install --quiet numpy
+                    python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+                    rm -rf /tmp/k3lazy /tmp/k3lazy-trunk /tmp/k3lazy-out
+                    mkdir -p /tmp/k3lazy-out
+                    python tools/make_tiny_checkpoint.py /tmp/k3lazy --seed 2090 --prompt-ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7
+                    NLAYERS=$(python - <<'PY'
+                    import json
+                    print(json.load(open('/tmp/k3lazy/config.json'))['num_hidden_layers'])
+                    PY
+                    )
+                    python tools/pack_trunk.py /tmp/k3lazy /tmp/k3lazy-trunk "$NLAYERS"
+                    BASE='/tmp/k3lazy --trunk /tmp/k3lazy-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7 --gen 20 --incremental --threads 1 --temperature 0'
+                    DRAFT='--draft-trunk /tmp/k3lazy-trunk --draft-trunk-gb 0.05 --draft-topk 2 --spec-auto --spec 8'
+                    K3_DRAFT_EAGER_NGRAM_SYNC=1 ./bin/k3 $BASE $DRAFT --out /tmp/k3lazy-out/eager.json >/tmp/k3lazy-out/eager.log 2>&1
+                    ./bin/k3 $BASE $DRAFT --out /tmp/k3lazy-out/lazy.json >/tmp/k3lazy-out/lazy.log 2>&1
+                    python - <<'PY'
+                    import json
+                    e=json.load(open('/tmp/k3lazy-out/eager.json')); l=json.load(open('/tmp/k3lazy-out/lazy.json'))
+                    assert e['generated_ids']==l['generated_ids'] and e['full_ids']==l['full_ids']
+                    assert l['draft_ngram_rounds']>1 and l['draft_ngram_disabled']==0
+                    assert l['draft_sync_tokens']<e['draft_sync_tokens']
+                    assert l['draft_sync_rounds']<e['draft_sync_rounds']
+                    print('LAZY DRAFT RESYNC PARITY PASS')
+                    PY
+          YAML
+          git add -A
+          git commit -m 'ci: make lazy draft resync gate permanent' || true
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
