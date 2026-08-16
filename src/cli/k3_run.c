@@ -364,6 +364,10 @@ static void usage(FILE *f)
 "                        serial decode by construction; needs --incremental. An extra\n"
 "                        verified position costs ~22%% of a serial token when the trunk\n"
 "                        streams, so repetitive text decodes up to several times faster\n"
+"  --spec-auto           greedy-only adaptive horizon: start at 4 drafts, grow after a\n"
+"                        fully accepted sweep and shrink after poor acceptance. Exact K3\n"
+"                        still verifies every emitted token. --spec N becomes the ceiling\n"
+"                        (default ceiling 8). Sampling keeps fixed --spec for seeded parity\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "diagnostics:\n"
@@ -665,6 +669,7 @@ int main(int argc, char **argv)
     double cache_gb = 64.0, trunk_gb = 16.0;
     int budget_auto = 0;
     int spec_n = 0;
+    int spec_auto = 0;
     int tf_check = 0;
     const char *draft_dir = NULL;
     double draft_gb = 6.0;
@@ -692,6 +697,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
         else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--spec-auto")) spec_auto = 1;
         else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
         else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
@@ -1269,17 +1275,40 @@ int main(int argc, char **argv)
      * prefix. The snapshot is one memcpy; the replay is one short batched sweep. */
     const size_t kperP  = (size_t)c.kda_heads * c.kda_head_dim;
     const size_t kper_f = kperP * c.kda_head_dim + 3 * kperP * (c.conv_k - 1);
+
+    /* Adaptive speculative width is intentionally greedy-only in this first exact
+     * version. Standard speculative sampling is distribution-correct for any width,
+     * but changing width changes how many RNG draws proposal/acceptance streams consume;
+     * refusing auto there preserves seeded bit-for-bit behavioural parity. */
+    if (spec_auto && temperature > 0.0) {
+        fprintf(stderr, "--spec-auto currently supports greedy decode only; "
+                        "use fixed --spec N with --temperature > 0\n");
+        return 2;
+    }
+    if (spec_auto && spec_n <= 0) spec_n = K3_SPEC_MAX;
+    if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
+    if (spec_n < 0) spec_n = 0;
+    int spec_limit = spec_n;
+    int spec_cur = spec_auto ? (spec_limit < 4 ? spec_limit : 4) : spec_limit;
+    long spec_auto_rounds = 0, spec_auto_proposed = 0, spec_auto_accepted = 0;
+    int spec_auto_grows = 0, spec_auto_shrinks = 0;
+
     float *spec_snap = NULL;
     if (spec_n > 0) {
         if (!incremental) {
             fprintf(stderr, "--spec needs --incremental; ignoring --spec\n");
             spec_n = 0;
+            spec_limit = 0;
+            spec_cur = 0;
         } else {
-            if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
             spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
             if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
-            printf("speculative decode: up to %d drafted tokens per sweep, n-gram lookup, "
-                   "verified batched\n\n", spec_n);
+            if (spec_auto)
+                printf("speculative decode: adaptive greedy horizon starts at %d, ceiling %d; "
+                       "exact batched verification\n\n", spec_cur, spec_limit);
+            else
+                printf("speculative decode: up to %d drafted tokens per sweep, n-gram lookup, "
+                       "verified batched\n\n", spec_n);
         }
     }
 
@@ -1303,8 +1332,11 @@ int main(int argc, char **argv)
             fprintf(stderr, "--draft-trunk needs --incremental and --trunk; ignoring\n");
             draft_dir = NULL;
         } else {
-            if (spec_n <= 0) spec_n = 4;
-            if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
+            if (spec_n <= 0) {
+                spec_n = 4;
+                spec_limit = spec_n;
+                spec_cur = spec_n;
+            }
             if (!spec_snap) {
                 spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
                 if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
@@ -1333,9 +1365,11 @@ int main(int argc, char **argv)
             dw.draft_mode = draft_cache_only;
             dw.draft_topk = draft_topk;
             printf("hybrid decode: draft trunk %s (%.1f GB budget), top-%d%s, proposes "
-                   "up to %d tokens per sweep;\n               the exact model verifies "
+                   "%s%d tokens per sweep;\n               the exact model verifies "
                    "every one before it is emitted\n\n", draft_dir, draft_gb, draft_topk,
-                   draft_cache_only ? ", cache-only" : "", spec_n);
+                   draft_cache_only ? ", cache-only" : "",
+                   spec_auto ? "adaptively up to " : "up to ",
+                   spec_auto ? spec_limit : spec_n);
         }
     }
 
@@ -1432,7 +1466,9 @@ int main(int argc, char **argv)
         } else if (incremental) {
             const int base = w.cached;
             int d[K3_SPEC_MAX], nd = 0;
-            if (spec_snap && T + spec_n + 1 < Tmax && base + spec_n + 1 <= w.kv_cap) {
+            const int spec_now = spec_auto ? spec_cur : spec_n;
+            if (spec_snap && spec_now > 0 &&
+                T + spec_now + 1 < Tmax && base + spec_now + 1 <= w.kv_cap) {
                 if (dw.trunk) {
                     const double hyb_draft_t0 = now_s();
                     /* The draft model proposes: k sequential one-token steps through
@@ -1441,7 +1477,7 @@ int main(int argc, char **argv)
                      * same way the exact side rewinds. */
                     memcpy(dsnap, dks, kper_f * (size_t)w.n_bound * sizeof(float));
                     int prev = seq[base];
-                    while (nd < spec_n) {
+                    while (nd < spec_now) {
                         if (forward(&dw, &c, &cache, &prev, 1, lg, sc, h, br,
                                     dks, NULL, NULL) != 0) break;
                         dw.cached += 1;
@@ -1460,7 +1496,7 @@ int main(int argc, char **argv)
                     hyb_drafted += nd;
                     hyb_draft_s += now_s() - hyb_draft_t0;
                 } else {
-                    nd = spec_draft(seq, T, spec_n, d);
+                    nd = spec_draft(seq, T, spec_now, d);
                     if (temperature > 0.0)
                         for (int j = 0; j < nd; j++) {
                             double *qrow = spec_q_probs + (size_t)j * c.vocab;
@@ -1519,6 +1555,22 @@ int main(int argc, char **argv)
                                 correction = k3_sample_probs(&sampler, spec_p_probs, c.vocab);
                         }
                         if (correction < 0) frc = -1;
+                    }
+                    if (spec_auto) {
+                        spec_auto_rounds++;
+                        spec_auto_proposed += nd;
+                        spec_auto_accepted += m;
+                        if (m == nd && spec_cur < spec_limit) {
+                            spec_cur++;
+                            spec_auto_grows++;
+                        } else if (m * 2 < nd && spec_cur > 1) {
+                            int next = (spec_cur + 1) / 2;
+                            if (next < 1) next = 1;
+                            if (next < spec_cur) {
+                                spec_cur = next;
+                                spec_auto_shrinks++;
+                            }
+                        }
                     }
                     if (m == nd) {
                         /* every fed position had true context; state is exact */
@@ -1644,6 +1696,13 @@ int main(int argc, char **argv)
         }
     }
 
+    if (spec_auto && spec_auto_rounds > 0) {
+        printf("\nadaptive speculation: %ld verified rounds, %ld/%ld drafts accepted (%.1f%%), "
+               "final horizon %d/%d, grows %d, shrinks %d\n",
+               spec_auto_rounds, spec_auto_accepted, spec_auto_proposed,
+               spec_auto_proposed ? 100.0 * spec_auto_accepted / spec_auto_proposed : 0.0,
+               spec_cur, spec_limit, spec_auto_grows, spec_auto_shrinks);
+    }
     if (dw.trunk && hyb_rounds > 0) {
         printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
                "mean accepted run %.2f\n",
@@ -1692,11 +1751,17 @@ int main(int argc, char **argv)
                    "\"draft_rounds\":%ld,\"draft_proposed\":%ld,"
                    "\"draft_accepted\":%ld,\"draft_acceptance\":%.9g,"
                    "\"draft_seconds\":%.6f,\"verify_seconds\":%.6f,"
+                   "\"spec_auto\":%d,\"spec_auto_rounds\":%ld,"
+                   "\"spec_auto_proposed\":%ld,\"spec_auto_accepted\":%ld,"
+                   "\"spec_auto_final\":%d,\"spec_auto_limit\":%d,"
+                   "\"spec_auto_grows\":%d,\"spec_auto_shrinks\":%d,"
                    "\"seconds_per_token\":%.4f}\n",
                 NL, compute_threads, temperature, top_p, sample_seed, stop_id,
                 hyb_rounds, hyb_drafted, hyb_accepted,
                 hyb_drafted ? (double)hyb_accepted / hyb_drafted : 0.0,
-                hyb_draft_s, hyb_verify_s, t_total / nout);
+                hyb_draft_s, hyb_verify_s, spec_auto, spec_auto_rounds,
+                spec_auto_proposed, spec_auto_accepted, spec_cur, spec_limit,
+                spec_auto_grows, spec_auto_shrinks, t_total / nout);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }

@@ -1,0 +1,141 @@
+# Permanent exactness gate for the cleaned adaptive-spec branch.
+name: Greedy adaptive speculation parity
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/cli/k3_run.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - '.github/workflows/adaptive-spec-greedy-parity.yml'
+  pull_request:
+    paths:
+      - 'src/cli/k3_run.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - '.github/workflows/adaptive-spec-greedy-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Strict AVX2 build and full oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build exact-draft grow fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3auto /tmp/k3auto-trunk /tmp/k3auto-out
+          mkdir -p /tmp/k3auto-out
+          python tools/make_tiny_checkpoint.py /tmp/k3auto --seed 2040 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3auto/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3auto /tmp/k3auto-trunk "$NLAYERS"
+
+      - name: Fixed and growing adaptive speculation emit exact serial greedy sequence
+        run: |
+          set -euo pipefail
+          D=/tmp/k3auto-out
+          BASE='/tmp/k3auto --trunk /tmp/k3auto-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 18 --incremental --threads 1 --temperature 0'
+          DRAFT='--draft-trunk /tmp/k3auto-trunk --draft-trunk-gb 0.05 --draft-topk 2'
+
+          ./bin/k3 $BASE --out "$D/serial.json" >"$D/serial.log" 2>&1
+          ./bin/k3 $BASE $DRAFT --spec 4 --out "$D/fixed4.json" >"$D/fixed4.log" 2>&1
+          ./bin/k3 $BASE $DRAFT --spec-auto --spec 8 --out "$D/auto8.json" >"$D/auto8.log" 2>&1
+          ./bin/k3 $BASE $DRAFT --spec-auto --spec 5 --out "$D/auto5.json" >"$D/auto5.log" 2>&1
+
+          python3 - <<'PY'
+          import json
+          d='/tmp/k3auto-out'
+          serial=json.load(open(d+'/serial.json'))
+          fixed=json.load(open(d+'/fixed4.json'))
+          auto=json.load(open(d+'/auto8.json'))
+          cap=json.load(open(d+'/auto5.json'))
+          for name,x in [('fixed4',fixed),('auto8',auto),('auto5',cap)]:
+              assert x['generated_ids'] == serial['generated_ids'], name
+              assert x['full_ids'] == serial['full_ids'], name
+          assert auto['spec_auto'] == 1
+          assert auto['spec_auto_rounds'] > 0
+          assert auto['spec_auto_grows'] > 0, auto
+          assert 4 < auto['spec_auto_final'] <= 8, auto
+          assert auto['spec_auto_accepted'] == auto['spec_auto_proposed'], auto
+          assert cap['spec_auto_final'] <= 5, cap
+          print('serial/fixed/auto exact generated + full IDs: PASS')
+          print('grow path: rounds=%d accepted=%d/%d grows=%d final=%d/%d' % (
+              auto['spec_auto_rounds'], auto['spec_auto_accepted'],
+              auto['spec_auto_proposed'], auto['spec_auto_grows'],
+              auto['spec_auto_final'], auto['spec_auto_limit']))
+          PY
+
+      - name: Build reduced-topk shrink fixture
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/k3shrink /tmp/k3shrink-trunk /tmp/k3shrink-out
+          mkdir -p /tmp/k3shrink-out
+          python tools/make_tiny_checkpoint.py /tmp/k3shrink --seed 2041 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3shrink/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3shrink /tmp/k3shrink-trunk "$NLAYERS"
+
+      - name: Poor draft triggers shrink while exact K3 sequence stays authoritative
+        run: |
+          set -euo pipefail
+          D=/tmp/k3shrink-out
+          BASE='/tmp/k3shrink --trunk /tmp/k3shrink-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18 --gen 32 --incremental --threads 1 --temperature 0'
+          ./bin/k3 $BASE --out "$D/serial.json" >"$D/serial.log" 2>&1
+          ./bin/k3 $BASE --draft-trunk /tmp/k3shrink-trunk --draft-trunk-gb 0.05 \
+            --draft-topk 1 --spec-auto --spec 8 --out "$D/auto.json" >"$D/auto.log" 2>&1
+          python3 - <<'PY'
+          import json
+          d='/tmp/k3shrink-out'
+          serial=json.load(open(d+'/serial.json'))
+          auto=json.load(open(d+'/auto.json'))
+          assert auto['generated_ids'] == serial['generated_ids']
+          assert auto['full_ids'] == serial['full_ids']
+          assert auto['spec_auto_rounds'] > 0
+          assert auto['spec_auto_shrinks'] > 0, auto
+          print('shrink path exact sequence: PASS')
+          print('shrink path: rounds=%d accepted=%d/%d grows=%d shrinks=%d final=%d/%d' % (
+              auto['spec_auto_rounds'], auto['spec_auto_accepted'],
+              auto['spec_auto_proposed'], auto['spec_auto_grows'],
+              auto['spec_auto_shrinks'], auto['spec_auto_final'],
+              auto['spec_auto_limit']))
+          PY
+
+      - name: Sampling refuses adaptive width to preserve seeded RNG parity
+        run: |
+          set -euo pipefail
+          set +e
+          ./bin/k3 /tmp/k3auto --trunk /tmp/k3auto-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --ids 3,7,11,5 --gen 1 --incremental --temperature 0.7 --spec-auto \
+            --out /tmp/k3auto-out/should-not-exist.json \
+            >/tmp/k3auto-out/sample-auto.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+          grep -q 'supports greedy decode only' /tmp/k3auto-out/sample-auto.log
+          echo 'sampled --spec-auto rejection: PASS'
