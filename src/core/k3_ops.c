@@ -1245,7 +1245,7 @@ void k3_matmul_q4g(float *y, const float *x, const void *W, int in, int out)
     for (int o = 0; o < out; o++) {
         const unsigned char *bp = base + (size_t)o * rowb;
         float acc = 0.0f;
-        for (int g = 0, off = 0; off < in; g++, off += K3_Q4_GROUP) {
+        for (int off = 0; off < in; off += K3_Q4_GROUP) {
             int n = in - off;
             if (n > K3_Q4_GROUP) n = K3_Q4_GROUP;
             float scale;
