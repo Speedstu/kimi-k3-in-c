@@ -1,0 +1,24 @@
+name: Expert cache online-policy probe
+
+on:
+  push:
+    branches: [speedboost/expert-policy-probe]
+    paths:
+      - 'tools/sim_cache_online_policies.py'
+      - '.github/workflows/expert-policy-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet numpy
+      - name: Replay recorded full-checkpoint trace
+        run: python tools/sim_cache_online_policies.py tests/fixtures/expert_trace.bin
