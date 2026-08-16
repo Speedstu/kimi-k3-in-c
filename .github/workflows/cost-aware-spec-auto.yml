@@ -3,17 +3,19 @@ name: Cost-aware adaptive speculation parity
 on:
   workflow_dispatch:
   push:
-    branches: [speedboost/cost-aware-spec-auto]
     paths:
       - 'src/cli/k3_run.c'
       - 'src/cli/k3_spec_auto.h'
-      - 'tools/patch_cost_aware_spec.py'
       - 'tools/make_tiny_checkpoint.py'
       - 'tools/pack_trunk.py'
       - '.github/workflows/cost-aware-spec-auto.yml'
-
-permissions:
-  contents: write
+  pull_request:
+    paths:
+      - 'src/cli/k3_run.c'
+      - 'src/cli/k3_spec_auto.h'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - '.github/workflows/cost-aware-spec-auto.yml'
 
 jobs:
   exactness:
@@ -21,14 +23,9 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.ref_name }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-
-      - name: Apply cost-aware source transform
-        run: python tools/patch_cost_aware_spec.py
 
       - name: Deterministic controller unit probe
         run: |
@@ -139,18 +136,3 @@ jobs:
           test "$rc" -eq 2
           grep -q 'supports greedy decode only' /tmp/k3cost-out/sample-auto.log
           echo 'sampled --spec-auto rejection: PASS'
-
-      - name: Persist validated source
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- src/cli/k3_run.c; then
-            echo 'source already committed'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/cli/k3_run.c
-          git commit -m 'perf: make adaptive speculation cost-aware'
-          git fetch origin "${{ github.ref_name }}"
-          git rebase "origin/${{ github.ref_name }}"
-          git push origin HEAD:${{ github.ref_name }}
