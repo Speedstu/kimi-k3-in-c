@@ -1,3 +1,4 @@
+# Permanent parity gate for warm exact + sampled-draft resident inference.
 name: Resident worker parity
 
 on:
