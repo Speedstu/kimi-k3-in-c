@@ -1,0 +1,41 @@
+name: Stage lazy KV bounded prefill
+
+on:
+  push:
+    branches: ['feature/lazy-kv-bounded-prefill']
+    paths:
+      - 'tools/apply_lazy_kv_stage.py'
+      - '.github/workflows/lazy-kv-stage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/lazy-kv-bounded-prefill
+      - name: Apply guarded worker patch
+        run: python3 tools/apply_lazy_kv_stage.py
+      - name: Build, tests, strict warnings
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+          make ARCH='-mavx2 -mfma' test -j"$(nproc)"
+          rm -rf build bin
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -Werror' -j"$(nproc)"
+      - name: CMake parity
+        run: |
+          cmake -S . -B /tmp/k3-lazy-cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/k3-lazy-cmake -j"$(nproc)"
+          ctest --test-dir /tmp/k3-lazy-cmake --output-on-failure
+      - name: Commit validated source
+        run: |
+          git config user.name Speedstu
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add src/cli/k3_worker.c
+          git diff --cached --quiet || git commit -m 'perf: make resident KV lazy and prefill scratch bounded'
+          git push origin HEAD:feature/lazy-kv-bounded-prefill
