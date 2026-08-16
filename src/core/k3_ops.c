@@ -402,40 +402,47 @@ void k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
 }
 
 /* ---------------------------------------------------------------- router ---- */
-void k3_router(int *idx, float *w, const float *x, const float *W,
+void k3_router(int *idx, float *w, const float *x, const void *W, int wdt,
                const float *bias, int hidden, int n_experts, int topk,
                int renorm, float routed_scale)
 {
     /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
-     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
-     * uninitialised stack. */
+     * expert pointers from them immediately afterward. Abort on allocation failure. */
     float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
     float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
     if (!score || !choice) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
 
-    /* logits in float32 with no bias, then an independent sigmoid per expert. The
-     * reference upcasts both operands explicitly; a double accumulator here matches
-     * it and costs nothing at this width. */
-    /* PARALLEL over experts, and bit-identical because of it.
+    /* Exact FP32/BF16 paths deliberately preserve the original sequential i=0..hidden-1
+     * double accumulation. The checkpoint gate is BF16; the old streamed binder widened
+     * those exact BF16 values into FP32 first, so widening each element here yields the
+     * same operand and the same addition order, hence bit-identical scores/top-k.
      *
-     * This is 896 dot products of length 7168 = 6.4M multiply-adds, per token, per MoE
-     * layer, so 590M across the 92 of them -- and it ran on ONE core while every other
-     * matmul in the engine was already threaded. It is pure arithmetic with no I/O to
-     * hide behind, so it sat squarely on the critical path.
-     *
-     * Each iteration writes only its own score[e] and choice[e], and the ACCUMULATION
-     * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
-     * sequence into its own double. Splitting the outer loop therefore cannot change a
-     * single bit, which is why this needs no tolerance and no re-gating. */
+     * I8R/Q4G occur only on speculative draft trunks. They may use their fast matmul
+     * kernels because their logits are proposals: exact BF16 K3 verifies emitted tokens. */
 #ifdef _OPENMP
 #   pragma omp parallel for schedule(static)
 #endif
     for (int e = 0; e < n_experts; e++) {
-        const float *row = W + (size_t)e * hidden;
-        double acc = 0.0;
-        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
+        double acc;
+        if (wdt == K3_WBF16) {
+            const uint16_t *row = (const uint16_t *)W + (size_t)e * hidden;
+            acc = 0.0;
+            for (int i = 0; i < hidden; i++)
+                acc += (double)k3_bf16f(row[i]) * (double)x[i];
+        } else if (wdt == K3_WF32) {
+            const float *row = (const float *)W + (size_t)e * hidden;
+            acc = 0.0;
+            for (int i = 0; i < hidden; i++)
+                acc += (double)row[i] * (double)x[i];
+        } else {
+            const unsigned char *row = (const unsigned char *)W
+                                     + (size_t)e * k3_row_bytes(wdt, hidden);
+            float draft_logit = 0.0f;
+            k3_mmw(&draft_logit, x, row, wdt, hidden, 1);
+            acc = (double)draft_logit;
+        }
         score[e]  = 1.0f / (1.0f + expf(-(float)acc));
-        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+        choice[e] = score[e] + (bias ? bias[e] : 0.0f);
     }
 
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
@@ -561,7 +568,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         float *ot = out + (size_t)t * E;
 
         /* 1. route on the FULL width, before the down-projection */
-        k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, K,
+        k3_router(idx, wt, xt, w->gate, w->gate_wdt, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
 
         int nk = K;
@@ -729,7 +736,7 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         const float *xt = x + (size_t)t * E;
         int   *it = ridx + (size_t)t * K;
         float *wtt = rwt + (size_t)t * K;
-        k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
+        k3_router(it, wtt, xt, w->gate, w->gate_wdt, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
         k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {

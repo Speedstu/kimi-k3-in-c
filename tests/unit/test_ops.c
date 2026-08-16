@@ -366,7 +366,8 @@ static void t_router(const char *dir)
         int set_ok = 1; double worst_w = 0.0;
 
         for (int rw = 0; rw < rows; rw++) {
-            k3_router(gi, gw, x + (size_t)rw * hidden, W, bias, hidden, E, K, 1, 1.0f);
+            k3_router(gi, gw, x + (size_t)rw * hidden, W, K3_WF32,
+                      bias, hidden, E, K, 1, 1.0f);
 
             /* compare index SETS */
             for (int a = 0; a < K; a++) {
@@ -386,13 +387,50 @@ static void t_router(const char *dir)
                 }
             }
         }
-        if (set_ok && worst_w <= 1.0) {
-            printf("  PASS  router         rows=%-4d k=%d  index sets match, "
-                   "worst weight=%.2fx tol\n", rows, K, worst_w);
+        /* Exact BF16 parity: build a separate gate whose values are first rounded to
+         * BF16, then compare the typed BF16 router against those SAME values widened to
+         * fp32. idx and combining weights must match bit-for-bit, because the real old
+         * binder did exactly that widening before calling the FP32 router. */
+        int bf16_ok = 1;
+        enum { PE = 17, PH = 257, PK = 4, PR = 5 };
+        uint16_t *wb = (uint16_t *)malloc((size_t)PE * PH * sizeof(uint16_t));
+        float *wf = (float *)malloc((size_t)PE * PH * sizeof(float));
+        float *px = (float *)malloc((size_t)PR * PH * sizeof(float));
+        float *pb = (float *)malloc((size_t)PE * sizeof(float));
+        int ia[PK], ib[PK]; float wa[PK], wbw[PK];
+        if (!wb || !wf || !px || !pb) bf16_ok = 0;
+        if (bf16_ok) {
+            unsigned st = 0x51A7E123u;
+            for (size_t i = 0; i < (size_t)PE * PH; i++) {
+                st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+                const float z = ((int)(st & 0xffffu) - 32768) * (1.0f / 65536.0f);
+                union { float f; uint32_t u; } v; v.f = z;
+                wb[i] = (uint16_t)(v.u >> 16);
+                wf[i] = k3_bf16f(wb[i]);
+            }
+            for (int i = 0; i < PR * PH; i++) {
+                st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+                px[i] = ((int)(st & 0xffffu) - 32768) * (1.0f / 32768.0f);
+            }
+            for (int e = 0; e < PE; e++) pb[e] = (float)(e - 8) * 0.00031f;
+            for (int r0 = 0; r0 < PR && bf16_ok; r0++) {
+                k3_router(ia, wa, px + (size_t)r0 * PH, wf, K3_WF32,
+                          pb, PH, PE, PK, 1, 1.0f);
+                k3_router(ib, wbw, px + (size_t)r0 * PH, wb, K3_WBF16,
+                          pb, PH, PE, PK, 1, 1.0f);
+                if (memcmp(ia, ib, sizeof ia) != 0 || memcmp(wa, wbw, sizeof wa) != 0)
+                    bf16_ok = 0;
+            }
+        }
+        free(wb); free(wf); free(px); free(pb);
+
+        if (set_ok && worst_w <= 1.0 && bf16_ok) {
+            printf("  PASS  router         rows=%-4d k=%d  fixture matches; BF16 typed "
+                   "gate is BIT-IDENTICAL\n", rows, K);
             g_pass++;
         } else {
-            printf("  FAIL  router         index_sets=%s worst weight=%.2fx tol\n",
-                   set_ok ? "ok" : "MISMATCH", worst_w);
+            printf("  FAIL  router         index_sets=%s worst weight=%.2fx tol bf16=%s\n",
+                   set_ok ? "ok" : "MISMATCH", worst_w, bf16_ok ? "exact" : "MISMATCH");
             g_fail++;
         }
         free(gi); free(gw);
