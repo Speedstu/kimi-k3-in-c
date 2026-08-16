@@ -4,9 +4,11 @@ on:
   pull_request:
     paths:
       - 'benchmarks/autotune.py'
+      - 'benchmarks/autotune_memory.py'
       - '.github/workflows/autotune-parity.yml'
       - 'README.md'
       - 'docs/AUTOTUNE.md'
+      - 'docs/MEMORY_AUTOTUNE.md'
       - 'src/**'
       - 'include/**'
       - 'tools/make_tiny_checkpoint.py'
@@ -110,7 +112,41 @@ jobs:
           assert all(r['full_ids'] == x['reference_full_ids'] for r in x['runs'])
           print('AUTO DRAFT TOP-K AUTOTUNE PARITY PASS', x['recommended'])
           PY
-      - name: Draft top-k tuner refuses ambiguous or invalid commands
+      - name: Fixed-budget memory autotune preserves exact tokens
+        run: |
+          python benchmarks/autotune_memory.py /tmp/k3tiny \
+            --k3-bin ./bin/k3 \
+            --allocator-budget-gb 0.10 \
+            --trunk-min-gb 0.02 \
+            --cache-candidates 0.005,0.01 \
+            --draft-trunk-candidates 0.02,0.04 \
+            --cache-seed-gb 0.01 \
+            --draft-seed-gb 0.04 \
+            --repeats 1 \
+            --out /tmp/memory-autotune.json \
+            -- \
+            --trunk /tmp/k3trunk \
+            --draft-trunk /tmp/k3trunk --draft-topk 2 --spec-auto --spec 8 \
+            --threads 1 --ids 3,7,11,5,9 --gen 8 --incremental --temperature 0
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/memory-autotune.json'))
+          r=x['recommended']
+          assert abs(r['allocator_sum_gb'] - 0.10) < 1e-6, r
+          assert r['trunk_gb'] >= 0.02, r
+          assert r['cache_gb'] in (0.005,0.01), r
+          assert r['draft_trunk_gb'] in (0.02,0.04), r
+          assert x['reference_generated_ids'][:3] == [92,168,13], x['reference_generated_ids']
+          assert len(x['runs']) >= 4, len(x['runs'])
+          for run in x['runs']:
+              a=run['allocation']
+              assert abs(a['trunk_gb'] + a['cache_gb'] + a['draft_trunk_gb'] - 0.10) < 1e-6, a
+              assert run['generated_ids'] == x['reference_generated_ids']
+              assert run['full_ids'] == x['reference_full_ids']
+              assert run['peak_rss_gb'] is not None and run['peak_rss_gb'] > 0, run['peak_rss_gb']
+          print('MEMORY AUTOTUNE PARITY PASS', r)
+          PY
+      - name: Autotuners refuse ambiguous or invalid commands
         run: |
           set -euo pipefail
           set +e
@@ -132,14 +168,28 @@ jobs:
             --ids 3,7,11,5,9 --gen 1 --incremental \
             >/tmp/bad-config.log 2>&1
           rc3=$?
+          python benchmarks/autotune_memory.py /tmp/k3tiny --k3-bin ./bin/k3 \
+            --allocator-budget-gb 0.1 -- \
+            --trunk /tmp/k3trunk --preset laptop --ids 3,7,11,5,9 --gen 1 \
+            >/tmp/memory-preset.log 2>&1
+          rc4=$?
+          python benchmarks/autotune_memory.py /tmp/k3tiny --k3-bin ./bin/k3 \
+            --allocator-budget-gb 0.1 -- \
+            --trunk /tmp/k3trunk --trunk-gb 0.05 --ids 3,7,11,5,9 --gen 1 \
+            >/tmp/memory-manual.log 2>&1
+          rc5=$?
           set -e
           test "$rc1" -eq 2
           test "$rc2" -eq 2
           test "$rc3" -eq 2
+          test "$rc4" -eq 2
+          test "$rc5" -eq 2
           grep -q 'requires --draft-trunk' /tmp/no-draft.log
           grep -q 'do not pass --draft-topk' /tmp/ambiguous.log
           grep -q 'cannot read K3 config' /tmp/bad-config.log
-          echo 'draft top-k CLI/config guards: PASS'
+          grep -q 'do not pass --preset' /tmp/memory-preset.log
+          grep -q 'do not pass --trunk-gb' /tmp/memory-manual.log
+          echo 'autotune CLI/config guards: PASS'
 
   windows-python-cli:
     runs-on: windows-latest
@@ -151,6 +201,8 @@ jobs:
       - name: Python syntax and CLI parsing
         shell: pwsh
         run: |
-          python -m py_compile benchmarks/autotune.py
+          python -m py_compile benchmarks/autotune.py benchmarks/autotune_memory.py
           python benchmarks/autotune.py --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python benchmarks/autotune_memory.py --help | Out-Null
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
