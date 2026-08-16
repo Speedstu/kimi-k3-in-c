@@ -1,0 +1,87 @@
+name: Sampled speculation parity
+
+on:
+  push:
+    branches: [main, 'feature/**']
+    paths:
+      - 'src/cli/k3_run.c'
+      - 'src/core/k3_sample.c'
+      - 'include/k3/k3_sample.h'
+      - 'local/**'
+      - 'tests/unit/test_sample.c'
+      - 'tools/qdq_trunk.py'
+      - '.github/workflows/sampled-spec-parity.yml'
+  pull_request:
+    paths:
+      - 'src/cli/k3_run.c'
+      - 'src/core/k3_sample.c'
+      - 'include/k3/k3_sample.h'
+      - 'local/**'
+      - 'tests/unit/test_sample.c'
+      - 'tools/qdq_trunk.py'
+      - '.github/workflows/sampled-spec-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  tiny-sampled-draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Dependencies and build
+        run: |
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+          make ARCH='-mavx2 -mfma' bin/test_sample -j"$(nproc)"
+          ./bin/test_sample
+      - name: Generate exact tiny K3 and a deliberately approximate draft
+        run: |
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11,5,9
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3tiny-trunk "$NLAYERS"
+          python tools/qdq_trunk.py /tmp/k3tiny-trunk /tmp/k3tiny-draft --bits 4 --group 0
+      - name: Temperature-1 draft speculation is deterministic and actually active
+        run: |
+          for R in a b; do
+            ./bin/k3 /tmp/k3tiny \
+              --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+              --draft-trunk /tmp/k3tiny-draft --draft-trunk-gb 0.05 \
+              --draft-topk 1 --spec 2 --ids 3,7,11,5,9 --gen 6 --incremental \
+              --temperature 1 --top-p 0.95 --seed 987654 \
+              --stream-tokens --out "/tmp/spec-$R.json" >"/tmp/spec-$R.log"
+          done
+          python - <<'PY'
+          import json
+          a=json.load(open('/tmp/spec-a.json')); b=json.load(open('/tmp/spec-b.json'))
+          assert a['generated_ids']==b['generated_ids'], (a['generated_ids'],b['generated_ids'])
+          assert a['temperature']==1 and abs(a['top_p']-.95)<1e-9
+          log=open('/tmp/spec-a.log').read()
+          assert 'sampled speculation: probability-correct' in log
+          streamed=[int(line.split()[1]) for line in log.splitlines() if line.startswith('@K3TOKEN ')]
+          assert streamed==a['generated_ids'], (streamed,a['generated_ids'])
+          print('sampled speculative tiny K3: PASS',a['generated_ids'])
+          PY
+      - name: Greedy speculative behavior remains accepted by legacy gates
+        run: |
+          ./bin/k3 /tmp/k3tiny \
+            --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+            --draft-trunk /tmp/k3tiny-draft --draft-trunk-gb 0.05 \
+            --draft-topk 1 --spec 2 --ids 3,7,11,5,9 --gen 4 --incremental \
+            --temperature 0 --out /tmp/greedy-spec.json
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/greedy-spec.json'))
+          assert len(x['generated_ids'])==4
+          print('greedy speculation regression gate: PASS',x['generated_ids'])
+          PY
