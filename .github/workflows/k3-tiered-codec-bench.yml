@@ -6,6 +6,7 @@ on:
     paths:
       - 'benchmarks/bench_bf16_dict7_tiered.c'
       - 'benchmarks/bench_bf16_dict7_literal.c'
+      - 'benchmarks/bench_bf16_dict7_wide.c'
       - 'benchmarks/bench_bf16_dict_codec.c'
       - '.github/workflows/k3-tiered-codec-bench.yml'
 
@@ -24,15 +25,19 @@ jobs:
           cc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict_codec.c -o /tmp/dict15
           cc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict7_tiered.c -o /tmp/tiered
           cc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict7_literal.c -o /tmp/literal
+          cc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict7_wide.c -o /tmp/wide
           echo '=== dict15 baseline ==='
           /tmp/dict15 256 5 | tee /tmp/d15.log
           echo '=== dict7 tiered ==='
           /tmp/tiered 256 5 | tee /tmp/d7t.log
           echo '=== dict7 literal SIMD ==='
           /tmp/literal 256 5 | tee /tmp/d7l.log
+          echo '=== dict7 literal 32-wide ==='
+          /tmp/wide 256 5 | tee /tmp/d7w.log
           grep -q 'byte-identical roundtrip: PASS' /tmp/d15.log
           grep -q 'byte-identical roundtrip: PASS' /tmp/d7t.log
           grep -q 'byte-identical roundtrip: PASS' /tmp/d7l.log
+          grep -q 'byte-identical roundtrip: PASS' /tmp/d7w.log
 
   windows-avx2:
     runs-on: windows-latest
@@ -51,12 +56,16 @@ jobs:
           gcc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict_codec.c -o /tmp/dict15.exe
           gcc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict7_tiered.c -o /tmp/tiered.exe
           gcc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict7_literal.c -o /tmp/literal.exe
+          gcc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict7_wide.c -o /tmp/wide.exe
           echo '=== dict15 baseline ==='
           /tmp/dict15.exe 256 5 | tee /tmp/d15.log
           echo '=== dict7 tiered ==='
           /tmp/tiered.exe 256 5 | tee /tmp/d7t.log
           echo '=== dict7 literal SIMD ==='
           /tmp/literal.exe 256 5 | tee /tmp/d7l.log
+          echo '=== dict7 literal 32-wide ==='
+          /tmp/wide.exe 256 5 | tee /tmp/d7w.log
           grep -q 'byte-identical roundtrip: PASS' /tmp/d15.log
           grep -q 'byte-identical roundtrip: PASS' /tmp/d7t.log
           grep -q 'byte-identical roundtrip: PASS' /tmp/d7l.log
+          grep -q 'byte-identical roundtrip: PASS' /tmp/d7w.log
