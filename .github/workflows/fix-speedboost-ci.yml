@@ -32,8 +32,8 @@ jobs:
       - name: Fix and verify Python lint
         run: |
           pip install --quiet ruff
-          ruff check tools/q4_trunk.py --fix
           ruff format tools/q4_trunk.py
+          ruff check tools/q4_trunk.py --fix
           ruff check tools/ --output-format=github
           python -m compileall -q tools/
       - name: Commit fixes
