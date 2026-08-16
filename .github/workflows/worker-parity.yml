@@ -1,4 +1,5 @@
 # Permanent parity gate for warm exact + sampled-draft resident inference.
+# Rerun marker: request-local speculation horizon parity.
 name: Resident worker parity
 
 on:
