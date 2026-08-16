@@ -392,7 +392,7 @@ static void t_router(const char *dir)
          * fp32. idx and combining weights must match bit-for-bit, because the real old
          * binder did exactly that widening before calling the FP32 router. */
         int bf16_ok = 1;
-        const int PE = 17, PH = 257, PK = 4, PR = 5;
+        enum { PE = 17, PH = 257, PK = 4, PR = 5 };
         uint16_t *wb = (uint16_t *)malloc((size_t)PE * PH * sizeof(uint16_t));
         float *wf = (float *)malloc((size_t)PE * PH * sizeof(float));
         float *px = (float *)malloc((size_t)PR * PH * sizeof(float));
