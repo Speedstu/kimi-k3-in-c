@@ -43,12 +43,27 @@ jobs:
               p.write_text(s.replace(old,new,1))
           else:
               raise SystemExit(f'refusing ambiguous memory patch: {n} matches')
+
+          # Microsoft CRT treats _IOLBF as full buffering on Win32. The worker stdout is
+          # a machine protocol, so READY/TOKEN/DONE must be immediately observable.
+          p=Path('src/cli/k3_worker.c')
+          s=p.read_text()
+          old='''    setvbuf(stdout, NULL, _IOLBF, 0);\n'''
+          new='''#if defined(_WIN32)\n    setvbuf(stdout, NULL, _IONBF, 0);\n#else\n    setvbuf(stdout, NULL, _IOLBF, 0);\n#endif\n'''
+          n=s.count(old)
+          if n == 0:
+              if 'setvbuf(stdout, NULL, _IONBF, 0);' not in s:
+                  raise SystemExit('worker buffering source pattern not found')
+          elif n == 1:
+              p.write_text(s.replace(old,new,1))
+          else:
+              raise SystemExit(f'refusing ambiguous worker buffering patch: {n} matches')
           PY
           if git diff --quiet; then exit 0; fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/core/k3_ops.c src/cli/k3_run.c
-          git commit -m 'port: query available memory on Windows'
+          git add src/core/k3_ops.c src/cli/k3_run.c src/cli/k3_worker.c
+          git commit -m 'port: make Windows worker protocol unbuffered'
           git push origin HEAD:feature/windows-native-runtime
 
 # Temporary staging helper; deleted before PR.
