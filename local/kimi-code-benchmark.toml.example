@@ -1,0 +1,39 @@
+# Kimi K3 coding-benchmark parity profile for the OFFICIAL Kimi Code harness.
+# Use only inside a disposable benchmark VM/container: `auto` lets the agent execute
+# tools without interactive approval. Inference still goes only to localhost.
+
+default_model = "k3-local-bench"
+default_permission_mode = "auto"
+default_plan_mode = false
+merge_all_available_skills = true
+telemetry = false
+
+[providers.local-k3]
+type = "kimi"
+base_url = "http://127.0.0.1:8000/v1"
+api_key = "local-only"
+
+[models.k3-local-bench]
+provider = "local-k3"
+model = "kimi-k3-local"
+# K3's published model window. Declaring it here gives the harness the same behavioral
+# contract; the current C backend still performs a physical RAM preflight and will refuse
+# contexts the local machine cannot actually hold. The local README explains this split.
+max_context_size = 1048576
+capabilities = ["thinking", "always_thinking", "tool_use"]
+display_name = "K3 Local Benchmark"
+support_efforts = ["max"]
+default_effort = "max"
+
+[thinking]
+enabled = true
+effort = "max"
+keep = "all"
+
+[loop_control]
+max_attempts_per_step = 10
+reserved_context_size = 50000
+
+[background]
+max_running_tasks = 1
+keep_alive_on_exit = false
