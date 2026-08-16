@@ -1,30 +1,47 @@
-name: Stage adaptive router storage
+name: Validate adaptive BF16 router
 
 on:
   push:
     branches:
       - speedboost/bf16-router
 
-permissions:
-  contents: write
-
 jobs:
-  apply:
-    if: github.event.head_commit.message == 'stage adaptive router storage'
+  validate:
+    if: github.event.head_commit.message == 'validate adaptive router end to end'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: Apply adaptive storage patch
-        run: python3 tools/apply_router_adaptive_stage.py .
-      - name: Strict build
+      - name: Build and test
         run: |
-          make clean
-          make portable CFLAGS="-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -fopenmp -pthread -ffp-contract=off" -j2
-      - name: Full tests
-        run: make test -j2
-      - name: Benchmark released-size streamed versus resident router
+          make -j2
+          make test -j2
+      - name: Install tiny-checkpoint deps
+        run: |
+          python3 -m pip install --quiet numpy
+          python3 -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Resident vs streamed exact tiny checkpoint
+        run: |
+          rm -rf /tmp/k3tiny /tmp/k3raw
+          python3 tools/make_tiny_checkpoint.py /tmp/k3tiny --prompt-ids 3,7,11,5,9
+          python3 tools/pack_trunk.py /tmp/k3tiny /tmp/k3raw 13
+
+          ./bin/k3 /tmp/k3tiny --ids 3,7,11,5,9 --gen 3 --incremental \
+            --dump-logits /tmp/resident_logits.bin --out /tmp/resident.json > /tmp/resident.log
+          ./bin/k3 /tmp/k3tiny --ids 3,7,11,5,9 --gen 3 --incremental \
+            --trunk /tmp/k3raw --trunk-gb 0.05 --cache-gb 0.02 \
+            --dump-logits /tmp/stream_logits.bin --out /tmp/stream.json > /tmp/stream.log
+
+          cmp /tmp/resident_logits.bin /tmp/stream_logits.bin
+          python3 - <<'PY'
+          import json
+          a = json.load(open('/tmp/resident.json'))
+          b = json.load(open('/tmp/stream.json'))
+          for k in ('prompt_ids', 'generated_ids', 'full_ids', 'layers'):
+              assert a[k] == b[k], (k, a[k], b[k])
+          print('RESIDENT VS STREAMED ROUTER: BYTE-EXACT PASS')
+          print('generated_ids:', a['generated_ids'])
+          PY
+      - name: Router benchmark
         env:
           OMP_NUM_THREADS: '2'
         run: |
@@ -32,10 +49,3 @@ jobs:
              -Iinclude -Iinclude/k3 benchmarks/bench_router_storage.c build/src/core/k3_ops.o \
              -o /tmp/bench_router -lm -fopenmp -pthread
           /tmp/bench_router 10
-      - name: Commit validated adaptive source
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add include/k3/k3.h src/core/k3_ops.c src/model/k3_bind.c
-          git commit -m "perf: adapt MoE router storage to resident vs streamed trunks"
-          git push origin HEAD:speedboost/bf16-router
