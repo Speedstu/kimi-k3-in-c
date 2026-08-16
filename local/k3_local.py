@@ -37,7 +37,7 @@ from typing import Any
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-O = "<|open|>"
+OPEN = "<|open|>"
 C = "<|close|>"
 S = "<|sep|>"
 EOM = "<|end_of_msg|>"
@@ -58,11 +58,11 @@ def parse_xtml(text: str) -> dict[str, Any]:
     ``<|close|>think<|sep|>`` rather than with a think-open token.
     """
 
-    think_open = O + "think" + S
+    think_open = OPEN + "think" + S
     think_close = C + "think" + S
-    response_open = O + "response" + S
+    response_open = OPEN + "response" + S
     response_close = C + "response" + S
-    tools_open = O + "tools" + S
+    tools_open = OPEN + "tools" + S
     tools_close = C + "tools" + S
 
     raw = text
@@ -103,7 +103,7 @@ def parse_xtml(text: str) -> dict[str, Any]:
             tool_body = tool_body[:tc]
 
         call_re = re.compile(
-            re.escape(O)
+            re.escape(OPEN)
             + r"call(?P<attrs>.*?)"
             + re.escape(S)
             + r"(?P<body>.*?)"
@@ -111,7 +111,7 @@ def parse_xtml(text: str) -> dict[str, Any]:
             re.DOTALL,
         )
         arg_re = re.compile(
-            re.escape(O)
+            re.escape(OPEN)
             + r"argument(?P<attrs>.*?)"
             + re.escape(S)
             + r"(?P<body>.*?)"
@@ -119,7 +119,7 @@ def parse_xtml(text: str) -> dict[str, Any]:
             re.DOTALL,
         )
         json_re = re.compile(
-            re.escape(O)
+            re.escape(OPEN)
             + r"json(?P<attrs>.*?)"
             + re.escape(S)
             + r"(?P<body>.*?)"
@@ -512,7 +512,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if self.path == "/v1/models":
             self._json(
                 200,
@@ -539,7 +539,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": {"message": "not found"}})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         if self.path != "/v1/chat/completions":
             self._json(404, {"error": {"message": "not found"}})
             return
@@ -547,7 +547,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
             result = self.server.k3.complete(request)  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001 - HTTP API boundary
+        except Exception as exc:
             self._json(
                 400,
                 {"error": {"message": str(exc), "type": type(exc).__name__}},
