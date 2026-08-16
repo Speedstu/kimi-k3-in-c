@@ -54,13 +54,14 @@ jobs:
               assert cfg['thinking']['enabled'] is True
               assert cfg['thinking']['effort'] == 'max'
               assert cfg['thinking']['keep'] == 'all'
+              assert cfg['models'][cfg['default_model']]['max_output_size'] == 4096
               print(path, 'PASS')
           PY
       - name: Build and sampler unit test
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libomp-dev
-          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+          make ARCH='-mavx2 -mfma' bin/test_sample -j"$(nproc)"
           ./bin/test_sample
 
   tiny-end-to-end:
@@ -148,7 +149,7 @@ jobs:
           ./bin/k3 /tmp/k3tiny --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
             --ids 3,7,11,5,9 --gen 8 --incremental --temperature 0 --stop-id "$STOP" --out /tmp/stop.json
           python - <<'PY'
-          import json, os
+          import json
           x=json.load(open('/tmp/stop.json'))
           assert len(x['generated_ids'])==1
           assert x['generated_ids'][0]==x['stop_id']
