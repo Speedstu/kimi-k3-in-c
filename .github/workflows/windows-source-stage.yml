@@ -1,0 +1,39 @@
+name: Windows source staging
+
+on:
+  push:
+    branches: [feature/windows-native-runtime]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/windows-native-runtime
+      - name: Remove dead Q4 fallback counter once
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/core/k3_ops.c')
+          s=p.read_text()
+          old='for (int g = 0, off = 0; off < in; g++, off += K3_Q4_GROUP) {'
+          new='for (int off = 0; off < in; off += K3_Q4_GROUP) {'
+          n=s.count(old)
+          if n == 0:
+              print('Q4 group counter already clean')
+          elif n == 1:
+              p.write_text(s.replace(old,new,1))
+              print('patched Q4 group counter')
+          else:
+              raise SystemExit(f'refusing ambiguous patch: {n} matches')
+          PY
+          if git diff --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/core/k3_ops.c
+          git commit -m 'core: remove dead Q4 group counter'
+          git push origin HEAD:feature/windows-native-runtime
