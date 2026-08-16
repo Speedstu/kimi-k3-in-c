@@ -488,7 +488,7 @@ typedef struct {
  * token at streamed-trunk budgets, which is the entire economics of --spec. */
 static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, int T,
                    float *logits_last, float *scratch, float *h, float *br, float *kstate,
-                   int *arg_all)
+                   int *arg_all, float *logits_all)
 {
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
@@ -557,8 +557,9 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     }
 
     float *nrm = scratch;
-    if (arg_all) {
-        /* Speculative verification asks for argmax at several adjacent positions. The
+    if (arg_all || logits_all) {
+        /* Speculative verification asks for complete distributions at several adjacent
+         * positions in sampled mode and argmaxes in greedy mode. The
          * old path ran the full lm_head matvec once per position, re-reading the same
          * ~2.35 GB bf16 matrix T times. For the short speculative batches (<=9), walk
          * vocabulary rows OUTER and positions INNER instead: each weight row is fetched
@@ -573,7 +574,12 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
          * batches. Longer arg_all calls retain the old low-memory path below. */
         if (T > 1 && T <= K3_SPEC_MAX + 1) {
             const size_t nv = (size_t)c->vocab;
-            float *all = (float *)malloc((size_t)T * nv * sizeof(float));
+            int own_all = 0;
+            float *all = logits_all;
+            if (!all) {
+                all = (float *)malloc((size_t)T * nv * sizeof(float));
+                own_all = 1;
+            }
             if (all) {
                 /* h is dead after logits are produced, so normalise in place and avoid
                  * another T*hidden scratch allocation. k3_rmsnorm supports y == x. */
@@ -592,10 +598,11 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
                         k3_mmw(all + (size_t)t * nv + o,
                                h + (size_t)t * E, row, w->mb.wdt, E, 1);
                 }
-                for (int t = 0; t < T; t++)
-                    arg_all[t] = argmax_(all + (size_t)t * nv, c->vocab);
+                if (arg_all)
+                    for (int t = 0; t < T; t++)
+                        arg_all[t] = argmax_(all + (size_t)t * nv, c->vocab);
                 memcpy(logits_last, all + (size_t)(T - 1) * nv, nv * sizeof(float));
-                free(all);
+                if (own_all) free(all);
                 return 0;
             }
             /* Allocation failure is a performance miss, not a correctness failure:
@@ -604,7 +611,10 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
         for (int t = 0; t < T; t++) {
             k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
             k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
-            arg_all[t] = argmax_(logits_last, c->vocab);
+            if (arg_all) arg_all[t] = argmax_(logits_last, c->vocab);
+            if (logits_all)
+                memcpy(logits_all + (size_t)t * c->vocab, logits_last,
+                       (size_t)c->vocab * sizeof(float));
         }
         /* logits_last now holds the FINAL position's vector, same as the plain path. */
         return 0;
@@ -746,12 +756,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "--stop-id must be >= -1\n");
         return 2;
     }
-    if (temperature > 0.0 && (spec_n > 0 || draft_dir != NULL)) {
-        fprintf(stderr, "sampled speculative decoding is not implemented yet; remove --spec/--draft-trunk\n"
-                        "rather than silently changing the requested sampling distribution.\n");
-        return 2;
-    }
-
     if (threads < 0 || threads > 4096) {
         fprintf(stderr, "--threads must be in [1,4096] when supplied, got %d\n", threads);
         return 2;
@@ -846,8 +850,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "--stop-id %d is outside vocabulary [0,%d)\n", stop_id, c.vocab);
         return 2;
     }
-    K3Sampler sampler;
+    K3Sampler sampler, draft_sampler, accept_sampler;
     k3_sampler_init(&sampler, temperature, top_p, (uint64_t)sample_seed);
+    k3_sampler_init(&draft_sampler, temperature, top_p,
+                    (uint64_t)sample_seed ^ UINT64_C(0xd6e8feb86659fd93));
+    k3_sampler_init(&accept_sampler, temperature, top_p,
+                    (uint64_t)sample_seed ^ UINT64_C(0xa5a3564e27f8862b));
 
     if (draft_dir && (draft_topk < 1 || draft_topk > c.topk)) {
         fprintf(stderr, "--draft-topk must be in [1,%d], got %d\n", c.topk, draft_topk);
@@ -1323,6 +1331,24 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Sampled speculative verification needs q_i for every proposal and p_i for every
+     * verified position. At K3's 163840-token vocabulary and spec=4 this is only about
+     * 8 MB of doubles plus 3 MB of logits -- tiny beside the model/KV working set, and
+     * allocated only for temperature > 0. */
+    float *spec_target_logits = NULL;
+    double *spec_q_probs = NULL, *spec_p_probs = NULL;
+    if (temperature > 0.0 && spec_n > 0) {
+        spec_target_logits = (float *)malloc((size_t)(spec_n + 1) * c.vocab * sizeof(float));
+        spec_q_probs = (double *)malloc((size_t)spec_n * c.vocab * sizeof(double));
+        spec_p_probs = (double *)malloc((size_t)c.vocab * sizeof(double));
+        if (!spec_target_logits || !spec_q_probs || !spec_p_probs) {
+            fprintf(stderr, "OOM for sampled speculative probability buffers\n");
+            return 1;
+        }
+        printf("sampled speculation: probability-correct p/q accept + (p-q)+ residual; "
+               "target distribution preserved\n\n");
+    }
+
     /* --tf-check: teacher-forced agreement over the whole --ids sequence in ONE sweep.
      * Prediction i is the argmax after positions 0..i; it is compared to the id the
      * sequence actually continues with. This is the acceptance rate a draft model
@@ -1334,7 +1360,7 @@ int main(int argc, char **argv)
         int *arg = (int *)malloc((size_t)np * sizeof(int));
         if (!arg) { fprintf(stderr, "OOM for --tf-check\n"); return 1; }
         const double t0c = now_s();
-        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, arg) != 0) {
+        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, arg, NULL) != 0) {
             fprintf(stderr, "forward failed in --tf-check\n");
             return 1;
         }
@@ -1381,7 +1407,7 @@ int main(int argc, char **argv)
              * from a context one token short: fluent, plausible, and wrong. */
             const int base = w.cached;
             const int nT0 = T - base;
-            frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL);
+            frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL, NULL);
             if (frc == 0) { w.cached = base + nT0; emit[emitn++] = k3_sample_token(&sampler, lg, c.vocab); }
             /* The draft model must absorb the same context, or its first proposals
              * come from a shorter one; one draft sweep, paid once. Saved state does
@@ -1391,7 +1417,7 @@ int main(int argc, char **argv)
             if (dw.trunk && frc == 0) {
                 const int db = load_state ? 0 : base;
                 if (forward(&dw, &c, &cache, seq + db, base + nT0 - db, lg, sc, h, br,
-                            dks, NULL) == 0)
+                            dks, NULL, NULL) == 0)
                     dw.cached = base + nT0;
                 else frc = -1;
             }
@@ -1408,15 +1434,29 @@ int main(int argc, char **argv)
                     int prev = seq[base];
                     while (nd < spec_n) {
                         if (forward(&dw, &c, &cache, &prev, 1, lg, sc, h, br,
-                                    dks, NULL) != 0) break;
+                                    dks, NULL, NULL) != 0) break;
                         dw.cached += 1;
-                        prev = argmax_(lg, c.vocab);
+                        if (temperature > 0.0) {
+                            double *qrow = spec_q_probs + (size_t)nd * c.vocab;
+                            if (k3_sampler_distribution(&draft_sampler, lg, c.vocab, qrow) != 0)
+                                break;
+                            prev = k3_sample_probs(&draft_sampler, qrow, c.vocab);
+                            if (prev < 0) break;
+                        } else {
+                            prev = argmax_(lg, c.vocab);
+                        }
                         d[nd++] = prev;
                     }
                     hyb_rounds  += 1;
                     hyb_drafted += nd;
                 } else {
                     nd = spec_draft(seq, T, spec_n, d);
+                    if (temperature > 0.0)
+                        for (int j = 0; j < nd; j++) {
+                            double *qrow = spec_q_probs + (size_t)j * c.vocab;
+                            memset(qrow, 0, (size_t)c.vocab * sizeof(double));
+                            qrow[d[j]] = 1.0;
+                        }
                 }
             }
             if (nd > 0) {
@@ -1427,10 +1467,48 @@ int main(int argc, char **argv)
                 int arg[K3_SPEC_MAX + 1];
                 memcpy(spec_snap, ks, kper_f * (size_t)w.n_bound * sizeof(float));
                 for (int i = 0; i < nd; i++) seq[T + i] = d[i];
-                frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg);
+                frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks,
+                              arg, temperature > 0.0 ? spec_target_logits : NULL);
                 if (frc == 0) {
                     int m = 0;
-                    while (m < nd && arg[m] == d[m]) m++;
+                    int correction = -1;
+                    if (temperature <= 0.0) {
+                        while (m < nd && arg[m] == d[m]) m++;
+                        correction = arg[m];
+                    } else {
+                        /* Standard speculative sampling. Proposal y~q is accepted with
+                         * min(1,p(y)/q(y)). On first rejection sample from normalised
+                         * (p-q)+. If every proposal is accepted, sample one extra token
+                         * from the target distribution after the final draft. */
+                        for (; m < nd; m++) {
+                            const float *plog = spec_target_logits + (size_t)m * c.vocab;
+                            const double *qrow = spec_q_probs + (size_t)m * c.vocab;
+                            if (k3_sampler_distribution(&sampler, plog, c.vocab,
+                                                        spec_p_probs) != 0) {
+                                frc = -1;
+                                break;
+                            }
+                            const double qy = qrow[d[m]];
+                            const double py = spec_p_probs[d[m]];
+                            if (!(qy > 0.0)) { frc = -1; break; }
+                            double accept = py / qy;
+                            if (accept > 1.0) accept = 1.0;
+                            if (k3_sampler_uniform(&accept_sampler) >= accept) {
+                                correction = k3_sample_residual(&sampler, spec_p_probs,
+                                                                qrow, c.vocab);
+                                break;
+                            }
+                        }
+                        if (frc == 0 && m == nd) {
+                            const float *extra = spec_target_logits + (size_t)nd * c.vocab;
+                            if (k3_sampler_distribution(&sampler, extra, c.vocab,
+                                                        spec_p_probs) != 0)
+                                frc = -1;
+                            else
+                                correction = k3_sample_probs(&sampler, spec_p_probs, c.vocab);
+                        }
+                        if (correction < 0) frc = -1;
+                    }
                     if (m == nd) {
                         /* every fed position had true context; state is exact */
                         w.cached = base + nd + 1;
@@ -1441,7 +1519,7 @@ int main(int argc, char **argv)
                         memcpy(ks, spec_snap, kper_f * (size_t)w.n_bound * sizeof(float));
                         w.cached = base;
                         frc = forward(&w, &c, &cache, seq + base, m + 1, lg, sc, h, br,
-                                      ks, NULL);
+                                      ks, NULL, NULL);
                         if (frc == 0) w.cached = base + m + 1;
                     }
                     /* Resync the draft model to the ACCEPTED sequence. On full
@@ -1454,33 +1532,33 @@ int main(int argc, char **argv)
                         if (m == nd) {
                             int last = d[nd - 1];
                             if (forward(&dw, &c, &cache, &last, 1, lg, sc, h, br,
-                                        dks, NULL) == 0) dw.cached += 1;
+                                        dks, NULL, NULL) == 0) dw.cached += 1;
                             else frc = -1;
                         } else {
                             memcpy(dks, dsnap, kper_f * (size_t)w.n_bound * sizeof(float));
                             dw.cached = base;
                             if (forward(&dw, &c, &cache, seq + base, m + 1, lg, sc,
-                                        h, br, dks, NULL) == 0) dw.cached = base + m + 1;
+                                        h, br, dks, NULL, NULL) == 0) dw.cached = base + m + 1;
                             else frc = -1;
                         }
                     }
                     if (frc == 0) {
                         for (int i = 0; i < m; i++) emit[emitn++] = d[i];
-                        emit[emitn++] = arg[m];
+                        emit[emitn++] = correction;
                     }
                 }
             } else {
-                frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL);
+                frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL, NULL);
                 if (frc == 0) { w.cached = base + 1; emit[emitn++] = k3_sample_token(&sampler, lg, c.vocab); }
                 /* keep the draft in lockstep through non-drafted steps */
                 if (dw.trunk && frc == 0) {
                     if (forward(&dw, &c, &cache, seq + base, 1, lg, sc, h, br,
-                                dks, NULL) == 0) dw.cached = base + 1;
+                                dks, NULL, NULL) == 0) dw.cached = base + 1;
                     else frc = -1;
                 }
             }
         } else {
-            frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL);
+            frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL, NULL);
             if (frc == 0) emit[emitn++] = k3_sample_token(&sampler, lg, c.vocab);
         }
         for (int i = 0; i < emitn; i++) if (emit[i] < 0) frc = -1;
@@ -1564,6 +1642,7 @@ int main(int argc, char **argv)
         free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec);
     }
     free(spec_snap);
+    free(spec_target_logits); free(spec_q_probs); free(spec_p_probs);
     printf("--------------------------------------------------------------------\n");
     printf("%d tokens in %.1f s, %.2f s/token average\n", nout, t_total, t_total / nout);
 
