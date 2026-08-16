@@ -1,0 +1,105 @@
+name: Adaptive resident prefill parity
+
+on:
+  push:
+    branches: [main, 'feature/**']
+    paths:
+      - 'src/cli/k3_worker.c'
+      - 'local/k3_local.py'
+      - 'benchmarks/prefill-sweep.sh'
+      - '.github/workflows/adaptive-prefill-parity.yml'
+  pull_request:
+    paths:
+      - 'src/cli/k3_worker.c'
+      - 'local/k3_local.py'
+      - 'benchmarks/prefill-sweep.sh'
+      - '.github/workflows/adaptive-prefill-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  tiny-prefill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Dependencies and build
+        run: |
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+      - name: Generate tiny K3, exact trunk, and approximate draft
+        run: |
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11 >/dev/null
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3tiny-trunk "$NLAYERS" >/dev/null
+          python tools/qdq_trunk.py /tmp/k3tiny-trunk /tmp/k3tiny-draft --bits 4 --group 0 >/dev/null
+      - name: Manual and automatic chunks preserve exact output
+        run: |
+          python - <<'PY'
+          import json, re, subprocess, tempfile
+
+          model='/tmp/k3tiny'; trunk='/tmp/k3tiny-trunk'; draft='/tmp/k3tiny-draft'
+          base=[model,'--trunk',trunk,'--trunk-gb','.05','--cache-gb','.05']
+          dargs=['--draft-trunk',draft,'--draft-trunk-gb','.05','--draft-topk','1','--spec','2']
+          ids=([3,7,11,5,9]*26)[:130]
+
+          def oneshot(gen,temp=0,seed=1,draft_on=False):
+              with tempfile.NamedTemporaryFile(suffix='.json') as f:
+                  cmd=['./bin/k3',*base]
+                  if draft_on: cmd += dargs
+                  cmd += ['--ids',','.join(map(str,ids)),'--gen',str(gen),'--incremental',
+                          '--temperature',str(temp),'--top-p','.95' if temp else '1',
+                          '--seed',str(seed),'--out',f.name]
+                  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL)
+                  return json.load(open(f.name))['generated_ids']
+
+          def worker(extra,gen=3,temp=0,seed=1,draft_on=False):
+              cmd=['./bin/k3-worker',*base,'--context','192',*extra]
+              if draft_on: cmd += dargs
+              p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT,text=True,bufsize=1)
+              assert p.stdin and p.stdout
+              startup=[]; selected=None
+              for line in p.stdout:
+                  startup.append(line)
+                  m=re.search(r'resident prefill: chunk (\d+) tokens',line)
+                  if m: selected=int(m.group(1))
+                  if line.startswith('@K3READY '): break
+              assert selected is not None,''.join(startup[-20:])
+              p.stdin.write(f'REQ 1 {len(ids)} {gen} {temp} {".95" if temp else "1"} {seed} -1\n')
+              p.stdin.write(' '.join(map(str,ids))+'\n'); p.stdin.flush()
+              out=[]
+              for line in p.stdout:
+                  if line.startswith('@K3TOKEN 1 '): out.append(int(line.split()[2]))
+                  elif line.startswith('@K3ERROR 1 '): raise AssertionError(line)
+                  elif line.startswith('@K3DONE 1 '): break
+              p.stdin.write('QUIT\n'); p.stdin.flush(); p.wait(timeout=10)
+              assert p.returncode==0
+              return out,selected
+
+          ref=oneshot(3)
+          for chunk in (1,16,64,128):
+              got,selected=worker(['--prefill-chunk',str(chunk)])
+              assert selected==chunk,(selected,chunk)
+              assert got==ref,(chunk,got,ref)
+
+          auto,selected=worker(['--prefill-mb','256'])
+          assert auto==ref,(auto,ref)
+          assert selected>64,selected
+
+          refd=oneshot(6,1,987654,True)
+          gotd,selected=worker(['--prefill-mb','256'],6,1,987654,True)
+          assert gotd==refd,(gotd,refd)
+          print('adaptive prefill exact + sampled-draft parity: PASS; auto chunk',selected)
+          PY
