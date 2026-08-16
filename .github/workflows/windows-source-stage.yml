@@ -14,56 +14,28 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: feature/windows-native-runtime
-      - name: Apply remaining Windows source portability edits once
+      - name: Update Windows README note once
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
-          # Q4: warning-clean scalar/non-AVX build, no arithmetic change.
-          p=Path('src/core/k3_ops.c')
+          p=Path('README.md')
           s=p.read_text()
-          old='for (int g = 0, off = 0; off < in; g++, off += K3_Q4_GROUP) {'
-          new='for (int off = 0; off < in; off += K3_Q4_GROUP) {'
-          n=s.count(old)
-          if n > 1:
-              raise SystemExit(f'refusing ambiguous Q4 patch: {n} matches')
-          if n == 1:
-              p.write_text(s.replace(old,new,1))
-
-          # k3_run: make auto-budgeting and the KV guard meaningful on native Windows.
-          p=Path('src/cli/k3_run.c')
-          s=p.read_text()
-          old='''static double mem_available_bytes(void)\n{\n    FILE *f = fopen("/proc/meminfo", "r");\n    if (!f) return 0.0;\n    char line[256];\n    double kb = 0.0;\n    while (fgets(line, sizeof line, f))\n        if (!strncmp(line, "MemAvailable:", 13)) { kb = atof(line + 13); break; }\n    fclose(f);\n    return kb * 1024.0;\n}\n'''
-          new='''static double mem_available_bytes(void)\n{\n#if defined(_WIN32)\n    MEMORYSTATUSEX ms;\n    memset(&ms, 0, sizeof ms);\n    ms.dwLength = sizeof ms;\n    return GlobalMemoryStatusEx(&ms) ? (double)ms.ullAvailPhys : 0.0;\n#else\n    FILE *f = fopen("/proc/meminfo", "r");\n    if (!f) return 0.0;\n    char line[256];\n    double kb = 0.0;\n    while (fgets(line, sizeof line, f))\n        if (!strncmp(line, "MemAvailable:", 13)) { kb = atof(line + 13); break; }\n    fclose(f);\n    return kb * 1024.0;\n#endif\n}\n'''
+          old='''**macOS, Windows, WSL?** The engine targets Linux. The tokenizer and config reader are\nportable C99 and are built portably in CI.\n'''
+          new='''**macOS, Windows, WSL?** Linux remains the reference and macOS is CI-gated. Native\nWindows x64 now builds and runs through MSYS2 UCRT64/GCC, including `bin/k3-worker` and\ntiny exact/Q4 speculative parity. The current Windows storage path is a correctness\nbaseline, not yet a claim of Linux-`O_DIRECT` performance; see [docs/WINDOWS.md](docs/WINDOWS.md).\n'''
           n=s.count(old)
           if n == 0:
-              if 'GlobalMemoryStatusEx(&ms)' not in s:
-                  raise SystemExit('mem_available_bytes source pattern not found')
+              if 'docs/WINDOWS.md' not in s:
+                  raise SystemExit('README Windows FAQ pattern not found')
           elif n == 1:
               p.write_text(s.replace(old,new,1))
           else:
-              raise SystemExit(f'refusing ambiguous memory patch: {n} matches')
-
-          # Microsoft CRT treats _IOLBF as full buffering on Win32. The worker stdout is
-          # a machine protocol, so READY/TOKEN/DONE must be immediately observable.
-          p=Path('src/cli/k3_worker.c')
-          s=p.read_text()
-          old='''    setvbuf(stdout, NULL, _IOLBF, 0);\n'''
-          new='''#if defined(_WIN32)\n    setvbuf(stdout, NULL, _IONBF, 0);\n#else\n    setvbuf(stdout, NULL, _IOLBF, 0);\n#endif\n'''
-          n=s.count(old)
-          if n == 0:
-              if 'setvbuf(stdout, NULL, _IONBF, 0);' not in s:
-                  raise SystemExit('worker buffering source pattern not found')
-          elif n == 1:
-              p.write_text(s.replace(old,new,1))
-          else:
-              raise SystemExit(f'refusing ambiguous worker buffering patch: {n} matches')
+              raise SystemExit(f'refusing ambiguous README patch: {n} matches')
           PY
           if git diff --quiet; then exit 0; fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/core/k3_ops.c src/cli/k3_run.c src/cli/k3_worker.c
-          git commit -m 'port: make Windows worker protocol unbuffered'
+          git add README.md
+          git commit -m 'docs: advertise gated native Windows runtime'
           git push origin HEAD:feature/windows-native-runtime
 
 # Temporary staging helper; deleted before PR.
