@@ -1,0 +1,32 @@
+name: Post-MXFP4 kernel profile
+
+on:
+  push:
+    branches: [speedboost/post-mxfp4-kernel-probe]
+    paths:
+      - '.github/workflows/post-mxfp4-kernel-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build real-dimension kernel benchmark
+        run: |
+          set -euo pipefail
+          make -j2
+          cc -O3 -std=gnu99 -march=native -fopenmp -pthread -ffp-contract=off \
+             -Iinclude -Iinclude/k3 benchmarks/bench_kernels.c build/src/core/k3_ops.o \
+             -o /tmp/bench_kernels -lm -fopenmp -pthread
+      - name: One thread
+        run: OMP_NUM_THREADS=1 /tmp/bench_kernels
+      - name: Two threads
+        run: OMP_NUM_THREADS=2 /tmp/bench_kernels
+      - name: Four threads
+        run: OMP_NUM_THREADS=4 /tmp/bench_kernels
+      - name: Eight threads
+        run: OMP_NUM_THREADS=8 /tmp/bench_kernels
