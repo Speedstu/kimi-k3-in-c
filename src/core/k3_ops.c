@@ -806,6 +806,18 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
     if (!ridx || !rwt || !zz || !contrib)
         k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
+#if defined(__AVX2__)
+    /* Expert-major prefill reuses each token's latent across up to K routed experts.
+     * Widen the latent once per token instead of once per output row of every w1/w3
+     * matmul. 64 * 3584 doubles is only ~1.75 MiB at the released geometry. */
+    static int no_prefill_xdouble = -1;
+    if (no_prefill_xdouble < 0)
+        no_prefill_xdouble = getenv("K3_NO_PREFILL_XDOUBLE") ? 1 : 0;
+    double *zzd = no_prefill_xdouble ? NULL
+                                     : (double *)malloc((size_t)T * Ll * sizeof(double));
+    if (!no_prefill_xdouble && !zzd)
+        k3_fatal_oom("MoE prefill xdouble latents", (size_t)T * Ll * sizeof(double));
+#endif
 
     /* 1. route every token and down-project it, and collect the batch's unique experts. */
     int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
@@ -819,6 +831,13 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         k3_router(it, wtt, xt, w->gate, w->gate_wdt, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
         k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
+#if defined(__AVX2__)
+        if (zzd) {
+            const float *zt = zz + (size_t)t * Ll;
+            double *zdt = zzd + (size_t)t * Ll;
+            for (int i = 0; i < Ll; i++) zdt[i] = (double)zt[i];
+        }
+#endif
         for (int j = 0; j < K; j++) {
             const int e = it[j];
             if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
@@ -839,6 +858,13 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     float *gu  = scratch;                 /* [2*I] */
     float *act = gu + 2 * I;              /* [I]   */
     float *edn = act + I;                 /* [Ll]  */
+#if defined(__AVX2__)
+    /* k3_moe_scratch already reserves xdouble workspace. During routed prefill the
+     * float regions after edn are dead, so one aligned I-double act buffer fits well
+     * inside that existing contract without growing the caller scratch. */
+    uintptr_t actdp = ((uintptr_t)(edn + Ll) + 7u) & ~(uintptr_t)7u;
+    double *actxd = (double *)actdp;
+#endif
     static int no_prefill_pipeline = -1;
     if (no_prefill_pipeline < 0)
         no_prefill_pipeline = getenv("K3_NO_PREFILL_PIPELINE") ? 1 : 0;
@@ -887,10 +913,28 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                 const float *zt = zz  + (size_t)t * Ll;
                 for (int j = 0; j < K; j++) {
                     if (it[j] != e) continue;
-                    k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
-                    k3_matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
-                    k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                    k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
+#if defined(__AVX2__)
+                    if (zzd) {
+                        const double *zdt = zzd + (size_t)t * Ll;
+                        /* Single-row xd is the measured production winner; row-pair is
+                         * intentionally not enabled here. The same widened z serves both
+                         * gate/up matrices and all experts that selected this token. */
+                        k3_matmul_mxfp4_xd(gu,     zdt, q.p1, q.s1,
+                                           Ll, I, K3_MXFP4_GROUP, 0);
+                        k3_matmul_mxfp4_xd(gu + I, zdt, q.p3, q.s3,
+                                           Ll, I, K3_MXFP4_GROUP, 0);
+                        k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
+                        for (int i = 0; i < I; i++) actxd[i] = (double)act[i];
+                        k3_matmul_mxfp4_xd(edn, actxd, q.p2, q.s2,
+                                           I, Ll, K3_MXFP4_GROUP, 0);
+                    } else
+#endif
+                    {
+                        k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
+                        k3_matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
+                        k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
+                        k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
+                    }
                     memcpy(contrib + ((size_t)t * K + j) * Ll, edn, (size_t)Ll * sizeof(float));
                 }
             }
@@ -930,6 +974,9 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
 
+#if defined(__AVX2__)
+    free(zzd);
+#endif
     free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
 }
 
