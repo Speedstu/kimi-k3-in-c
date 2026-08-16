@@ -240,7 +240,11 @@ int main(int argc, char **argv)
 #if defined(_WIN32)
     setvbuf(stdout, NULL, _IONBF, 0);
 #else
+#if defined(_WIN32)
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
     setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
 #endif
     if (argc < 2) { worker_usage(stderr); return 2; }
     for (int i = 1; i < argc; i++) {
