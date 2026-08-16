@@ -1,0 +1,73 @@
+name: Stage async expert overlap
+
+on:
+  push:
+    branches:
+      - speedboost/async-expert-prefetch
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'stage async expert overlap'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Apply async overlap patch
+        run: python3 tools/apply_async_expert_stage.py .
+
+      - name: Build
+        run: make -j2
+
+      - name: Full tests
+        run: make test -j2
+
+      - name: Strict warnings build
+        run: |
+          make clean
+          make portable CFLAGS="-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -fopenmp -pthread -ffp-contract=off" -j2
+
+      - name: Install tiny-checkpoint deps
+        run: |
+          python3 -m pip install --quiet numpy
+          python3 -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Async vs sync tiny checkpoint
+        run: |
+          rm -rf /tmp/k3tiny /tmp/k3raw
+          python3 tools/make_tiny_checkpoint.py /tmp/k3tiny --prompt-ids 3,7,11,5,9
+          python3 tools/pack_trunk.py /tmp/k3tiny /tmp/k3raw 13
+
+          make -j2
+          ./bin/k3 /tmp/k3tiny --ids 3,7,11,5,9 --gen 3 --incremental \
+            --trunk /tmp/k3raw --trunk-gb 0.05 --cache-gb 0.02 \
+            --dump-logits /tmp/async_logits.bin --out /tmp/async.json > /tmp/async.log
+          K3_NOASYNC_PREFETCH=1 ./bin/k3 /tmp/k3tiny --ids 3,7,11,5,9 --gen 3 --incremental \
+            --trunk /tmp/k3raw --trunk-gb 0.05 --cache-gb 0.02 \
+            --dump-logits /tmp/sync_logits.bin --out /tmp/sync.json > /tmp/sync.log
+
+          cmp /tmp/async_logits.bin /tmp/sync_logits.bin
+          python3 - <<'PY'
+          import json
+          a = json.load(open('/tmp/async.json'))
+          b = json.load(open('/tmp/sync.json'))
+          for k in ('prompt_ids', 'generated_ids', 'full_ids', 'layers'):
+              assert a[k] == b[k], (k, a[k], b[k])
+          print('ASYNC VS SYNC EXPERT PREFETCH: BYTE-EXACT PASS')
+          print('generated_ids:', a['generated_ids'])
+          PY
+          grep -q 'async overlap' /tmp/async.log
+          grep -q 'async expert overlap DISABLED' /tmp/sync.log || true
+          tail -40 /tmp/async.log
+
+      - name: Commit validated source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add include/k3/k3.h src/cache/k3_cache.h src/cache/k3_cache.c src/core/k3_ops.c tests/unit/test_cache.c
+          git commit -m "perf: overlap expert reads with independent MoE compute"
+          git push origin HEAD:speedboost/async-expert-prefetch
