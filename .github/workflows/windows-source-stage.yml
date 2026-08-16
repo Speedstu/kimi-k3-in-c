@@ -37,3 +37,5 @@ jobs:
           git add src/core/k3_ops.c
           git commit -m 'core: remove dead Q4 group counter'
           git push origin HEAD:feature/windows-native-runtime
+
+# Existing only while the Windows port is staged; removed before PR.
