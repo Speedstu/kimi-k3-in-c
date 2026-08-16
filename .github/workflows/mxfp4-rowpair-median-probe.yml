@@ -1,0 +1,52 @@
+name: MXFP4 row-pair median probe
+
+on:
+  push:
+    branches: [speedboost/mxfp4-rowpair-median-probe]
+  workflow_dispatch:
+
+jobs:
+  median:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build production helper probe
+        run: |
+          set -euo pipefail
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS \
+             -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_test.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off \
+             benchmarks/bench_mxfp4_rowpair_exact.c /tmp/k3_ops_test.o \
+             -o /tmp/mx_rowpair_exact -lm -fopenmp -pthread
+      - name: Nine repeats and medians
+        run: |
+          set -euo pipefail
+          : > /tmp/all.txt
+          for t in 1 2 4; do
+            for r in $(seq 1 9); do
+              OMP_NUM_THREADS=$t /tmp/mx_rowpair_exact | tee /tmp/run.txt
+              grep -q 'ROWPAIR EXACTNESS PASS' /tmp/run.txt
+              awk -v t="$t" -v r="$r" '
+                /^w1w3 single=/ {for(i=1;i<=NF;i++) if($i ~ /^speedup=/){gsub(/speedup=|x/,"",$i); print t, r, "w1w3", $i}}
+                /^w2 single=/   {for(i=1;i<=NF;i++) if($i ~ /^speedup=/){gsub(/speedup=|x/,"",$i); print t, r, "w2", $i}}
+              ' /tmp/run.txt >> /tmp/all.txt
+            done
+          done
+          cat /tmp/all.txt
+          python3 - <<'PY'
+          import statistics
+          from collections import defaultdict
+          d=defaultdict(list)
+          for line in open('/tmp/all.txt'):
+              t,r,shape,x=line.split()
+              d[(int(t),shape)].append(float(x))
+          print('\nMEDIANS')
+          failed=False
+          for key in sorted(d):
+              vals=d[key]
+              med=statistics.median(vals)
+              print(f'threads={key[0]} shape={key[1]} median={med:.4f}x min={min(vals):.4f} max={max(vals):.4f}')
+              if med < 1.0:
+                  failed=True
+          print('ROWPAIR_DEFAULT_VERDICT=' + ('REGRESSION' if failed else 'KEEP'))
+          PY
