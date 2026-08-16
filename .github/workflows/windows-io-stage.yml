@@ -1,0 +1,63 @@
+name: Windows I/O staging
+
+on:
+  push:
+    branches: [feature/windows-overlapped-io]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/windows-overlapped-io
+      - name: Wire portable open and file-size helpers once
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p=Path('src/io/k3_st.c')
+          s=p.read_text()
+          reps=[
+            ('int fd = open(path, O_RDONLY);',
+             'int fd = k3_open_read(path, 0, NULL);'),
+            ('''    off_t fsize = lseek(fd, 0, SEEK_END);\n    if (hlen == 0 || (uint64_t)fsize < 8 + hlen) {''',
+             '''    const int64_t fsize = k3_file_size(fd);\n    if (fsize < 0 || hlen == 0 || (uint64_t)fsize < 8 + hlen) {'''),
+            ('''    if (s->dfd) {\n        s->dfd[shard] = open(path, O_RDONLY | O_DIRECT);\n        k3_set_direct(s->dfd[shard]);   /* no-op off Darwin; advisory, failure is fine */\n    }''',
+             '''    if (s->dfd) {\n        int direct = 0;\n        int dfd = k3_open_read(path, 1, &direct);\n        if (dfd >= 0 && direct) s->dfd[shard] = dfd;\n        else {\n            if (dfd >= 0) close(dfd);\n            s->dfd[shard] = -1;\n        }\n    }'''),
+          ]
+          for old,new in reps:
+              n=s.count(old)
+              if n == 1: s=s.replace(old,new,1)
+              elif n == 0 and new.splitlines()[0].strip() in s: pass
+              else: raise SystemExit(f'k3_st ambiguous/missing pattern: {old[:80]!r} count={n}')
+          p.write_text(s)
+
+          p=Path('src/io/k3_trunk.c')
+          s=p.read_text()
+          old='''    tr->direct = 1;\n    tr->fd = open(p, O_RDONLY | O_DIRECT);\n    if (tr->fd >= 0 && k3_set_direct(tr->fd) != 0)\n        tr->direct = 0;   /* Darwin refused F_NOCACHE: reads stay buffered but correct */\n    if (tr->fd < 0) {\n        tr->direct = 0;\n        tr->fd = open(p, O_RDONLY);\n    }'''
+          new='''    tr->fd = k3_open_read(p, 1, &tr->direct);'''
+          n=s.count(old)
+          if n == 1: s=s.replace(old,new,1)
+          elif n == 0 and new in s: pass
+          else: raise SystemExit(f'k3_trunk open pattern count={n}')
+
+          old='''            tr->direct = 0;\n            tr->fd = open(p, O_RDONLY);\n            if (tr->fd < 0) return -1;'''
+          new='''            tr->fd = k3_open_read(p, 0, &tr->direct);\n            if (tr->fd < 0) return -1;'''
+          n=s.count(old)
+          if n == 1: s=s.replace(old,new,1)
+          elif n == 0 and new in s: pass
+          else: raise SystemExit(f'k3_trunk fallback pattern count={n}')
+          p.write_text(s)
+          PY
+          if git diff --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/io/k3_st.c src/io/k3_trunk.c
+          git commit -m 'perf(win): open model files for overlapped reads'
+          git push origin HEAD:feature/windows-overlapped-io
+
+# Temporary staging helper; removed before PR.
