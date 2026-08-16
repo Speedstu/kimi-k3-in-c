@@ -1,0 +1,233 @@
+=== K3MemCtx / vector binding ===
+
+=== k3_layer_mem_extra_bytes ===
+
+=== k3_bind_layer_mem ===
+311-
+312-void k3_bind_free(K3LayerBind *b)
+313-{
+314-    free(b->blob);
+315-    memset(b, 0, sizeof *b);
+316-}
+317-
+318-/* ------------------------------------------------- binding from a memory buffer */
+319-
+320-size_t k3_bind_widen_bytes(const K3Cfg *c)
+321-{
+322-    /* Only BF16 vectors that kernels read elementwise are copied. Large matrices,
+323-     * including the router gate, remain in their native tagged representation. */
+324-    const size_t H = (size_t)c->hidden;
+325-    size_t n = 6 * H                       /* in/post norm, attn-res and mlp-res pair  */
+326-             + (size_t)c->q_lora + c->kv_lora   /* MLA q_a/kv_a layernorms             */
+327-             + (size_t)c->latent;               /* routed_expert_norm                  */
+328-    return n * sizeof(float) + 4096;       /* slack for per-tensor 8-byte alignment    */
+329-}
+330-
+331:int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
+332-                      const unsigned char *run, const K3MemSrc *src,
+333-                      unsigned char *widen, size_t widen_cap, size_t *widen_used)
+334-{
+335-    memset(b, 0, sizeof *b);
+336-    b->layer = L;
+337-    const int is_mla = k3_is_mla(c, L), is_dense = k3_is_dense(c, L);
+338-
+339-    Plan p; memset(&p, 0, sizeof p);
+340-    p.narrow_ok = 1;
+341-    plan_layer(&p, c, L, b, is_mla, is_dense);
+342-
+343-    size_t w = 0;
+344-    int narrowed_all = 1;
+345-    int i8_seen = 0, q4_seen = 0;
+346-    for (int i = 0; i < p.n; i++) {
+347-        Req *q = &p.r[i];
+348-        int64_t off = 0, nb = 0; int dt = 0;
+349-        if (src->find(src->ctx, q->name, &off, &nb, &dt) != 0) {
+350-            fprintf(stderr, "k3_bind_mem: %s not present in the packed run\n", q->name);
+351-            return -1;
+352-        }
+353-        if (q->router_gate) {
+354-            if (dt == K3_DT_BF16) {
+355-                if (nb != q->take * 2) {
+356-                    fprintf(stderr, "k3_bind_mem: %s bad BF16 router size\n", q->name);
+357-                    return -1;
+358-                }
+359-                *q->dest = run + off;
+360-                b->moe.gate_wdt = K3_WBF16;
+361-                continue;
+362-            }
+363-            if (dt == K3_DT_I8R) {
+364-                *q->dest = run + off;
+365-                b->moe.gate_wdt = K3_WI8;
+366-                i8_seen = 1;
+367-                continue;
+368-            }
+369-            if (dt == K3_DT_Q4G) {
+370-                *q->dest = run + off;
+371-                b->moe.gate_wdt = K3_WQ4G;
+372-                q4_seen = 1;
+373-                continue;
+374-            }
+375-            if (dt == K3_DT_F32) {
+376-                if (nb != q->take * 4) {
+377-                    fprintf(stderr, "k3_bind_mem: %s bad FP32 router size\n", q->name);
+378-                    return -1;
+379-                }
+380-                *q->dest = run + off;
+381-                b->moe.gate_wdt = K3_WF32;
+382-                continue;
+383-            }
+384-            fprintf(stderr, "k3_bind_mem: %s unsupported router dtype %d\n", q->name, dt);
+385-            return -1;
+386-        }
+387-        /* Groupwise Q4 draft tensor. The Q4 packer requires each matrix row width
+388-         * to be a multiple of K3_Q4_GROUP, so the tensor is also just a sequence of
+389-         * independent 128-value blocks. Narrow matmul weights point directly into the
+390-         * run; elementwise tensors are dequantised into the existing widen area. */
+391-        if (dt == K3_DT_Q4G) {
+392-            if (q->narrow) {
+393-                *q->dest = run + off;
+394-                q4_seen = 1;
+395-                continue;
+396-            }
+397-            const int64_t take = q->take;
+398-            if (take < 0 || take % K3_Q4_GROUP != 0) {
+399-                fprintf(stderr, "k3_bind_mem: %s bad Q4 logical size\n", q->name);
+400-                return -1;
+401-            }
+402-            const int64_t blocks = take / K3_Q4_GROUP;
+403-            const int64_t wantb = blocks * (4 + K3_Q4_GROUP / 2);
+404-            if (nb != wantb) {
+405-                fprintf(stderr, "k3_bind_mem: %s bad Q4 layout (%lld bytes, want %lld)\n",
+406-                        q->name, (long long)nb, (long long)wantb);
+407-                return -1;
+408-            }
+409-            w = (w + 7u) & ~(size_t)7u;
+410-            if (w + (size_t)take * 4 > widen_cap) {
+411-                fprintf(stderr, "k3_bind_mem: widen area too small at %s\n", q->name);
+412-                return -1;
+413-            }
+414-            float *dst = (float *)(widen + w);
+415-            const unsigned char *rp = run + off;
+416-            for (int64_t g = 0; g < blocks; g++) {
+417-                float scale;
+418-                memcpy(&scale, rp, 4);
+419-                const unsigned char *pk = rp + 4;
+420-                float *dg = dst + g * K3_Q4_GROUP;
+421-                for (int j = 0; j < K3_Q4_GROUP; j++) {
+422-                    const unsigned char qb = pk[j >> 1];
+423-                    const int nib = (j & 1) ? (qb >> 4) : (qb & 0x0f);
+424-                    const int qv = nib < 8 ? nib : nib - 16;
+425-                    dg[j] = (float)qv * scale;
+426-                }
+427-                rp += 4 + K3_Q4_GROUP / 2;
+428-            }
+429-            *q->dest = dst;
+430-            w += (size_t)take * 4;
+431-            q4_seen = 1;
+432-            continue;
+433-        }
+434-        /* Per-row int8 draft weight: [f32 scale][int8 * cols] per row. A matmul weight is
+435-         * pointed at directly and the layer is tagged K3_WI8; a tensor the engine reads
+436-         * elementwise as fp32 (the AttnRes projection) is DEQUANTISED into the widen
+437-         * buffer here, row scale times int8, exactly parallel to the bf16 widen path.
+438-         * The element-count check does not apply to the scale-interleaved layout; the
+439-         * packer owns the shape. */
+440-        if (dt == K3_DT_I8R) {
+441-            if (q->narrow) {
+442-                *q->dest = run + off;
+443-                i8_seen = 1;
+444-                continue;
+445-            }
+446-            /* want fp32: dequantise. take is the logical element count (rows*cols); the
+447-             * row width is derivable because each row is [4 bytes scale][cols int8] and
+448-             * nb = rows*(4+cols) with rows*cols == take. Solve rows from nb and take. */
+449-            const int64_t take = q->take;
+450-            /* nb = rows*4 + take  ->  rows = (nb - take)/4 */
+451-            if ((nb - take) % 4 != 0) {
+452-                fprintf(stderr, "k3_bind_mem: %s bad int8 layout\n", q->name);
+453-                return -1;
+454-            }
+455-            const int64_t rows = (nb - take) / 4;
+456-            if (rows <= 0 || take % rows != 0) {
+457-                fprintf(stderr, "k3_bind_mem: %s bad int8 shape\n", q->name);
+458-                return -1;
+459-            }
+460-            const int64_t cols = take / rows;
+461-            w = (w + 7u) & ~(size_t)7u;
+462-            if (w + (size_t)take * 4 > widen_cap) {
+463-                fprintf(stderr, "k3_bind_mem: widen area too small at %s\n", q->name);
+464-                return -1;
+465-            }
+466-            float *dst = (float *)(widen + w);
+467-            const unsigned char *rp = run + off;
+468-            const size_t rowb = 4u + (size_t)cols;
+469-            for (int64_t r = 0; r < rows; r++) {
+470-                float scale;
+471-                memcpy(&scale, rp + (size_t)r * rowb, 4);
+472-                const signed char *q8 = (const signed char *)(rp + (size_t)r * rowb + 4);
+473-                for (int64_t k = 0; k < cols; k++)
+474-                    dst[r * cols + k] = (float)q8[k] * scale;
+475-            }
+476-            *q->dest = dst;
+477-            w += (size_t)take * 4;
+478-            continue;
+479-        }
+480-        const int esz = (dt == K3_DT_F32) ? 4 : (dt == K3_DT_U8 ? 1 : 2);
+481-        const int64_t have = nb / esz;
+482-        if (q->want >= 0 && have != q->want) {
+483-            fprintf(stderr, "k3_bind_mem: %s has %lld elements, engine expects %lld\n",
+484-                    q->name, (long long)have, (long long)q->want);
+485-            return -1;
+486-        }
+487-        if (q->take > have) {
+488-            fprintf(stderr, "k3_bind_mem: %s: asked for %lld of %lld\n",
+489-                    q->name, (long long)q->take, (long long)have);
+490-            return -1;
+491-        }
+492-
+493-        if (q->narrow) {
+494-            if (dt != K3_DT_BF16) { narrowed_all = 0; }   /* handled below */
+495-            else { *q->dest = run + off; continue; }
+496-        }
+497-
+498-        /* Wanted as fp32. If it is already F32 on disk, point at it; a prefix take
+499-         * (A_log) is just the front of the same array, so that is free too. */
+500-        if (dt == K3_DT_F32) { *q->dest = run + off; continue; }
+501-
+502-        if (dt != K3_DT_BF16) {
+503-            fprintf(stderr, "k3_bind_mem: %s has dtype %d, cannot widen\n", q->name, dt);
+504-            return -1;
+505-        }
+506-        w = (w + 7u) & ~(size_t)7u;
+507-        if (w + (size_t)q->take * 4 > widen_cap) {
+508-            fprintf(stderr, "k3_bind_mem: widen area too small at %s (%zu of %zu)\n",
+509-                    q->name, w + (size_t)q->take * 4, widen_cap);
+510-            return -1;
+511-        }
+
+=== config shape / generator constants ===
+6:moe_intermediate_size=48 (48/32 = 1.5 groups) so it can never be loaded by bin/k3.
+7:This script regenerates the tiny model with moe_intermediate_size=64 (2 groups),
+199:def build(seed: int, dense_intermediate: int = 96, num_experts: int = 8,
+202:    cfg = tiny_config(moe_intermediate_size=64, intermediate_size=dense_intermediate,
+203:                      num_experts=num_experts, num_experts_per_token=topk)
+242:    ap.add_argument("--dense-intermediate", type=int, default=96,
+243:                    help="dense layer-0 intermediate width; 512 mimics K3's oversized first layer")
+252:    if a.dense_intermediate <= 0:
+253:        ap.error("--dense-intermediate must be positive")
+259:    cfg, model = build(a.seed, a.dense_intermediate, a.num_experts, a.topk)
+261:    print("model: hidden %d, layers %d, vocab %d, experts %d, moe_inter %d" %
+262:          (cfg.hidden_size, cfg.num_hidden_layers, cfg.vocab_size,
+263:           cfg.num_experts, cfg.moe_intermediate_size))
+297:        "hidden_size": cfg.hidden_size, "num_hidden_layers": cfg.num_hidden_layers,
+299:        "kda_num_heads": cfg.kda_num_heads, "kda_head_dim": cfg.kda_head_dim,
+302:        "num_attention_heads": cfg.num_attention_heads, "q_lora_rank": cfg.q_lora_rank,
+303:        "kv_lora_rank": cfg.kv_lora_rank, "qk_nope_head_dim": cfg.qk_nope_head_dim,
+304:        "qk_rope_head_dim": cfg.qk_rope_head_dim, "v_head_dim": cfg.v_head_dim,
+306:        "num_experts": cfg.num_experts, "num_experts_per_token": cfg.num_experts_per_token,
+308:        "routed_expert_hidden_size": cfg.routed_expert_hidden_size,
+309:        "moe_intermediate_size": cfg.moe_intermediate_size,
+314:        "intermediate_size": cfg.intermediate_size,
+343:            # engine binds want=kda_head_dim(16) take=kda_heads(4); real checkpoint
+345:            full = np.zeros(cfg.kda_head_dim, dtype=np.float32)
+365:    for L in range(cfg.num_hidden_layers):
