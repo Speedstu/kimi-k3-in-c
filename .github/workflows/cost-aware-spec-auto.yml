@@ -1,0 +1,156 @@
+name: Cost-aware adaptive speculation parity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [speedboost/cost-aware-spec-auto]
+    paths:
+      - 'src/cli/k3_run.c'
+      - 'src/cli/k3_spec_auto.h'
+      - 'tools/patch_cost_aware_spec.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - '.github/workflows/cost-aware-spec-auto.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Apply cost-aware source transform
+        run: python tools/patch_cost_aware_spec.py
+
+      - name: Deterministic controller unit probe
+        run: |
+          set -euo pipefail
+          cat >/tmp/spec_ctrl_test.c <<'C'
+          #include <assert.h>
+          #include "src/cli/k3_spec_auto.h"
+          int main(void) {
+              K3SpecAutoCost s;
+              int next;
+              k3_spec_auto_cost_init(&s);
+
+              /* h=4 needs two stable samples before probing h=5. */
+              k3_spec_auto_cost_observe(&s, 4, 0.50, 5);
+              next = k3_spec_auto_cost_choose(&s, 4, 8, 4, 4);
+              assert(next == 4);
+              k3_spec_auto_cost_observe(&s, 4, 0.50, 5);
+              next = k3_spec_auto_cost_choose(&s, 4, 8, 4, 4);
+              assert(next == 5);
+              assert(s.probes == 1);
+
+              /* h=5 is 50% slower per exact token: after two samples it must
+               * return to h=4 and block h=5 instead of blindly growing. */
+              k3_spec_auto_cost_observe(&s, 5, 0.90, 6);
+              next = k3_spec_auto_cost_choose(&s, 5, 8, 5, 5);
+              assert(next == 5);
+              k3_spec_auto_cost_observe(&s, 5, 0.90, 6);
+              next = k3_spec_auto_cost_choose(&s, 5, 8, 5, 5);
+              assert(next == 4);
+              assert(s.backoffs == 1);
+              assert((s.blocked_mask & (1u << 5)) != 0u);
+
+              /* Acceptance remains a hard safety signal even before timings mature. */
+              k3_spec_auto_cost_init(&s);
+              next = k3_spec_auto_cost_choose(&s, 8, 8, 8, 2);
+              assert(next == 4);
+              return 0;
+          }
+          C
+          cc -std=c99 -Wall -Wextra -Werror -I. /tmp/spec_ctrl_test.c -o /tmp/spec_ctrl_test
+          /tmp/spec_ctrl_test
+          echo 'synthetic cost controller: PASS'
+
+      - name: Strict AVX2 build and full oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build exact tiny streamed trunk
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3cost /tmp/k3cost-trunk /tmp/k3cost-out
+          mkdir -p /tmp/k3cost-out
+          python tools/make_tiny_checkpoint.py /tmp/k3cost --seed 2050 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3cost/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3cost /tmp/k3cost-trunk "$NLAYERS"
+
+      - name: Cost-aware auto remains exact and exercises timing probes
+        run: |
+          set -euo pipefail
+          D=/tmp/k3cost-out
+          TOPK=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3cost/config.json'))['num_experts_per_tok'])
+          PY
+          )
+          BASE='/tmp/k3cost --trunk /tmp/k3cost-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 36 --incremental --threads 1 --temperature 0'
+          DRAFT="--draft-trunk /tmp/k3cost-trunk --draft-trunk-gb 0.05 --draft-topk $TOPK"
+          ./bin/k3 $BASE --out "$D/serial.json" >"$D/serial.log" 2>&1
+          ./bin/k3 $BASE $DRAFT --spec-auto --spec 8 --out "$D/auto.json" >"$D/auto.log" 2>&1
+
+          python3 - <<'PY'
+          import json
+          d='/tmp/k3cost-out'
+          s=json.load(open(d+'/serial.json'))
+          a=json.load(open(d+'/auto.json'))
+          assert a['generated_ids'] == s['generated_ids']
+          assert a['full_ids'] == s['full_ids']
+          assert a['spec_auto_rounds'] > 0
+          assert a['spec_auto_cost_best'] > 0, a
+          assert a['spec_auto_cost_best_spt'] >= 0.0, a
+          assert a['spec_auto_cost_probes'] > 0, a
+          print('exact serial token parity: PASS')
+          print('cost-aware metrics:', {k:a[k] for k in [
+              'spec_auto_final','spec_auto_limit','spec_auto_cost_best',
+              'spec_auto_cost_best_spt','spec_auto_cost_probes','spec_auto_cost_backoffs']})
+          PY
+
+      - name: Sampling still refuses adaptive width
+        run: |
+          set -euo pipefail
+          set +e
+          ./bin/k3 /tmp/k3cost --trunk /tmp/k3cost-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --ids 3,7,11,5 --gen 1 --incremental --temperature 0.7 --spec-auto \
+            --out /tmp/k3cost-out/should-not-exist.json \
+            >/tmp/k3cost-out/sample-auto.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+          grep -q 'supports greedy decode only' /tmp/k3cost-out/sample-auto.log
+          echo 'sampled --spec-auto rejection: PASS'
+
+      - name: Persist validated source
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/cli/k3_run.c; then
+            echo 'source already committed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/cli/k3_run.c
+          git commit -m 'perf: make adaptive speculation cost-aware'
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
