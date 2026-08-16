@@ -211,8 +211,9 @@ The main speed work in this fork is:
   released-dimension microbenchmark, with bit-identical top-k/combining weights;
 - **async expert prefetch** overlaps top-k expert reads with the independent down
   projection and shared-expert MLP, then joins before the first routed expert is touched;
-- **measured thread tuning** via `--threads N` and `benchmarks/thread-sweep.sh` instead of
-  assuming that all logical CPUs are fastest;
+- **real-hardware CPU + I/O autotuning** via `benchmarks/autotune.py`: it measures
+  `--threads N` together with `K3_ASYNC_IO_THREADS=M` on the actual CPU/NVMe path and
+  refuses to recommend anything if the exact token stream changes;
 - **optional Q4 speculative draft** at 0.53125 bytes/weight for full groups plus
   `--draft-topk`, while exact bf16/MXFP4 K3 still verifies every emitted token.
 
@@ -228,13 +229,14 @@ After the normal checkpoint download and trunk pack:
 # 1. Create a byte-exact compressed storage representation of the exact trunk.
 python3 tools/lossless_trunk.py ~/k3trunk ~/k3trunk-lossless
 
-# 2. Find the best compute thread count on THIS machine/workload.
-K3_SWEEP_REPEATS=3 benchmarks/thread-sweep.sh ~/k3model \
+# 2. Tune BOTH compute and async expert-I/O threads on THIS machine/storage path.
+#    Use a short deterministic request so the sweep is affordable.
+python3 benchmarks/autotune.py ~/k3model --repeats 2 -- \
   --trunk ~/k3trunk-lossless --preset laptop --incremental \
-  --ids 1008,10484,318,15383,387 --gen 4
+  --ids 1008,10484,318,15383,387 --gen 2 --temperature 0
 
-# 3. Re-run with the recommended --threads N.
-./bin/k3 ~/k3model --trunk ~/k3trunk-lossless --preset laptop \
+# 3. Re-run with the recommended --threads N and K3_ASYNC_IO_THREADS=M.
+K3_ASYNC_IO_THREADS=M ./bin/k3 ~/k3model --trunk ~/k3trunk-lossless --preset laptop \
   --incremental --threads N \
   --ids 1008,10484,318,15383,387 --gen 8
 ```
@@ -244,7 +246,7 @@ controls:
 
 ```bash
 K3_NOASYNC_PREFETCH=1   # compare against the old synchronous caller behavior
-K3_ASYNC_IO_THREADS=4   # background expert-read OpenMP team (default 4)
+K3_ASYNC_IO_THREADS=4   # background expert-read team; autotune this on real hardware
 ```
 
 For an **optional faster speculative proposal path**, derive a Q4 trunk from the normal
@@ -266,6 +268,7 @@ More detail:
 [`SPEEDBOOST.md`](docs/SPEEDBOOST.md) ·
 [`LOSSLESS_TRUNK.md`](docs/LOSSLESS_TRUNK.md) ·
 [`ASYNC_EXPERT_PREFETCH.md`](docs/ASYNC_EXPERT_PREFETCH.md) ·
+[`AUTOTUNE.md`](docs/AUTOTUNE.md) ·
 [`THREAD_TUNING.md`](docs/THREAD_TUNING.md)
 
 ---
