@@ -363,6 +363,16 @@ typedef struct K3ExpertSrc {
      * ZERO THIS FIELD. It is a function pointer in a struct that callers build on the
      * stack; an uninitialised one is a jump to garbage. See the warning below. */
     int (*getmany)(struct K3ExpertSrc *self, int layer, const int *experts, int n);
+    /* OPTIONAL asynchronous form of getmany. begin returns:
+     *   >0  a background batch was launched and wait MUST be called before get/resident;
+     *    0  all requested experts were already resident, nothing was launched;
+     *   <0  async unavailable/failed, caller should fall back to getmany/get.
+     * wait returns the background getmany result. These callbacks exist so independent
+     * trunk/shared-expert compute can overlap storage latency without letting any model
+     * arithmetic observe a half-loaded expert. */
+    int (*prefetch_begin)(struct K3ExpertSrc *self, int layer,
+                          const int *experts, int n);
+    int (*prefetch_wait)(struct K3ExpertSrc *self);
     /* OPTIONAL: 1 if the expert is already resident (get() would read no disk), filling
      * out when non-NULL. The draft model's cache-only routing uses this to propose tokens
      * with zero expert I/O. May be NULL; callers must cope. */

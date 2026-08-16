@@ -163,6 +163,29 @@ int main(int argc, char **argv)
         ck(cache.prefetch_reads <= cache.hits, "prefetch_reads <= hits", a);
     }
 
+    /* ---- 2a: async batch must publish the same bytes as synchronous getmany ---- */
+    if (!cache.src.prefetch_begin || !cache.src.prefetch_wait) {
+        ck(0, "async batch prefetch present", "callbacks are NULL");
+    } else {
+        k3_cache_reset_stats(&cache);
+        int bada = 0, launched = 0;
+        for (int start = 0; start + c.topk <= NE; start += c.topk) {
+            int ids[16];
+            for (int j = 0; j < c.topk; j++) ids[j] = start + j;
+            const int ar = cache.src.prefetch_begin(&cache.src, 0, ids, c.topk);
+            if (ar > 0) { launched++; cache.src.prefetch_wait(&cache.src); }
+            else if (ar < 0 && cache.src.getmany) cache.src.getmany(&cache.src, 0, ids, c.topk);
+            for (int j = 0; j < c.topk; j++) {
+                K3ExpertQ q;
+                if (cache.src.get(&cache.src, 0, ids[j], &q) != 0) { bada++; continue; }
+                if (!same_expert(&st, 0, ids[j], &q)) bada++;
+            }
+        }
+        char b[96];
+        snprintf(b, sizeof b, "%d async batches launched, %d wrong", launched, bada);
+        ck(bada == 0 && launched > 0, "async prefetch is byte-exact", b);
+    }
+
     /* ---- 2b: interleaving the two paths must not corrupt either ---- */
     k3_cache_reset_stats(&cache);
     int bad3 = 0;

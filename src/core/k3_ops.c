@@ -587,18 +587,37 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
         }
 
-        /* 2. down-project into the latent space */
+        /* If the cache supports async top-k prefetch, start it as soon as routing has
+         * identified the experts. Nothing below touches the cache until prefetch_wait. */
+        int async_prefetch = 0, prefetch_known_ready = 0;
+        if (!w->cache_only && w->src && w->src->prefetch_begin) {
+            const int ar = w->src->prefetch_begin(w->src, w->layer, idx, nk);
+            async_prefetch = ar > 0;
+            prefetch_known_ready = ar == 0;
+        }
+
+        /* 2. down-project into the latent space. This is independent of expert bytes
+         * and therefore overlaps the background reads when async_prefetch is active. */
         k3_mmw(z, xt, w->down, w->wdt, E, L);
 
-        /* 3. the selected experts, in latent space, weighted and summed */
-        for (int i = 0; i < L; i++) accL[i] = 0.0f;
-        /* Hand the WHOLE top-k to the source first, so its reads can overlap. Without
-         * this the loop below misses, blocks on a 17.55 MB read, computes, misses
-         * again: a queue depth of one against a drive that needs depth to reach its
-         * rated bandwidth. getmany is optional and may be NULL, in which case nothing
-         * changes and the loop reads them one at a time exactly as before. */
-        if (!w->cache_only && w->src && w->src->getmany)
+        /* The shared expert is also independent of the routed experts. Compute it early
+         * ONLY on the async path, into its normal disjoint scratch, then still add it at
+         * the original step 6 after the routed up-projection. Arithmetic/output order is
+         * unchanged; only when these independent multiplies happen in wall-clock time moves. */
+        if (async_prefetch) {
+            k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
+            k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
+            k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
+            k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
+            w->src->prefetch_wait(w->src);
+        } else if (!w->cache_only && !prefetch_known_ready && w->src && w->src->getmany) {
+            /* Async unsupported/failed: preserve the old synchronous batch path. */
             w->src->getmany(w->src, w->layer, idx, nk);
+        }
+
+        /* 3. the selected experts, in latent space, weighted and summed. At this point
+         * an async batch is fully joined, so get() can never observe an inflight slot. */
+        for (int i = 0; i < L; i++) accL[i] = 0.0f;
         for (int j = 0; j < nk; j++) {
             if (w->src) {
                 /* Streamed: the expert stays MXFP4 and the matmul reads nibbles. In
@@ -641,11 +660,15 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         if (c->latent_norm) k3_rmsnorm(accL, accL, w->latent_norm, L, c->rms_eps);
         k3_mmw(ot, accL, w->up, w->wdt, L, E);
 
-        /* 6. shared expert on the ORIGINAL full-width input, added UNWEIGHTED */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
+        /* 6. shared expert on the ORIGINAL full-width input, added UNWEIGHTED.
+         * On async_prefetch its value was computed early to hide I/O, but this ADD stays
+         * exactly here, after the routed up-projection, preserving model arithmetic. */
+        if (!async_prefetch) {
+            k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
+            k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
+            k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
+            k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
+        }
         for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
 }
