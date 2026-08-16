@@ -7,6 +7,7 @@ on:
     paths:
       - 'src/core/k3_ops.c'
       - 'tools/patch_prefill_batched_mla_bf16.py'
+      - 'tools/fix_mla_batch_decl.py'
       - 'tools/make_tiny_checkpoint.py'
       - '.github/workflows/prefill-batched-mla-bf16-parity.yml'
 
@@ -26,7 +27,9 @@ jobs:
           python-version: '3.12'
 
       - name: Apply exact MLA BF16 prefill transform once
-        run: python tools/patch_prefill_batched_mla_bf16.py
+        run: |
+          python tools/patch_prefill_batched_mla_bf16.py
+          python tools/fix_mla_batch_decl.py
 
       - name: Strict AVX2 build and full weightless oracle
         run: |
