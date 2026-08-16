@@ -22,6 +22,9 @@ model = "kimi-k3-local"
 # engine is the final authority and refuses a request before allocation when the chosen
 # machine cannot fit its KV cache. Increase this only after measuring your RAM budget.
 max_context_size = 32768
+# The released K3 preserved-thinking example also uses max_tokens=4096. Pinning this here
+# prevents a client from deriving an output budget from the much larger context window.
+max_output_size = 4096
 capabilities = ["thinking", "always_thinking", "tool_use"]
 display_name = "K3 Local (C)"
 support_efforts = ["max"]
