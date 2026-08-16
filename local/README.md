@@ -34,7 +34,8 @@ Example paths used below:
 ```text
 ~/k3model/             official K3 checkpoint + tokenizer files
 ~/k3trunk-lossless/    exact lossless packed trunk
-./bin/k3               C inference engine
+./bin/k3               one-shot C inference engine
+./bin/k3-worker        resident C inference worker (default localhost backend)
 ```
 
 The Python bridge needs `transformers` only for K3's **official local chat tokenizer / XTML
@@ -71,8 +72,17 @@ python local/k3_local.py serve \
   --model-dir ~/k3model \
   --trunk ~/k3trunk-lossless \
   --preset laptop \
-  --threads N
+  --threads N \
+  --worker-context 1024
 ```
+
+`k3_local.py` now starts **one resident `bin/k3-worker` process by default**. The
+safetensors index, exact packed trunk mappings, model head, expert cache, recurrent KDA
+state and MLA KV stay alive between HTTP/tool turns. If the next XTML prompt extends the
+previous exact token sequence, only the pending last token plus the new suffix is fed; a
+bifurcation resets conversation state but keeps weights and the warm expert cache open.
+Use `--no-resident-worker` only for A/B testing or a feature not yet supported by the
+worker.
 
 It listens on `http://127.0.0.1:8000/v1` by default. The server refuses a non-loopback bind
 unless `--allow-remote` is explicitly supplied; the endpoint itself has no authentication.
@@ -152,27 +162,34 @@ this constraint by letting the OS OOM-kill the run.
 
 ## Conversation state reuse
 
-By default the bridge keeps one exact saved prefix under:
+The default path is now **in-RAM resident reuse**, not a multi-GB state file per tool
+turn. `k3-worker` retains the active exact sequence, KDA recurrence and MLA KV. Every new
+request still sends the full canonical XTML token sequence; the worker reuses state only
+when the entire previous sequence is an exact prefix. It reports the exact number of
+prefix tokens reused. Any token mismatch causes a conversation-state reset, while the
+loaded checkpoint/trunk and expert cache remain warm.
 
-```text
-~/.cache/k3-local/state/
-```
-
-When Kimi Code sends the next full conversation, the bridge tokenizes it with the official
-XTML template and compares it against saved token prefixes. If an exact prefix matches, it
-passes only the new suffix to `bin/k3 --load-state`: prior KDA/MLA state is restored instead
-of recomputing the whole conversation. If even one token differs, the cache is ignored and
-the full prompt is evaluated — correctness wins over a guessed reuse.
-
-Current state files contain expanded MLA KV and can therefore be large. Controls:
+The resident KV capacity is explicit:
 
 ```bash
---state-cache-entries 1   # default; exact-prefix LRU
+--worker-context 1024   # default
+```
+
+Raise it for long benchmark episodes only when RAM allows it. The expanded fp32 MLA cache
+still costs roughly 2.37 MB per position across the 24 MLA layers, so context capacity is
+a real memory decision, not a cosmetic API field.
+
+The older disk-backed prefix cache remains available with `--no-resident-worker`:
+
+```bash
+--no-resident-worker
+--state-cache-entries 1
 --state-cache-dir PATH
 --no-state-cache
 ```
 
-Keep the cache directory on fast local NVMe.
+That fallback is useful for A/B tests and can retain multiple prefixes, but the resident
+worker is the low-latency path for the normal linear Kimi Code tool loop.
 
 ## Sampling correctness
 
@@ -201,8 +218,14 @@ To enable it for the localhost/Kimi Code bridge, add for example:
 ```bash
 python local/k3_local.py serve \
   --model-dir ~/k3model --trunk ~/k3trunk-lossless --preset laptop --threads N \
+  --no-resident-worker \
   --draft-trunk ~/k3draft-q4 --draft-trunk-gb 32 --draft-topk 4 --spec 4
 ```
+
+The exact resident worker is the default, but the Q4 draft is still wired through the
+one-shot backend in this revision; `--no-resident-worker` selects that path explicitly.
+The next worker step is to keep **both** exact and draft trunks resident without changing
+the probability-correct verifier.
 
 The draft can change acceptance rate and wall-clock speed, but exact K3 remains the
 verification/target distribution. Sweep draft top-k/spec length on the real machine rather
@@ -240,10 +263,10 @@ streaming is part of the correctness gate rather than a UI-only feature.
 
 - **Text/coding first:** image/video/audio message parts are rejected instead of discarded.
   K3's vision path still needs to be integrated locally.
-- **Process startup per turn:** true token streaming is live now, and saved state avoids
-  recomputing exact conversation prefixes, but the one-shot C process still reopens the
-  checkpoint/index/trunk/cache for each HTTP request. A resident C worker is the next
-  latency step and will also preserve the warm expert cache between tool turns.
+- **Draft + resident worker:** the exact path is resident now, but sampled Q4/I8 draft
+  acceleration still uses the one-shot backend. Combining both resident states is the
+  next throughput step; until then choose warm exact (`default`) or sampled draft
+  (`--no-resident-worker --draft-trunk ...`) explicitly.
 - **Long context:** the exact expanded fp32 MLA cache is the current context-memory wall.
   A latent-cache kernel can reduce it dramatically, but it must be numerically gated
   before becoming a default.

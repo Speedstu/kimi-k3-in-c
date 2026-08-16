@@ -84,6 +84,10 @@ add_executable(k3_cli src/cli/k3_run.c)
 set_target_properties(k3_cli PROPERTIES OUTPUT_NAME k3)
 target_link_libraries(k3_cli PRIVATE k3)
 
+add_executable(k3_worker src/cli/k3_worker.c)
+set_target_properties(k3_worker PROPERTIES OUTPUT_NAME k3-worker)
+target_link_libraries(k3_worker PRIVATE k3)
+
 # ---------------------------------------------------------------------------- tests --
 # Every test below runs WITHOUT model weights. The checkpoint is 1.56 TB; if correctness
 # needed it, correctness would go unchecked.
@@ -146,7 +150,7 @@ set_tests_properties(tokenizer PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 add_executable(bench_kernels benchmarks/bench_kernels.c)
 target_link_libraries(bench_kernels PRIVATE k3)
 
-install(TARGETS k3_cli RUNTIME DESTINATION bin)
+install(TARGETS k3_cli k3_worker RUNTIME DESTINATION bin)
 install(DIRECTORY include/k3 DESTINATION include)
 # k3_cfg.h includes json.h and exposes jval in its signatures, so an installed header
 # set without it does not compile. Kept in step with the Makefile's install target.
