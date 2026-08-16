@@ -73,6 +73,63 @@ def candidate_arg_present(args: Iterable[str], name: str) -> bool:
     return any(a == name or a.startswith(prefix) for a in args)
 
 
+def option_value(args: list[str], name: str) -> str | None:
+    """Read a K3 option in either --name VALUE or --name=VALUE form."""
+    prefix = name + "="
+    for i, arg in enumerate(args):
+        if arg.startswith(prefix):
+            value = arg[len(prefix) :]
+            if not value:
+                raise ValueError(f"{name}= has no value")
+            return value
+        if arg == name:
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                raise ValueError(f"{name} needs a value")
+            return args[i + 1]
+    return None
+
+
+def exact_topk_from_config(model_dir: str, k3_args: list[str]) -> tuple[Path, int]:
+    """Resolve the same config path K3 uses and read its exact routed top-k.
+
+    K3 supports both the released nested config (text_config.num_experts_per_token) and
+    the flat oracle/tiny fixture shape. We deliberately support exactly those two shapes
+    here and never invent a default: an unreadable config must stop autotuning rather
+    than silently generate inappropriate draft candidates.
+    """
+    raw = option_value(k3_args, "--config")
+    path = Path(raw).expanduser() if raw else Path(model_dir).expanduser() / "config.json"
+    path = path.resolve()
+    try:
+        root = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read K3 config {path}: {exc}") from exc
+    if not isinstance(root, dict):
+        raise ValueError(f"K3 config {path} is not a JSON object")
+    base = root.get("text_config", root)
+    if not isinstance(base, dict):
+        raise ValueError(f"K3 config {path} has non-object text_config")
+    value = base.get("num_experts_per_token")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
+        raise ValueError(f"K3 config {path} has no integer num_experts_per_token")
+    topk = int(value)
+    if topk < 1:
+        raise ValueError(f"K3 config {path} has invalid num_experts_per_token={topk}")
+    return path, topk
+
+
+def automatic_draft_topk_candidates(exact_topk: int) -> list[int]:
+    """Powers of two up to exact top-k, always including the exact top-k itself."""
+    vals: list[int] = []
+    v = 1
+    while v < exact_topk:
+        vals.append(v)
+        v *= 2
+    if exact_topk not in vals:
+        vals.append(exact_topk)
+    return vals
+
+
 def median_for(
     runs: list[Run],
     compute: int,
@@ -145,8 +202,8 @@ def main() -> int:
             "  python benchmarks/autotune.py ~/k3model --repeats 2 -- \\\n"
             "    --trunk ~/k3trunk-lossless --preset laptop --incremental \\\n"
             "    --ids 1008,10484,318,15383,387 --gen 2 --temperature 0\n\n"
-            "With an exact-verified draft trunk, add for example:\n"
-            "  --draft-topk-candidates 1,2,4 before the bare --, and pass \\\n"
+            "With an exact-verified draft trunk, use --draft-topk-candidates auto (recommended) "
+            "or an explicit list such as 1,2,4 before the bare --, and pass \\\n"
             "  --draft-trunk PATH --spec-auto after it.\n\n"
             "For a quick first pass, use a short deterministic request. After tuning, run your "
             "normal longer prompt with the recommended settings."
@@ -173,8 +230,9 @@ def main() -> int:
         "--draft-topk-candidates",
         default=None,
         help=(
-            "optional comma/space draft routed-expert counts; requires --draft-trunk after --. "
-            "When set, autotune controls --draft-topk and includes it in the exactness-guarded search"
+            "optional 'auto' or comma/space draft routed-expert counts; requires --draft-trunk "
+            "after --. auto reads the exact model config and tries powers of two through its "
+            "num_experts_per_token, including the exact top-k"
         ),
     )
     p.add_argument(
@@ -211,12 +269,22 @@ def main() -> int:
 
     draft_topk: list[int] | None = None
     draft_topk_seed: int | None = None
+    draft_topk_source_config: str | None = None
+    draft_topk_exact_limit: int | None = None
     if ns.draft_topk_candidates:
         if not candidate_arg_present(k3_args, "--draft-trunk"):
             p.error("--draft-topk-candidates requires --draft-trunk after the bare --")
         if candidate_arg_present(k3_args, "--draft-topk"):
             p.error("do not pass --draft-topk after -- when --draft-topk-candidates is set")
-        draft_topk = parse_candidates(ns.draft_topk_candidates)
+        if ns.draft_topk_candidates.strip().lower() == "auto":
+            try:
+                config_path, draft_topk_exact_limit = exact_topk_from_config(ns.model_dir, k3_args)
+            except ValueError as exc:
+                p.error(str(exc))
+            draft_topk_source_config = str(config_path)
+            draft_topk = automatic_draft_topk_candidates(draft_topk_exact_limit)
+        else:
+            draft_topk = parse_candidates(ns.draft_topk_candidates)
         draft_topk_seed = min(draft_topk, key=lambda x: (abs(x - ns.draft_topk_seed), x))
 
     for disabled in ("K3_NOASYNC_PREFETCH", "K3_NOPREFETCH"):
@@ -344,7 +412,14 @@ def main() -> int:
     print(f"  compute candidates : {compute}")
     print(f"  I/O candidates     : {io}")
     if draft_topk is not None:
-        print(f"  draft top-k        : {draft_topk} (initial seed {draft_topk_seed})")
+        if draft_topk_exact_limit is not None:
+            print(
+                f"  draft top-k        : {draft_topk} (auto from exact top-{draft_topk_exact_limit}; "
+                f"initial seed {draft_topk_seed})"
+            )
+            print(f"  source config      : {draft_topk_source_config}")
+        else:
+            print(f"  draft top-k        : {draft_topk} (initial seed {draft_topk_seed})")
     else:
         print("  draft top-k        : unchanged")
     print(f"  repeats            : {ns.repeats}")
@@ -428,6 +503,8 @@ def main() -> int:
             "compute_candidates": compute,
             "io_candidates": io,
             "draft_topk_candidates": draft_topk,
+            "draft_topk_source_config": draft_topk_source_config,
+            "draft_topk_exact_limit": draft_topk_exact_limit,
             "recommended": recommended,
             "reference_generated_ids": reference_generated,
             "reference_full_ids": reference_full,
