@@ -45,19 +45,45 @@ jobs:
             --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
           NLAYERS=$(python - <<'PY'
           import json
-          print(json.load(open('/tmp/k3wave/config.json'))['num_hidden_layers'])
+          x=json.load(open('/tmp/k3wave/config.json'))
+          print(x['num_hidden_layers'])
+          print('stress config:', x['n_routed_experts'], 'experts top', x['num_experts_per_tok'], file=__import__('sys').stderr)
           PY
           )
           python tools/pack_trunk.py /tmp/k3wave /tmp/k3wave-trunk "$NLAYERS"
 
       - name: Old giant-prefetch schedule vs expert waves are binary-identical
         run: |
-          set -euo pipefail
+          set -uo pipefail
           D=/tmp/k3wave-out
           COMMON='/tmp/k3wave --trunk /tmp/k3wave-trunk --trunk-gb 0.05 --cache-gb 0.0004 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --gen 3 --incremental --threads 1 --temperature 0'
+
           K3_NO_PREFILL_PIPELINE=1 ./bin/k3 $COMMON --dump-logits "$D/old.logits" --out "$D/old.json" >"$D/old.log" 2>&1
+          old_rc=$?
           ./bin/k3 $COMMON --dump-logits "$D/waves.logits" --out "$D/waves.json" >"$D/waves.log" 2>&1
-          cmp "$D/old.logits" "$D/waves.logits"
+          waves_rc=$?
+
+          echo "old_rc=$old_rc waves_rc=$waves_rc"
+          echo '--- old log tail ---'
+          tail -n 80 "$D/old.log" || true
+          echo '--- waves log tail ---'
+          tail -n 80 "$D/waves.log" || true
+          echo '--- produced files ---'
+          ls -lh "$D" || true
+
+          if [ "$old_rc" -ne 0 ] || [ "$waves_rc" -ne 0 ]; then
+            echo 'one or both K3 runs failed' >&2
+            exit 1
+          fi
+
+          if cmp "$D/old.logits" "$D/waves.logits"; then
+            echo 'binary logits cmp: PASS'
+          else
+            echo 'binary logits cmp: FAIL' >&2
+            sha256sum "$D/old.logits" "$D/waves.logits" || true
+            exit 1
+          fi
+
           python3 - <<'PY'
           import json, re
           d='/tmp/k3wave-out'
@@ -67,13 +93,17 @@ jobs:
           old=open(d+'/old.log',errors='replace').read()
           new=open(d+'/waves.log',errors='replace').read()
           def batches(s):
-              m=re.findall(r'async overlap\s*:\s*(\d+) batches',s)
-              return int(m[-1]) if m else 0
+              pats = [
+                  r'async overlap\s*:\s*(\d+) batches',
+                  r'async[^\n]*?(\d+) batches',
+              ]
+              for pat in pats:
+                  m=re.findall(pat,s,re.I)
+                  if m: return int(m[-1])
+              return 0
           ob, nb=batches(old), batches(new)
           print('prefill-wave exact ids:',a['generated_ids'])
           print('async batches old/new:',ob,nb)
-          # The old prefill scheduler never uses async begin/get for its giant unique set;
-          # the wave scheduler does. Decode is common to both, so the new count must grow.
           assert nb > ob, (ob,nb)
           print('PREFILL EXPERT WAVES PARITY + SCHEDULING PASS')
           PY
