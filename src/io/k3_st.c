@@ -196,7 +196,7 @@ static int push(Build *b, K3St *s, const char *name, size_t nlen, const K3Tensor
 
 static int scan_shard(K3St *s, Build *b, int shard, const char *path)
 {
-    int fd = open(path, O_RDONLY);
+    int fd = k3_open_read(path, 0, NULL);
     if (fd < 0) { fprintf(stderr, "k3_st: cannot open %s\n", path); return -1; }
 
     unsigned char lenbuf[8];
@@ -207,8 +207,8 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
     uint64_t hlen = 0;
     for (int i = 7; i >= 0; i--) hlen = (hlen << 8) | lenbuf[i];   /* little endian */
 
-    off_t fsize = lseek(fd, 0, SEEK_END);
-    if (hlen == 0 || (uint64_t)fsize < 8 + hlen) {
+    const int64_t fsize = k3_file_size(fd);
+    if (fsize < 0 || hlen == 0 || (uint64_t)fsize < 8 + hlen) {
         fprintf(stderr, "k3_st: %s header length %llu is impossible (file %lld bytes)\n",
                 path, (unsigned long long)hlen, (long long)fsize);
         close(fd); return -1;
@@ -344,8 +344,13 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
      * through the page cache. Optional: if the filesystem refuses O_DIRECT the reader
      * falls back to fd[]. */
     if (s->dfd) {
-        s->dfd[shard] = open(path, O_RDONLY | O_DIRECT);
-        k3_set_direct(s->dfd[shard]);   /* no-op off Darwin; advisory, failure is fine */
+        int direct = 0;
+        int dfd = k3_open_read(path, 1, &direct);
+        if (dfd >= 0 && direct) s->dfd[shard] = dfd;
+        else {
+            if (dfd >= 0) close(dfd);
+            s->dfd[shard] = -1;
+        }
     }
     return ntensor;
 bad:

@@ -1,13 +1,13 @@
 # Native Windows runtime
 
-K3 now has a native Windows x64 path through **MSYS2 UCRT64 + GCC**. It builds and runs
+K3 has a native Windows x64 path through **MSYS2 UCRT64 + GCC**. It builds and runs
 `bin/k3.exe` and `bin/k3-worker.exe` directly on Windows; WSL is not required for
 correctness.
 
-This port is deliberately conservative. The Windows CI gate runs the same tiny K3 graph
-through the one-shot engine and the resident worker, checks warm-prefix reuse and reset,
-checks seeded temperature/top-p sampling, and checks a Q4 speculative draft whose output
-is still verified by the exact model. The emitted token ids must match.
+The Windows gate runs the same tiny K3 graph through the one-shot engine and the resident
+worker, checks warm-prefix reuse and reset, checks seeded temperature/top-p sampling, and
+checks a Q4 speculative draft whose output is still verified by the exact model. The
+emitted token ids must match.
 
 ## What is tested
 
@@ -79,13 +79,24 @@ not `/proc/meminfo`.
 
 ### Positioned reads
 
-The UCRT has no `pread()`. The correctness path implements positioned reads around
-`_lseeki64` + `_read` and protects each descriptor with an SRW lock so two background
-reads cannot move the same descriptor's file position underneath each other. Different
-file descriptors can still make progress independently.
+The UCRT has no `pread()`. K3 therefore opens model files with
+`FILE_FLAG_OVERLAPPED`, wraps the resulting HANDLE in the fd-shaped interface the rest of
+the engine already uses, and supplies an explicit 64-bit offset to every `ReadFile` via
+`OVERLAPPED.Offset` / `OffsetHigh`.
 
-Every model descriptor is switched to binary mode. This matters on Windows because model
-weights are arbitrary bytes, not text.
+Each positioned read owns its event and never moves a shared file pointer. Multiple expert
+prefetch workers can therefore have reads against the same safetensors shard in flight at
+the same time. The trunk uses the same primitive. The files are still opened through the
+Windows buffered I/O path; no `FILE_FLAG_NO_BUFFERING` claim is made here.
+
+A reproducible warm-cache same-file microbenchmark on the Windows CI runner measured a
+median **7,752.0 MB/s** for the old locked seek/read compatibility path and **11,831.7
+MB/s** for overlapped reads, or **1.526x** aggregate throughput with identical checksums.
+That is a positioned-I/O microbenchmark, not a 1.526x end-to-end token-speed claim. See
+`docs/data/windows-overlapped-2026-08.md` and `benchmarks/windows-pread-bench.c`.
+
+Every model descriptor is binary. This matters on Windows because model weights are
+arbitrary bytes, not text.
 
 ### Worker stdout
 
@@ -100,16 +111,17 @@ from `GetSystemInfo`.
 
 ## Current limitations
 
-### Native Windows I/O is a correctness baseline, not the fastest backend yet
+### Windows storage is overlapped, but still buffered
 
-Linux can use `O_DIRECT` for the streamed trunk and experts. The current Windows path uses
-buffered CRT reads and a per-descriptor lock. It is exact and CI-gated, but **there is no
-claim yet that it is faster than Linux or WSL for the full 1.56 TB checkpoint**.
+Linux can use `O_DIRECT` for the streamed trunk and experts. Windows now has true
+explicit-offset overlapped reads and no longer serializes same-shard readers behind a CRT
+file-position lock, but the storage path still uses the Windows system cache.
 
-The next Windows performance step is a dedicated Win32 reader using independent handles,
-explicit-offset/overlapped `ReadFile`, and only then an optional unbuffered path with the
-required alignment. That needs a real full-checkpoint benchmark before it becomes the
-default.
+So there is still **no claim that native Windows beats Linux/WSL on the full 1.56 TB
+checkpoint**. The next storage experiment is optional `FILE_FLAG_NO_BUFFERING`, and it
+must first validate the volume's physical-sector alignment plus buffer, offset and length
+alignment on every read. It should only become a default if a full-checkpoint benchmark
+wins.
 
 ### Very large worker context is not yet lightweight on Windows
 
@@ -126,6 +138,7 @@ parity gate.
 ## What Windows support means here
 
 Native Windows support means the engine and resident worker execute on Windows and pass
-model-output parity gates. It does **not** mean that the Windows storage backend has
-already been tuned to match Linux `O_DIRECT`, and it does not change the model: the exact
-K3 verifier remains authoritative.
+model-output parity gates. The Windows reader now supports concurrent same-file positioned
+I/O, but it has not yet been tuned or measured to match Linux `O_DIRECT` on the full
+checkpoint. None of these platform changes alter the model: the exact K3 verifier remains
+authoritative.
