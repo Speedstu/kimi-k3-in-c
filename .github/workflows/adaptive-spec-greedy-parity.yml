@@ -57,7 +57,10 @@ jobs:
           set -euo pipefail
           D=/tmp/k3auto-out
           BASE='/tmp/k3auto --trunk /tmp/k3auto-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 18 --incremental --threads 1 --temperature 0'
-          DRAFT='--draft-trunk /tmp/k3auto-trunk --draft-trunk-gb 0.05 --draft-topk 0'
+          # The tiny fixture has checkpoint top-k=2. Using the exact same top-k and
+          # exact trunk as the draft forces 100% acceptance and guarantees that the
+          # adaptive horizon is actually exercised rather than only parsed.
+          DRAFT='--draft-trunk /tmp/k3auto-trunk --draft-trunk-gb 0.05 --draft-topk 2'
 
           ./bin/k3 $BASE --out "$D/serial.json" >"$D/serial.log" 2>&1
           ./bin/k3 $BASE $DRAFT --spec 4 --out "$D/fixed4.json" >"$D/fixed4.log" 2>&1
@@ -84,7 +87,7 @@ jobs:
           print('adaptive path exercised: rounds=%d grows=%d final=%d/%d' % (
               auto['spec_auto_rounds'], auto['spec_auto_grows'],
               auto['spec_auto_final'], auto['spec_auto_limit']))
-          print('fixed4 %.4f s/token, auto8 %.4f s/token' % (
+          print('fixed4 %.4f s/token, auto8 %.4f s/token (tiny pinned fixture; timing is directional only)' % (
               fixed['seconds_per_token'], auto['seconds_per_token']))
           PY
 
