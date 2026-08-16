@@ -45,10 +45,12 @@ jobs:
           python3 -m py_compile local/k3_local.py
           python3 - <<'PY'
           import importlib.util
+          import sys
           from pathlib import Path
           p = Path('local/k3_local.py')
           spec = importlib.util.spec_from_file_location('k3_local', p)
           mod = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = mod
           spec.loader.exec_module(mod)
           sample = (
               'I should inspect the repository.'
