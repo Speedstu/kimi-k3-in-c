@@ -192,7 +192,8 @@ int main(int argc, char **argv)
         const double t0=now_s();
         got_esc=decode_tiered(out,n,low,p0,p1,p2,sec,lit,d7,d15,&got_lit);
         const double dt=now_s()-t0;
-        if (dt<best) best=dt; sum+=dt;
+        if (dt<best) best=dt;
+        sum+=dt;
         checksum+=out[(size_t)r*4099u%raw_bytes]+got_esc+got_lit;
         printf("run %d: %.3f s %.2f GB/s reconstructed %.2f GB/s packed-input-equiv\n",
                r+1,dt,(double)raw_bytes/1e9/dt,(double)packed/1e9/dt);
