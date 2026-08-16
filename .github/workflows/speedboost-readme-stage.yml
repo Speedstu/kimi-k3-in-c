@@ -1,0 +1,35 @@
+name: Stage speedboost README guide
+
+on:
+  push:
+    branches:
+      - docs/speedboost-guide
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'stage speedboost README guide'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Apply README guide
+        run: python3 tools/apply_speedboost_readme_stage.py
+      - name: Sanity-check links and commands
+        run: |
+          grep -q 'tools/lossless_trunk.py' README.md
+          grep -q 'tools/q4_trunk.py' README.md
+          grep -q 'benchmarks/thread-sweep.sh' README.md
+          grep -q -- '--draft-topk 4' README.md
+          grep -q -- '--threads N' README.md
+          grep -q 'github.com/Speedstu/kimi-k3-in-c.git' README.md
+      - name: Commit README
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: surface speedboost setup for consumer hardware"
+          git push origin HEAD:docs/speedboost-guide
