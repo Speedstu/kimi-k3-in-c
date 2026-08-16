@@ -1,29 +1,41 @@
 #!/usr/bin/env python3
-"""Fully local Kimi K3 API/agent bridge.
+"""Fully local Kimi K3 chat / agent bridge.
 
-No request made by this program leaves the machine.  The official K3 tokenizer code is
-loaded from MODEL_DIR with ``local_files_only=True`` and renders the exact XTML chat
-format; ``bin/k3`` remains the inference backend.
+The official K3 tokenizer code and the model checkpoint are read from ``--model-dir``;
+the C engine is the only inference backend.  This process never calls Moonshot, Kimi,
+Hugging Face, or another inference service.  It exposes an OpenAI-compatible localhost
+endpoint so the official Kimi Code harness can drive the local model.
 
-The endpoint intentionally mirrors the useful part of OpenAI chat completions so the
-*official Kimi Code CLI* can be pointed at localhost and used as the agent harness.
+For coding/agent parity the defaults intentionally match the K3 release evaluation:
+reasoning effort ``max``, temperature 1.0, top-p 1.0.  Single-step benchmark callers can
+request top-p 0.95 explicitly.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import html
+import ipaddress
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+# A local model directory must be sufficient by itself.  These environment variables are
+# set before transformers is imported (the import is intentionally lazy below), so a
+# missing local tokenizer file fails rather than quietly downloading one from the web.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 O = "<|open|>"
 C = "<|close|>"
@@ -39,11 +51,11 @@ def _attrs(text: str) -> dict[str, str]:
 
 
 def parse_xtml(text: str) -> dict[str, Any]:
-    """Turn K3's generated XTML channels into an API-style assistant message.
+    """Turn generated K3 XTML channels into an API-style assistant message.
 
-    K3 generation normally starts *inside* the think channel because the generation
-    prompt already emitted ``<|open|>think<|sep|>``.  Therefore a missing think-open is
-    expected, not an error.
+    The official generation prompt starts generation *inside* the think channel, so a
+    generated completion commonly begins with reasoning text and then
+    ``<|close|>think<|sep|>`` rather than with a think-open token.
     """
 
     think_open = O + "think" + S
@@ -64,7 +76,7 @@ def parse_xtml(text: str) -> dict[str, Any]:
         reasoning = raw[:cut]
         rest = raw[cut + len(think_close) :]
     elif response_open not in raw and tools_open not in raw:
-        # Truncated while still thinking.
+        # The completion ended while the model was still thinking.
         reasoning = raw
         rest = ""
 
@@ -90,20 +102,28 @@ def parse_xtml(text: str) -> dict[str, Any]:
         if tc >= 0:
             tool_body = tool_body[:tc]
 
-        # Calls and arguments are delimited by K3's control-token separators.
         call_re = re.compile(
-            re.escape(O) + r"call(?P<attrs>.*?)" + re.escape(S)
-            + r"(?P<body>.*?)" + re.escape(C + "call" + S),
+            re.escape(O)
+            + r"call(?P<attrs>.*?)"
+            + re.escape(S)
+            + r"(?P<body>.*?)"
+            + re.escape(C + "call" + S),
             re.DOTALL,
         )
         arg_re = re.compile(
-            re.escape(O) + r"argument(?P<attrs>.*?)" + re.escape(S)
-            + r"(?P<body>.*?)" + re.escape(C + "argument" + S),
+            re.escape(O)
+            + r"argument(?P<attrs>.*?)"
+            + re.escape(S)
+            + r"(?P<body>.*?)"
+            + re.escape(C + "argument" + S),
             re.DOTALL,
         )
         json_re = re.compile(
-            re.escape(O) + r"json(?P<attrs>.*?)" + re.escape(S)
-            + r"(?P<body>.*?)" + re.escape(C + "json" + S),
+            re.escape(O)
+            + r"json(?P<attrs>.*?)"
+            + re.escape(S)
+            + r"(?P<body>.*?)"
+            + re.escape(C + "json" + S),
             re.DOTALL,
         )
 
@@ -112,17 +132,19 @@ def parse_xtml(text: str) -> dict[str, Any]:
             name = ca.get("tool", "")
             idx = ca.get("index", str(pos))
             args: dict[str, Any] = {}
-            cb = call.group("body")
-            json_block = json_re.search(cb)
+            call_body = call.group("body")
+            json_block = json_re.search(call_body)
             if json_block:
                 try:
                     parsed = json.loads(json_block.group("body"))
                     if isinstance(parsed, dict):
                         args = parsed
+                    else:
+                        args = {"value": parsed}
                 except json.JSONDecodeError:
                     args = {"_raw": json_block.group("body")}
             else:
-                for arg in arg_re.finditer(cb):
+                for arg in arg_re.finditer(call_body):
                     aa = _attrs(arg.group("attrs"))
                     key = aa.get("key", "")
                     typ = aa.get("type", "string")
@@ -142,7 +164,9 @@ def parse_xtml(text: str) -> dict[str, Any]:
                     "type": "function",
                     "function": {
                         "name": name,
-                        "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":")),
+                        "arguments": json.dumps(
+                            args, ensure_ascii=False, separators=(",", ":")
+                        ),
                     },
                 }
             )
@@ -158,7 +182,30 @@ def parse_xtml(text: str) -> dict[str, Any]:
     }
 
 
-@dataclass
+def _contains_media(messages: list[dict[str, Any]]) -> bool:
+    """Return true for API message parts the current C text backend cannot encode."""
+
+    media_types = {
+        "image",
+        "image_url",
+        "input_image",
+        "video",
+        "video_url",
+        "input_video",
+        "audio",
+        "input_audio",
+    }
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in media_types:
+                return True
+    return False
+
+
+@dataclass(frozen=True)
 class BackendConfig:
     model_dir: Path
     trunk_dir: Path
@@ -169,18 +216,25 @@ class BackendConfig:
     trunk_gb: float | None = None
 
 
+@dataclass
+class StateEntry:
+    tokens: tuple[int, ...]
+    path: Path
+    touched: float
+
+
 class LocalTokenizer:
     def __init__(self, model_dir: Path):
         try:
             from transformers import AutoTokenizer
         except ImportError as exc:  # pragma: no cover - environment error
             raise SystemExit(
-                "transformers is required only for the official K3 XTML tokenizer. "
-                "Install it in a venv: pip install 'transformers>=4.56' tiktoken"
+                "The official K3 XTML tokenizer needs transformers. Install it in a "
+                "venv, for example: pip install 'transformers>=4.56' tiktoken"
             ) from exc
 
-        # LOCAL ONLY. trust_remote_code means execute the tokenizer Python files already
-        # present in model_dir; local_files_only prevents a network fallback.
+        # trust_remote_code here means "execute the tokenizer Python source already in
+        # model_dir".  local_files_only plus the offline env above forbids a web fallback.
         self.tok = AutoTokenizer.from_pretrained(
             str(model_dir), trust_remote_code=True, local_files_only=True
         )
@@ -204,8 +258,8 @@ class LocalTokenizer:
             "tokenize": True,
             "add_generation_prompt": True,
             "thinking": True,
-            # The official local encoder calls the template kwarg thinking_effort even
-            # though the public API field is reasoning_effort.
+            # The local K3 encoder names this template kwarg thinking_effort.  The
+            # compatible HTTP field remains reasoning_effort.
             "thinking_effort": reasoning_effort,
         }
         if tools is not None:
@@ -229,8 +283,47 @@ class LocalTokenizer:
 
 
 class CBackend:
-    def __init__(self, cfg: BackendConfig):
+    """Serialises access to the huge local engine and reuses exact saved prefixes."""
+
+    def __init__(
+        self,
+        cfg: BackendConfig,
+        state_root: Path | None,
+        max_state_entries: int,
+    ):
         self.cfg = cfg
+        self.lock = threading.Lock()
+        self.max_state_entries = max(0, max_state_entries)
+        self.entries: list[StateEntry] = []
+        self.session_state_dir: Path | None = None
+        if state_root is not None and self.max_state_entries > 0:
+            state_root.mkdir(parents=True, exist_ok=True)
+            self.session_state_dir = state_root / ("session-" + uuid.uuid4().hex)
+            self.session_state_dir.mkdir(parents=True)
+            atexit.register(shutil.rmtree, self.session_state_dir, True)
+
+    def _best_state(self, prompt_ids: list[int]) -> StateEntry | None:
+        best: StateEntry | None = None
+        for entry in self.entries:
+            n = len(entry.tokens)
+            if n > len(prompt_ids):
+                continue
+            if tuple(prompt_ids[:n]) != entry.tokens:
+                continue
+            if best is None or n > len(best.tokens):
+                best = entry
+        if best is not None:
+            best.touched = time.monotonic()
+        return best
+
+    def _remember(self, tokens: list[int], path: Path) -> None:
+        if not path.is_file():
+            return
+        self.entries.append(StateEntry(tuple(tokens), path, time.monotonic()))
+        while len(self.entries) > self.max_state_entries:
+            victim = min(self.entries, key=lambda entry: entry.touched)
+            self.entries.remove(victim)
+            victim.path.unlink(missing_ok=True)
 
     def generate(
         self,
@@ -242,66 +335,109 @@ class CBackend:
         seed: int,
         stop_id: int,
     ) -> tuple[list[int], dict[str, Any]]:
-        with tempfile.TemporaryDirectory(prefix="k3-local-") as td:
-            td_path = Path(td)
-            ids_path = td_path / "prompt.ids"
-            out_path = td_path / "result.json"
-            ids_path.write_text(",".join(map(str, prompt_ids)), encoding="ascii")
+        # Running two 2.78T checkpoint processes at once on a laptop is not concurrency,
+        # it is an OOM / disk-thrashing bug.  The HTTP server may have many client
+        # threads, but the model backend is deliberately one-at-a-time.
+        with self.lock:
+            cached = self._best_state(prompt_ids)
+            cached_tokens = len(cached.tokens) if cached else 0
+            suffix = prompt_ids[cached_tokens:]
 
-            cmd = [
-                str(self.cfg.binary),
-                str(self.cfg.model_dir),
-                "--trunk",
-                str(self.cfg.trunk_dir),
-                "--preset",
-                self.cfg.preset,
-                "--ids-file",
-                str(ids_path),
-                "--gen",
-                str(max_tokens),
-                "--incremental",
-                "--temperature",
-                str(temperature),
-                "--top-p",
-                str(top_p),
-                "--seed",
-                str(seed),
-                "--stop-id",
-                str(stop_id),
-                "--out",
-                str(out_path),
-            ]
-            if self.cfg.threads is not None:
-                cmd += ["--threads", str(self.cfg.threads)]
-            if self.cfg.cache_gb is not None:
-                cmd += ["--cache-gb", str(self.cfg.cache_gb)]
-            if self.cfg.trunk_gb is not None:
-                cmd += ["--trunk-gb", str(self.cfg.trunk_gb)]
+            with tempfile.TemporaryDirectory(prefix="k3-local-") as td:
+                td_path = Path(td)
+                ids_path = td_path / "prompt.ids"
+                out_path = td_path / "result.json"
+                ids_path.write_text(",".join(map(str, suffix)), encoding="ascii")
 
-            proc = subprocess.run(cmd, text=True)
-            if proc.returncode != 0:
-                raise RuntimeError(f"local K3 backend exited with code {proc.returncode}")
-            data = json.loads(out_path.read_text(encoding="utf-8"))
-            return [int(x) for x in data["generated_ids"]], data
+                save_path: Path | None = None
+                if self.session_state_dir is not None:
+                    save_path = self.session_state_dir / (uuid.uuid4().hex + ".k3state")
+
+                cmd = [
+                    str(self.cfg.binary),
+                    str(self.cfg.model_dir),
+                    "--trunk",
+                    str(self.cfg.trunk_dir),
+                    "--preset",
+                    self.cfg.preset,
+                    "--ids-file",
+                    str(ids_path),
+                    "--gen",
+                    str(max_tokens),
+                    "--incremental",
+                    "--temperature",
+                    str(temperature),
+                    "--top-p",
+                    str(top_p),
+                    "--seed",
+                    str(seed),
+                    "--stop-id",
+                    str(stop_id),
+                    "--out",
+                    str(out_path),
+                ]
+                if cached is not None:
+                    cmd += ["--load-state", str(cached.path)]
+                if save_path is not None:
+                    cmd += ["--save-state", str(save_path)]
+                if self.cfg.threads is not None:
+                    cmd += ["--threads", str(self.cfg.threads)]
+                if self.cfg.cache_gb is not None:
+                    cmd += ["--cache-gb", str(self.cfg.cache_gb)]
+                if self.cfg.trunk_gb is not None:
+                    cmd += ["--trunk-gb", str(self.cfg.trunk_gb)]
+
+                proc = subprocess.run(cmd, text=True, capture_output=True)
+                if proc.returncode != 0:
+                    tail = (proc.stdout + "\n" + proc.stderr)[-8000:]
+                    raise RuntimeError(
+                        f"local K3 backend exited with code {proc.returncode}\n{tail}"
+                    )
+                data = json.loads(out_path.read_text(encoding="utf-8"))
+                generated = [int(x) for x in data["generated_ids"]]
+                full_ids = [int(x) for x in data["full_ids"]]
+                if save_path is not None:
+                    self._remember(full_ids, save_path)
+                data["state_cache_hit_tokens"] = cached_tokens
+                data["state_cache_suffix_tokens"] = len(suffix)
+                return generated, data
 
 
 class LocalK3:
-    def __init__(self, cfg: BackendConfig):
+    def __init__(
+        self,
+        cfg: BackendConfig,
+        state_root: Path | None,
+        max_state_entries: int,
+    ):
         self.tokenizer = LocalTokenizer(cfg.model_dir)
-        self.backend = CBackend(cfg)
+        self.backend = CBackend(cfg, state_root, max_state_entries)
 
     def complete(self, request: dict[str, Any]) -> dict[str, Any]:
         messages = request.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty list")
+        if _contains_media(messages):
+            raise ValueError(
+                "this local C backend currently supports K3 text/coding input only; "
+                "image/video input is rejected rather than silently discarded"
+            )
 
         effort = request.get("reasoning_effort", "max")
         if effort not in {"low", "high", "max"}:
             raise ValueError("reasoning_effort must be low, high, or max")
         temperature = float(request.get("temperature", 1.0))
         top_p = float(request.get("top_p", 1.0))
-        max_tokens = int(request.get("max_tokens", request.get("max_completion_tokens", 4096)))
+        max_tokens = int(
+            request.get("max_tokens", request.get("max_completion_tokens", 4096))
+        )
         seed = int(request.get("seed", 1))
+        if not 1 <= max_tokens <= 4096:
+            raise ValueError("max_tokens must be in [1,4096] for the current C backend")
+        if temperature < 0.0:
+            raise ValueError("temperature must be >= 0")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0,1]")
 
         prompt_ids = self.tokenizer.render(
             messages,
@@ -319,6 +455,12 @@ class LocalK3:
             stop_id=self.tokenizer.eos_id,
         )
         message = parse_xtml(self.tokenizer.decode(generated))
+        stopped = bool(generated and generated[-1] == self.tokenizer.eos_id)
+        finish_reason = (
+            "tool_calls"
+            if message.get("tool_calls")
+            else ("stop" if stopped else "length")
+        )
         return {
             "id": "chatcmpl-local-" + uuid.uuid4().hex,
             "object": "chat.completion",
@@ -328,7 +470,7 @@ class LocalK3:
                 {
                     "index": 0,
                     "message": message,
-                    "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {
@@ -341,7 +483,8 @@ class LocalK3:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "K3Local/0.1"
+    server_version = "K3Local/0.2"
+    protocol_version = "HTTP/1.1"
 
     def _json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -357,11 +500,24 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "object": "list",
-                    "data": [{"id": "kimi-k3-local", "object": "model", "owned_by": "local"}],
+                    "data": [
+                        {
+                            "id": "kimi-k3-local",
+                            "object": "model",
+                            "owned_by": "local",
+                        }
+                    ],
                 },
             )
         elif self.path in {"/health", "/healthz"}:
-            self._json(200, {"status": "ok", "backend": "local-c"})
+            self._json(
+                200,
+                {
+                    "status": "ok",
+                    "backend": "local-c",
+                    "network_inference": False,
+                },
+            )
         else:
             self._json(404, {"error": {"message": "not found"}})
 
@@ -373,34 +529,44 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
             result = self.server.k3.complete(request)  # type: ignore[attr-defined]
-            if not request.get("stream", False):
-                self._json(200, result)
-                return
+        except Exception as exc:  # noqa: BLE001 - HTTP API boundary
+            self._json(
+                400,
+                {"error": {"message": str(exc), "type": type(exc).__name__}},
+            )
+            return
 
-            # The C backend currently completes the turn before returning. We still speak
-            # valid SSE so Kimi Code and OpenAI-compatible clients work unchanged; a future
-            # resident backend can emit these deltas token-by-token without changing the
-            # wire protocol.
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            choice = result["choices"][0]
-            msg = choice["message"]
-            rid = result["id"]
+        if not request.get("stream", False):
+            self._json(200, result)
+            return
 
-            def event(delta: dict[str, Any], finish: str | None = None) -> None:
-                packet = {
-                    "id": rid,
-                    "object": "chat.completion.chunk",
-                    "created": result["created"],
-                    "model": result["model"],
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-                }
-                self.wfile.write(("data: " + json.dumps(packet, ensure_ascii=False) + "\n\n").encode())
-                self.wfile.flush()
+        # This is valid SSE and therefore compatible with streaming clients, but the
+        # current CLI backend completes a turn before returning.  The resident-worker
+        # backend planned for this same wire protocol can later send true token deltas.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        choice = result["choices"][0]
+        msg = choice["message"]
+        response_id = result["id"]
 
+        def event(delta: dict[str, Any], finish: str | None = None) -> None:
+            packet = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": result["created"],
+                "model": result["model"],
+                "choices": [
+                    {"index": 0, "delta": delta, "finish_reason": finish}
+                ],
+            }
+            payload = "data: " + json.dumps(packet, ensure_ascii=False) + "\n\n"
+            self.wfile.write(payload.encode("utf-8"))
+            self.wfile.flush()
+
+        try:
             event({"role": "assistant"})
             if msg.get("reasoning_content"):
                 event({"reasoning_content": msg["reasoning_content"]})
@@ -411,14 +577,33 @@ class Handler(BaseHTTPRequestHandler):
             event({}, choice["finish_reason"])
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
-        except Exception as exc:  # noqa: BLE001 - API boundary
-            self._json(400, {"error": {"message": str(exc), "type": type(exc).__name__}})
+        except BrokenPipeError:
+            pass
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print("[k3-local] " + (fmt % args))
 
 
+class K3HTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def serve(args: argparse.Namespace) -> None:
+    if not _is_loopback_host(args.host) and not args.allow_remote:
+        raise SystemExit(
+            f"refusing to expose unauthenticated model server on {args.host}; "
+            "use 127.0.0.1/localhost or pass --allow-remote explicitly"
+        )
+
     cfg = BackendConfig(
         model_dir=args.model_dir.resolve(),
         trunk_dir=args.trunk.resolve(),
@@ -428,19 +613,39 @@ def serve(args: argparse.Namespace) -> None:
         cache_gb=args.cache_gb,
         trunk_gb=args.trunk_gb,
     )
-    for path, label in [(cfg.model_dir, "model"), (cfg.trunk_dir, "trunk"), (cfg.binary, "binary")]:
+    for path, label in [
+        (cfg.model_dir, "model"),
+        (cfg.trunk_dir, "trunk"),
+        (cfg.binary, "binary"),
+    ]:
         if not path.exists():
             raise SystemExit(f"{label} path does not exist: {path}")
-    k3 = LocalK3(cfg)
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+
+    state_root: Path | None = None
+    if not args.no_state_cache and args.state_cache_entries > 0:
+        state_root = args.state_cache_dir.expanduser().resolve()
+
+    k3 = LocalK3(cfg, state_root, args.state_cache_entries)
+    httpd = K3HTTPServer((args.host, args.port), Handler)
     httpd.k3 = k3  # type: ignore[attr-defined]
     print(f"K3 Local listening on http://{args.host}:{args.port}/v1")
-    print("network inference: disabled; tokenizer and weights are loaded from local paths only")
+    print("inference network: OFF; tokenizer + weights are local-files-only")
+    print("default parity profile: reasoning=max, temperature=1.0, top-p=1.0")
+    if state_root is not None:
+        print(
+            f"conversation state cache: ON ({args.state_cache_entries} entry/entries; "
+            f"root {state_root})"
+        )
+        print("note: current expanded MLA state is large; keep this cache on fast local NVMe")
+    else:
+        print("conversation state cache: OFF")
     httpd.serve_forever()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Fully local Kimi K3 OpenAI-compatible server")
+    ap = argparse.ArgumentParser(
+        description="Fully local Kimi K3 OpenAI-compatible chat / agent server"
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("serve")
     sp.add_argument("--model-dir", type=Path, required=True)
@@ -452,6 +657,23 @@ def main() -> None:
     sp.add_argument("--trunk-gb", type=float)
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--port", type=int, default=8000)
+    sp.add_argument(
+        "--state-cache-dir",
+        type=Path,
+        default=Path("~/.cache/k3-local/state"),
+    )
+    sp.add_argument(
+        "--state-cache-entries",
+        type=int,
+        default=1,
+        help="exact saved conversation prefixes retained on local NVMe (default 1)",
+    )
+    sp.add_argument("--no-state-cache", action="store_true")
+    sp.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow binding to a non-loopback host; the server itself has no auth",
+    )
     sp.set_defaults(func=serve)
     args = ap.parse_args()
     args.func(args)
