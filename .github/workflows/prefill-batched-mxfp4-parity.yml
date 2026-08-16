@@ -1,6 +1,7 @@
 name: Batched MXFP4 prefill parity
 
 on:
+  workflow_dispatch:
   push:
     branches: [speedboost/prefill-batched-mxfp4]
     paths:
