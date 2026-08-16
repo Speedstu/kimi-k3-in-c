@@ -1,0 +1,85 @@
+name: Expert-ready pipeline parity
+
+on:
+  push:
+    branches: [speedboost/expert-ready-pipeline]
+    paths:
+      - 'include/k3/k3.h'
+      - 'src/cache/k3_cache.c'
+      - 'src/cache/k3_cache.h'
+      - 'src/core/k3_ops.c'
+      - 'tests/unit/test_cache.c'
+      - '.github/workflows/expert-ready-parity.yml'
+  pull_request:
+    paths:
+      - 'include/k3/k3.h'
+      - 'src/cache/k3_cache.c'
+      - 'src/cache/k3_cache.h'
+      - 'src/core/k3_ops.c'
+      - 'tests/unit/test_cache.c'
+      - '.github/workflows/expert-ready-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exact-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Dependencies and strict build
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' all bin/test_cache -j2
+
+      - name: Streaming-cache per-expert stress gate
+        run: |
+          set -euo pipefail
+          ./bin/test_cache tests/fixtures/cache | tee /tmp/cache.log
+          grep -q 'PASS  per-expert pipeline is byte-exact' /tmp/cache.log
+          grep -q 'CACHE TESTS PASSED' /tmp/cache.log
+
+      - name: Build tiny streamed K3
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/k3tiny /tmp/k3trunk /tmp/expert-ready
+          mkdir -p /tmp/expert-ready
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11,5,9
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3trunk "$NLAYERS"
+
+      - name: Pipeline ON is bit-identical to whole-batch wait
+        run: |
+          set -euo pipefail
+          D=/tmp/expert-ready
+          COMMON='/tmp/k3tiny --trunk /tmp/k3trunk --trunk-gb 0.05 --cache-gb 0.001 --ids 3,7,11,5,9 --gen 8 --incremental --threads 1 --temperature 0'
+          K3_NO_EXPERT_PIPELINE=1 ./bin/k3 $COMMON --dump-logits "$D/off.logits" --out "$D/off.json" >"$D/off.log" 2>&1
+          ./bin/k3 $COMMON --dump-logits "$D/on.logits" --out "$D/on.json" >"$D/on.log" 2>&1
+          cmp "$D/off.logits" "$D/on.logits"
+          python - <<'PY'
+          import json
+          d='/tmp/expert-ready'
+          a=json.load(open(d+'/off.json')); b=json.load(open(d+'/on.json'))
+          assert a['generated_ids']==b['generated_ids'], (a['generated_ids'], b['generated_ids'])
+          assert a['full_ids']==b['full_ids']
+          print('expert pipeline exact ids:', a['generated_ids'])
+          PY
+          grep -q 'per-expert pipeline DISABLED by K3_NO_EXPERT_PIPELINE' "$D/off.log"
+          grep -Eq 'async overlap *: [1-9][0-9]* batches' "$D/on.log"
+          echo 'per-expert pipeline logits + 8-token parity: PASS'
+
+      - name: Full weightless regression suite
+        run: make test -j2

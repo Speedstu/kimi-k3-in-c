@@ -217,27 +217,86 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
 }
 
 typedef struct {
+    int slot, expert;
+    K3ExpertRef r;
+    int64_t got, pad;
+    int state;                         /* 0 reading, 1 published, -1 failed */
+} K3AsyncWork;
+
+typedef struct {
     K3Cache *cache;
     pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int sync_init;
     int active;
     int result;
-    int layer, n;
-    int ids[K3_MAX_TOPK];
+    int finished;
+    int layer, nw, ok;
+    K3AsyncWork w[K3_MAX_TOPK];
 } K3AsyncPrefetch;
 
+static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out);
+static int cache_prefetch_wait(K3ExpertSrc *self);
+
+/* Background side of the expert pipeline.
+ *
+ * Slots are RESERVED serially by begin() before this thread starts. Each worker therefore
+ * owns a distinct destination. As soon as one read completes, publish JUST that slot under
+ * the metadata mutex and wake the model thread. The model still consumes top-k in j order;
+ * only storage completion is out of order. */
 static void *cache_async_main(void *arg)
 {
     K3AsyncPrefetch *a = (K3AsyncPrefetch *)arg;
+    K3Cache *c = a->cache;
 #ifdef _OPENMP
-    /* I/O threads mostly sleep in pread. Give the device enough queue depth without
-     * spawning a second full compute-sized OpenMP team beside the model matmuls. */
-    omp_set_num_threads(a->cache->async_io_threads);
+    /* I/O workers mostly sleep in pread. Keep their team separate from compute. */
+    omp_set_num_threads(c->async_io_threads);
 #endif
-    a->result = cache_getmany(&a->cache->src, a->layer, a->ids, a->n);
+    const double t0 = now_s();
+#ifdef _OPENMP
+#   pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int i = 0; i < a->nw; i++) {
+        K3AsyncWork *w = &a->w[i];
+        int64_t pad = 0;
+        const int64_t got = k3_expert_load_direct(
+            c->st, &w->r, c->arena + (size_t)w->slot * c->slot_bytes,
+            c->slot_bytes, &pad);
+
+        pthread_mutex_lock(&a->mu);
+        w->got = got;
+        w->pad = pad;
+        if (got == w->r.nbytes) {
+            const int32_t key = a->layer * c->n_experts + w->expert;
+            c->ref[w->slot] = w->r;
+            c->pad[w->slot] = (int32_t)pad;
+            c->key_of[w->slot] = key;
+            c->slot_of[key] = w->slot;
+            c->used_at[w->slot] = ++c->clock;
+            c->bytes_read += (uint64_t)got;
+            c->prefetch_reads++;
+            w->state = 1;
+            a->ok++;
+        } else {
+            fprintf(stderr, "k3_cache: short async prefetch of L%d expert %d (%lld of %lld); "
+                            "releasing its slot\n",
+                    a->layer, w->expert, (long long)got, (long long)w->r.nbytes);
+            c->key_of[w->slot] = K3_SLOT_EMPTY;
+            w->state = -1;
+        }
+        pthread_cond_broadcast(&a->cv);
+        pthread_mutex_unlock(&a->mu);
+    }
+
+    pthread_mutex_lock(&a->mu);
+    c->load_seconds += now_s() - t0;
+    a->result = a->ok;
+    a->finished = 1;
+    pthread_cond_broadcast(&a->cv);
+    pthread_mutex_unlock(&a->mu);
     return NULL;
 }
-
-static int cache_prefetch_wait(K3ExpertSrc *self);
 
 static int cache_prefetch_begin(K3ExpertSrc *self, int layer, const int *ids, int n)
 {
@@ -245,31 +304,104 @@ static int cache_prefetch_begin(K3ExpertSrc *self, int layer, const int *ids, in
     K3AsyncPrefetch *a = (K3AsyncPrefetch *)c->async_ctx;
     if (!a || n <= 0) return -1;
     if (a->active) {
-        /* A previous caller forgot to wait. Do not race two batches through the same
-         * LRU/cache state: finish it first, loudly but safely. */
         fprintf(stderr, "k3_cache: async prefetch begin found a previous batch active; waiting\n");
         cache_prefetch_wait(self);
     }
+    if (n > K3_MAX_TOPK) n = K3_MAX_TOPK;
 
-    int any_miss = 0;
+    a->cache = c;
+    a->layer = layer;
+    a->nw = 0;
+    a->ok = 0;
+    a->result = -1;
+    a->finished = 0;
+
+    /* Reserve every miss BEFORE launching readers. This is the same serial victim phase
+     * as cache_getmany(), and it guarantees that no ready expert can be evicted by a
+     * later miss from this top-k while the model is multiplying it. */
     for (int i = 0; i < n; i++) {
         const int e = ids[i];
         if (e < 0 || e >= c->n_experts) continue;
         const int32_t key = layer * c->n_experts + e;
-        if (key >= 0 && key < c->n_layers * c->n_experts && c->slot_of[key] < 0) {
-            any_miss = 1;
-            break;
-        }
-    }
-    if (!any_miss) return 0;
+        if (c->slot_of[key] >= 0) continue;
 
-    if (n > K3_MAX_TOPK) n = K3_MAX_TOPK;
-    a->cache = c; a->layer = layer; a->n = n; a->result = -1;
-    memcpy(a->ids, ids, (size_t)n * sizeof(int));
-    if (pthread_create(&a->thread, NULL, cache_async_main, a) != 0) return -1;
+        int dup = 0;
+        for (int j = 0; j < a->nw; j++) if (a->w[j].expert == e) { dup = 1; break; }
+        if (dup) continue;
+
+        K3ExpertRef r;
+        if (k3_expert_ref(c->st, layer, e, &r) != 0 || r.nbytes > c->slot_bytes) continue;
+        const int slot = pick_victim(c);
+        if (slot < 0) break;
+        if (c->key_of[slot] >= 0) {
+            c->slot_of[c->key_of[slot]] = -1;
+            c->evictions++;
+        }
+        c->key_of[slot] = K3_SLOT_INFLIGHT;
+        c->used_at[slot] = ++c->clock;
+
+        K3AsyncWork *w = &a->w[a->nw++];
+        memset(w, 0, sizeof *w);
+        w->slot = slot;
+        w->expert = e;
+        w->r = r;
+        w->got = -1;
+    }
+    if (a->nw == 0) return 0;             /* all selected experts were resident */
+
+    /* Submit in physical order for the same mostly-forward disk sweep as getmany(). */
+    for (int i = 1; i < a->nw; i++) {
+        K3AsyncWork t = a->w[i];
+        int j = i - 1;
+        while (j >= 0 && (a->w[j].r.shard > t.r.shard ||
+               (a->w[j].r.shard == t.r.shard && a->w[j].r.off > t.r.off))) {
+            a->w[j + 1] = a->w[j];
+            j--;
+        }
+        a->w[j + 1] = t;
+    }
+
+    if (pthread_create(&a->thread, NULL, cache_async_main, a) != 0) {
+        /* Correctness-first fallback: the evicted old cache entries are gone, but every
+         * reservation is released so synchronous getmany/get can refill safely. */
+        for (int i = 0; i < a->nw; i++)
+            if (c->key_of[a->w[i].slot] == K3_SLOT_INFLIGHT)
+                c->key_of[a->w[i].slot] = K3_SLOT_EMPTY;
+        return -1;
+    }
     a->active = 1;
     c->async_batches++;
     return 1;
+}
+
+/* Wait for exactly one routed expert, then serve it through cache_get while holding the
+ * same metadata mutex used by async publication. cache_get therefore records the SAME
+ * histogram/trace/hit accounting as the old post-join path, with no slot_of/clock race. */
+static int cache_prefetch_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
+{
+    K3Cache *c = (K3Cache *)self;
+    K3AsyncPrefetch *a = (K3AsyncPrefetch *)c->async_ctx;
+    if (!a || !a->active || layer != a->layer)
+        return cache_get(self, layer, expert, out);
+
+    pthread_mutex_lock(&a->mu);
+    int wi = -1;
+    for (int i = 0; i < a->nw; i++)
+        if (a->w[i].expert == expert) { wi = i; break; }
+
+    if (wi >= 0) {
+        const double t0 = now_s();
+        while (a->w[wi].state == 0 && !a->finished)
+            pthread_cond_wait(&a->cv, &a->mu);
+        c->async_ready_wait_seconds += now_s() - t0;
+    }
+
+    /* On success this is an immediate cache hit. On a failed read it performs the normal
+     * exact synchronous fallback. Holding mu during that rare fallback blocks metadata
+     * publication, never the already-issued disk reads, and avoids a data race. */
+    const int rc = cache_get(self, layer, expert, out);
+    pthread_mutex_unlock(&a->mu);
+    return rc;
 }
 
 static int cache_prefetch_wait(K3ExpertSrc *self)
@@ -281,8 +413,6 @@ static int cache_prefetch_wait(K3ExpertSrc *self)
     const int rc = pthread_join(a->thread, NULL);
     c->async_wait_seconds += now_s() - t0;
     if (rc != 0) {
-        /* Continuing would allow get() to race a possibly-live writer into the cache.
-         * Abort instead of risking a plausible token from partially loaded weights. */
         fprintf(stderr, "k3_cache: FATAL pthread_join failed for expert prefetch (%d)\n", rc);
         abort();
     }
@@ -426,6 +556,11 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     if (c->src.getmany && !getenv("K3_NOASYNC_PREFETCH")) {
         K3AsyncPrefetch *a = (K3AsyncPrefetch *)calloc(1, sizeof *a);
         if (!a) { k3_cache_free(c); return -1; }
+        if (pthread_mutex_init(&a->mu, NULL) != 0) { free(a); k3_cache_free(c); return -1; }
+        if (pthread_cond_init(&a->cv, NULL) != 0) {
+            pthread_mutex_destroy(&a->mu); free(a); k3_cache_free(c); return -1;
+        }
+        a->sync_init = 1;
         c->async_ctx = a;
         c->async_io_threads = 4;
         const char *et = getenv("K3_ASYNC_IO_THREADS");
@@ -435,6 +570,8 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
         }
         c->src.prefetch_begin = cache_prefetch_begin;
         c->src.prefetch_wait = cache_prefetch_wait;
+        if (!getenv("K3_NO_EXPERT_PIPELINE")) c->src.prefetch_get = cache_prefetch_get;
+        else fprintf(stderr, "k3_cache: per-expert pipeline DISABLED by K3_NO_EXPERT_PIPELINE\n");
     } else if (c->src.getmany) {
         fprintf(stderr, "k3_cache: async expert overlap DISABLED by K3_NOASYNC_PREFETCH\n");
     }
@@ -444,6 +581,10 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
 void k3_cache_free(K3Cache *c)
 {
     if (c->src.prefetch_wait) c->src.prefetch_wait(&c->src);
+    if (c->async_ctx) {
+        K3AsyncPrefetch *a = (K3AsyncPrefetch *)c->async_ctx;
+        if (a->sync_init) { pthread_cond_destroy(&a->cv); pthread_mutex_destroy(&a->mu); }
+    }
     free(c->async_ctx);
     free(c->arena); free(c->slot_of); free(c->key_of);
     free(c->used_at); free(c->pinned); free(c->ref); free(c->pad); free(c->hist);
@@ -491,6 +632,7 @@ void k3_cache_reset_stats(K3Cache *c)
     c->prefetch_reads = 0;
     c->async_batches = 0;
     c->async_wait_seconds = 0.0;
+    c->async_ready_wait_seconds = 0.0;
 }
 
 void k3_cache_report(const K3Cache *c, const char *label)
@@ -520,10 +662,10 @@ void k3_cache_report(const K3Cache *c, const char *label)
            (double)c->bytes_read / 1e9, c->load_seconds,
            c->load_seconds > 0 ? (double)c->bytes_read / 1e6 / c->load_seconds : 0.0);
     if (c->async_batches)
-        printf("  async overlap : %llu batches, caller waited %.2f s after independent compute "
+        printf("  async overlap : %llu batches, final join wait %.2f s, next-expert waits %.2f s "
                "(I/O worker threads %d)\n",
                (unsigned long long)c->async_batches, c->async_wait_seconds,
-               c->async_io_threads);
+               c->async_ready_wait_seconds, c->async_io_threads);
 }
 
 int k3_cache_dump_hist(const K3Cache *c, const char *path)

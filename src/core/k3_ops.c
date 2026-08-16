@@ -587,8 +587,9 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
         }
 
-        /* If the cache supports async top-k prefetch, start it as soon as routing has
-         * identified the experts. Nothing below touches the cache until prefetch_wait. */
+        /* Start top-k I/O as soon as routing identifies the experts. Down/shared compute
+         * is cache-independent; a pipeline-capable source then publishes experts one by one,
+         * while older sources retain the whole-batch barrier before routed computation. */
         int async_prefetch = 0, prefetch_known_ready = 0;
         if (!w->cache_only && w->src && w->src->prefetch_begin) {
             const int ar = w->src->prefetch_begin(w->src, w->layer, idx, nk);
@@ -609,14 +610,18 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
             k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
             k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-            w->src->prefetch_wait(w->src);
+            /* Old sources still require a whole-batch barrier. A pipeline-capable cache
+             * lets the routed loop below wait only for expert j while j+1..K keep loading. */
+            if (!w->src->prefetch_get) w->src->prefetch_wait(w->src);
         } else if (!w->cache_only && !prefetch_known_ready && w->src && w->src->getmany) {
             /* Async unsupported/failed: preserve the old synchronous batch path. */
             w->src->getmany(w->src, w->layer, idx, nk);
         }
 
-        /* 3. the selected experts, in latent space, weighted and summed. At this point
-         * an async batch is fully joined, so get() can never observe an inflight slot. */
+        /* 3. Selected experts stay in the ORIGINAL top-k order. With prefetch_get,
+         * only the current expert must have landed; later reads continue while its three
+         * MXFP4 matmuls run. This changes wall-clock overlap, never accumulation order. */
+        const int expert_pipeline = async_prefetch && w->src && w->src->prefetch_get;
         for (int i = 0; i < L; i++) accL[i] = 0.0f;
         for (int j = 0; j < nk; j++) {
             if (w->src) {
@@ -626,7 +631,9 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                 K3ExpertQ q;
                 int miss = w->cache_only
                     ? !w->src->resident(w->src, w->layer, idx[j], &q)
-                    : (w->src->get(w->src, w->layer, idx[j], &q) != 0);
+                    : (expert_pipeline
+                       ? w->src->prefetch_get(w->src, w->layer, idx[j], &q) != 0
+                       : w->src->get(w->src, w->layer, idx[j], &q) != 0);
                 if (miss) {
                     /* A cache-only draft filtered to resident experts already, so a miss
                      * here is a benign race at worst; skip it, since the draft is
@@ -655,6 +662,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             const float wj = wt[j];
             for (int i = 0; i < L; i++) accL[i] += wj * edn[i];
         }
+        if (expert_pipeline) w->src->prefetch_wait(w->src);
 
         /* 4. RMSNorm the AGGREGATE (not per expert), then 5. up-project */
         if (c->latent_norm) k3_rmsnorm(accL, accL, w->latent_norm, L, c->rms_eps);

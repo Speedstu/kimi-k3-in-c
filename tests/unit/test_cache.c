@@ -186,6 +186,41 @@ int main(int argc, char **argv)
         ck(bada == 0 && launched > 0, "async prefetch is byte-exact", b);
     }
 
+    /* ---- 2aa: pipeline consumption before whole-batch join must be byte-exact ---- */
+    if (!cache.src.prefetch_begin || !cache.src.prefetch_get || !cache.src.prefetch_wait) {
+        ck(0, "per-expert pipeline present", "callbacks are NULL");
+    } else {
+        k3_cache_reset_stats(&cache);
+        int badp = 0, launchedp = 0;
+        for (int pass = 0; pass < 4; pass++) {
+            for (int start = 0; start + c.topk <= NE; start += c.topk) {
+                int ids[16];
+                for (int j = 0; j < c.topk; j++) ids[j] = (start + j + pass) % NE;
+                const int ar = cache.src.prefetch_begin(&cache.src, 0, ids, c.topk);
+                if (ar > 0) {
+                    launchedp++;
+                    for (int j = 0; j < c.topk; j++) {
+                        K3ExpertQ q;
+                        if (cache.src.prefetch_get(&cache.src, 0, ids[j], &q) != 0) {
+                            badp++; continue;
+                        }
+                        if (!same_expert(&st, 0, ids[j], &q)) badp++;
+                    }
+                    cache.src.prefetch_wait(&cache.src);
+                } else {
+                    for (int j = 0; j < c.topk; j++) {
+                        K3ExpertQ q;
+                        if (cache.src.get(&cache.src, 0, ids[j], &q) != 0 ||
+                            !same_expert(&st, 0, ids[j], &q)) badp++;
+                    }
+                }
+            }
+        }
+        char b[112];
+        snprintf(b, sizeof b, "%d pipelined batches launched, %d wrong", launchedp, badp);
+        ck(badp == 0 && launchedp > 0, "per-expert pipeline is byte-exact", b);
+    }
+
     /* ---- 2b: interleaving the two paths must not corrupt either ---- */
     k3_cache_reset_stats(&cache);
     int bad3 = 0;
