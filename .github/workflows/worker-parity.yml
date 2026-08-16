@@ -25,6 +25,7 @@ permissions:
 jobs:
   tiny-worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -70,7 +71,6 @@ jobs:
               if line.startswith('@K3READY '): break
           else: raise AssertionError('worker exited before READY')
 
-          rid=0
           def req(ids, gen, temp=0.0, top_p=1.0, seed=1):
               nonlocal_rid[0]+=1; r=nonlocal_rid[0]
               p.stdin.write(f'REQ {r} {len(ids)} {gen} {temp} {top_p} {seed} -1\n')
