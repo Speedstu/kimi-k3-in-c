@@ -1290,6 +1290,7 @@ int main(int argc, char **argv)
     Weights dw; memset(&dw, 0, sizeof dw);
     float *dks = NULL, *dsnap = NULL;
     long hyb_rounds = 0, hyb_drafted = 0, hyb_accepted = 0;
+    double hyb_draft_s = 0.0, hyb_verify_s = 0.0;
     if (draft_dir) {
         if (!incremental || !trunk_dir) {
             fprintf(stderr, "--draft-trunk needs --incremental and --trunk; ignoring\n");
@@ -1426,6 +1427,7 @@ int main(int argc, char **argv)
             int d[K3_SPEC_MAX], nd = 0;
             if (spec_snap && T + spec_n + 1 < Tmax && base + spec_n + 1 <= w.kv_cap) {
                 if (dw.trunk) {
+                    const double hyb_draft_t0 = now_s();
                     /* The draft model proposes: k sequential one-token steps through
                      * the draft trunk, chaining its own argmax. Its state is
                      * snapshotted first so a partial acceptance can rewind it the
@@ -1449,6 +1451,7 @@ int main(int argc, char **argv)
                     }
                     hyb_rounds  += 1;
                     hyb_drafted += nd;
+                    hyb_draft_s += now_s() - hyb_draft_t0;
                 } else {
                     nd = spec_draft(seq, T, spec_n, d);
                     if (temperature > 0.0)
@@ -1467,6 +1470,7 @@ int main(int argc, char **argv)
                 int arg[K3_SPEC_MAX + 1];
                 memcpy(spec_snap, ks, kper_f * (size_t)w.n_bound * sizeof(float));
                 for (int i = 0; i < nd; i++) seq[T + i] = d[i];
+                const double hyb_verify_t0 = dw.trunk ? now_s() : 0.0;
                 frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks,
                               arg, temperature > 0.0 ? spec_target_logits : NULL);
                 if (frc == 0) {
@@ -1522,6 +1526,7 @@ int main(int argc, char **argv)
                                       ks, NULL, NULL);
                         if (frc == 0) w.cached = base + m + 1;
                     }
+                    if (dw.trunk) hyb_verify_s += now_s() - hyb_verify_t0;
                     /* Resync the draft model to the ACCEPTED sequence. On full
                      * acceptance its state already contains every fed token except
                      * the last draft, so one step closes the gap; on partial
@@ -1638,6 +1643,8 @@ int main(int argc, char **argv)
                hyb_rounds, hyb_drafted, hyb_accepted,
                hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
                (double)hyb_accepted / hyb_rounds);
+        printf("  draft proposal %.3f s, exact verify/replay %.3f s\n",
+               hyb_draft_s, hyb_verify_s);
         k3_trunk_close(&trunk_d);
         free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec);
     }
@@ -1675,8 +1682,14 @@ int main(int argc, char **argv)
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
         fprintf(f, "],\"layers\":%d,\"threads\":%d,\"temperature\":%.9g,"
                    "\"top_p\":%.9g,\"seed\":%llu,\"stop_id\":%d,"
+                   "\"draft_rounds\":%ld,\"draft_proposed\":%ld,"
+                   "\"draft_accepted\":%ld,\"draft_acceptance\":%.9g,"
+                   "\"draft_seconds\":%.6f,\"verify_seconds\":%.6f,"
                    "\"seconds_per_token\":%.4f}\n",
-                NL, compute_threads, temperature, top_p, sample_seed, stop_id, t_total / nout);
+                NL, compute_threads, temperature, top_p, sample_seed, stop_id,
+                hyb_rounds, hyb_drafted, hyb_accepted,
+                hyb_drafted ? (double)hyb_accepted / hyb_drafted : 0.0,
+                hyb_draft_s, hyb_verify_s, t_total / nout);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
