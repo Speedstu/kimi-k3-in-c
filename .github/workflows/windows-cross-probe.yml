@@ -1,0 +1,30 @@
+name: Windows MinGW cross probe
+
+on:
+  push:
+    branches: ['experiment/windows-native-probe']
+    paths:
+      - '.github/workflows/windows-cross-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  mingw:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 make
+      - name: Cross-compile current source and expose native blockers
+        run: |
+          x86_64-w64-mingw32-gcc --version
+          set +e
+          make CC=x86_64-w64-mingw32-gcc ARCH='-msse2' -j2 > /tmp/k3-mingw.log 2>&1
+          rc=$?
+          cat /tmp/k3-mingw.log
+          echo "BUILD_RC=$rc"
+          exit "$rc"
