@@ -16,8 +16,18 @@ jobs:
           install: >-
             make
             mingw-w64-ucrt-x86_64-gcc
-      - name: Build native Windows engine
+      - name: Build native Windows engine with warnings fatal
         shell: msys2 {0}
         run: |
           gcc --version
-          make CC=gcc ARCH='-msse2' -j2
+          make CC=gcc ARCH='-msse2' \
+            CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -msse2 -fopenmp -pthread -ffp-contract=off' \
+            -j2
+      - name: Run native weightless parity suite
+        shell: msys2 {0}
+        run: |
+          make clean
+          make CC=gcc ARCH='-msse2' -j2 test 2>&1 | tee /tmp/k3-win-tests.log
+          grep -q '23 passed, 0 failed, 0 skipped' /tmp/k3-win-tests.log
+          grep -q 'VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY' /tmp/k3-win-tests.log
+          grep -q 'ALL WEIGHTLESS TESTS PASSED' /tmp/k3-win-tests.log
