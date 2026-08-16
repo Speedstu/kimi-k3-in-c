@@ -68,38 +68,30 @@ s = once(
     "verify timer end",
 )
 
+# Inserting immediately before the close is less brittle than duplicating the multi-line
+# human summary, while still being structurally inside the same dw.trunk/rounds block.
 s = once(
     s,
-    '''        printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
-               "mean accepted run %.2f\n",
-               hyb_rounds, hyb_drafted, hyb_accepted,
-               hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
-               (double)hyb_accepted / hyb_rounds);
-''',
-    '''        printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
-               "mean accepted run %.2f\n",
-               hyb_rounds, hyb_drafted, hyb_accepted,
-               hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
-               (double)hyb_accepted / hyb_rounds);
-        printf("  draft proposal %.3f s, exact verify/replay %.3f s\n",
-               hyb_draft_s, hyb_verify_s);
-''',
+    "        k3_trunk_close(&trunk_d);\n",
+    "        printf(\"  draft proposal %.3f s, exact verify/replay %.3f s\\n\",\n"
+    "               hyb_draft_s, hyb_verify_s);\n"
+    "        k3_trunk_close(&trunk_d);\n",
     "hybrid timing report",
 )
 
 s = once(
     s,
-    '''        fprintf(f, "],\"layers\":%d,\"threads\":%d,\"temperature\":%.9g,"
-                   "\"top_p\":%.9g,\"seed\":%llu,\"stop_id\":%d,"
-                   "\"seconds_per_token\":%.4f}\n",
+    '''        fprintf(f, "],\\\"layers\\\":%d,\\\"threads\\\":%d,\\\"temperature\\\":%.9g,"
+                   "\\\"top_p\\\":%.9g,\\\"seed\\\":%llu,\\\"stop_id\\\":%d,"
+                   "\\\"seconds_per_token\\\":%.4f}\\n",
                 NL, compute_threads, temperature, top_p, sample_seed, stop_id, t_total / nout);
 ''',
-    '''        fprintf(f, "],\"layers\":%d,\"threads\":%d,\"temperature\":%.9g,"
-                   "\"top_p\":%.9g,\"seed\":%llu,\"stop_id\":%d,"
-                   "\"draft_rounds\":%ld,\"draft_proposed\":%ld,"
-                   "\"draft_accepted\":%ld,\"draft_acceptance\":%.9g,"
-                   "\"draft_seconds\":%.6f,\"verify_seconds\":%.6f,"
-                   "\"seconds_per_token\":%.4f}\n",
+    '''        fprintf(f, "],\\\"layers\\\":%d,\\\"threads\\\":%d,\\\"temperature\\\":%.9g,"
+                   "\\\"top_p\\\":%.9g,\\\"seed\\\":%llu,\\\"stop_id\\\":%d,"
+                   "\\\"draft_rounds\\\":%ld,\\\"draft_proposed\\\":%ld,"
+                   "\\\"draft_accepted\\\":%ld,\\\"draft_acceptance\\\":%.9g,"
+                   "\\\"draft_seconds\\\":%.6f,\\\"verify_seconds\\\":%.6f,"
+                   "\\\"seconds_per_token\\\":%.4f}\\n",
                 NL, compute_threads, temperature, top_p, sample_seed, stop_id,
                 hyb_rounds, hyb_drafted, hyb_accepted,
                 hyb_drafted ? (double)hyb_accepted / hyb_drafted : 0.0,
