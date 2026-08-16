@@ -372,6 +372,12 @@ typedef struct K3ExpertSrc {
      * arithmetic observe a half-loaded expert. */
     int (*prefetch_begin)(struct K3ExpertSrc *self, int layer,
                           const int *experts, int n);
+    /* OPTIONAL pipelined consumer. Valid only after begin() returned >0. It waits for
+     * THIS expert, not the whole batch, then returns the same exact bytes get() would.
+     * The caller must still call prefetch_wait() once after consuming the batch. This
+     * lets routed expert j compute while j+1..K are still loading, without changing
+     * the top-k accumulation order. NULL preserves the old whole-batch wait. */
+    int (*prefetch_get)(struct K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out);
     int (*prefetch_wait)(struct K3ExpertSrc *self);
     /* OPTIONAL: 1 if the expert is already resident (get() would read no disk), filling
      * out when non-NULL. The draft model's cache-only routing uses this to propose tokens

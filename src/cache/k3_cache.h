@@ -80,7 +80,8 @@ typedef struct {
     void        *async_ctx;
     int          async_io_threads;
     uint64_t     async_batches;
-    double       async_wait_seconds;
+    double       async_wait_seconds;       /* final whole-batch join wait             */
+    double       async_ready_wait_seconds; /* waits for the next top-k expert only    */
     uint32_t    *hist;            /* [n_layers*n_experts] request counts       */
 
     /* THE ACCESS TRACE, and why it is worth recording.
