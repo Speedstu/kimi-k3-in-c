@@ -10,7 +10,11 @@ The converter streams row chunks instead of loading a multi-GB layer into RAM.
 
 usage: python3 tools/q4_trunk.py <bf16_trunk_dir> <q4_out_dir>
 """
-import json, os, sys
+
+import json
+import os
+import sys
+
 import numpy as np
 
 ALIGN = 4096
@@ -25,7 +29,7 @@ def bf16_to_f32(u16):
 
 def encode_rows(raw, rows, cols):
     if cols % GROUP:
-        raise ValueError(f'Q4G requires cols divisible by {GROUP}, got {cols}')
+        raise ValueError(f"Q4G requires cols divisible by {GROUP}, got {cols}")
     f = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(rows, cols)
     ng = cols // GROUP
     fg = f.reshape(rows, ng, GROUP)
@@ -46,77 +50,100 @@ def copy_n(src, dst, n):
     while left:
         b = src.read(min(left, COPY_CHUNK))
         if not b:
-            raise IOError('unexpected EOF')
+            raise OSError("unexpected EOF")
         dst.write(b)
         left -= len(b)
 
 
 def main():
     if len(sys.argv) != 3:
-        print('usage: q4_trunk.py <bf16_trunk_dir> <q4_out_dir>')
+        print("usage: q4_trunk.py <bf16_trunk_dir> <q4_out_dir>")
         return 2
     srcdir, outdir = sys.argv[1:]
     os.makedirs(outdir, exist_ok=True)
-    with open(os.path.join(srcdir, 'trunk.json')) as f:
+    with open(os.path.join(srcdir, "trunk.json")) as f:
         man = json.load(f)
-    src = open(os.path.join(srcdir, 'trunk.bin'), 'rb')
-    dst = open(os.path.join(outdir, 'trunk.bin'), 'wb')
-    outman = {k: v for k, v in man.items() if k != 'layers'}
-    outman['q4_group'] = GROUP
-    outman['layers'] = []
+    src = open(os.path.join(srcdir, "trunk.bin"), "rb")
+    dst = open(os.path.join(outdir, "trunk.bin"), "wb")
+    outman = {k: v for k, v in man.items() if k != "layers"}
+    outman["q4_group"] = GROUP
+    outman["layers"] = []
     nq = 0
 
-    for li, lay in enumerate(man['layers']):
+    for li, lay in enumerate(man["layers"]):
         pad = (-dst.tell()) % ALIGN
-        if pad: dst.write(b'\0' * pad)
+        if pad:
+            dst.write(b"\0" * pad)
         file_off = dst.tell()
         run_pos = 0
         nt = {}
-        items = sorted(lay['tensors'].items(), key=lambda kv: kv[1]['off'])
+        items = sorted(lay["tensors"].items(), key=lambda kv: kv[1]["off"])
         for name, t in items:
-            off, nb, dt = t['off'], t['nbytes'], t['dtype']
-            shape = t.get('shape', [])
-            src.seek(lay['file_off'] + off)
-            if dt == 'BF16' and len(shape) == 2:
+            off, nb, dt = t["off"], t["nbytes"], t["dtype"]
+            shape = t.get("shape", [])
+            src.seek(lay["file_off"] + off)
+            if dt == "BF16" and len(shape) == 2:
                 rows, cols = int(shape[0]), int(shape[1])
                 if cols % GROUP:
-                    raise RuntimeError(f'{name}: cols={cols} not divisible by Q4 group {GROUP}')
+                    raise RuntimeError(
+                        f"{name}: cols={cols} not divisible by Q4 group {GROUP}"
+                    )
                 rchunk = max(1, TARGET_INPUT_BYTES // max(1, cols * 2))
                 before = dst.tell()
                 for r0 in range(0, rows, rchunk):
                     nr = min(rchunk, rows - r0)
                     raw = src.read(nr * cols * 2)
                     if len(raw) != nr * cols * 2:
-                        raise IOError(f'short read at {name} row {r0}')
+                        raise OSError(f"short read at {name} row {r0}")
                     dst.write(encode_rows(raw, nr, cols))
                 enb = dst.tell() - before
                 expected = rows * (cols // GROUP) * (4 + GROUP // 2)
                 if enb != expected:
-                    raise RuntimeError(f'{name}: encoded {enb}, expected {expected}')
-                nt[name] = {'off': run_pos, 'nbytes': enb, 'dtype': 'Q4G', 'shape': shape}
+                    raise RuntimeError(f"{name}: encoded {enb}, expected {expected}")
+                nt[name] = {
+                    "off": run_pos,
+                    "nbytes": enb,
+                    "dtype": "Q4G",
+                    "shape": shape,
+                }
                 run_pos += enb
                 nq += 1
             else:
                 copy_n(src, dst, nb)
-                nt[name] = {'off': run_pos, 'nbytes': nb, 'dtype': dt, 'shape': shape}
+                nt[name] = {
+                    "off": run_pos,
+                    "nbytes": nb,
+                    "dtype": dt,
+                    "shape": shape,
+                }
                 run_pos += nb
 
         pad = (-dst.tell()) % ALIGN
-        if pad: dst.write(b'\0' * pad)
+        if pad:
+            dst.write(b"\0" * pad)
         run_bytes = (run_pos + ALIGN - 1) & ~(ALIGN - 1)
-        nl = {k: v for k, v in lay.items() if k not in ('file_off', 'nbytes', 'tensors')}
-        nl.update({'file_off': file_off, 'nbytes': run_bytes, 'tensors': nt})
-        outman['layers'].append(nl)
-        if (li + 1) % 10 == 0 or li + 1 == len(man['layers']):
-            print(f'  q4 {li+1}/{len(man["layers"])} layers, {dst.tell()/1e9:.1f} GB out', flush=True)
+        nl = {
+            k: v
+            for k, v in lay.items()
+            if k not in ("file_off", "nbytes", "tensors")
+        }
+        nl.update({"file_off": file_off, "nbytes": run_bytes, "tensors": nt})
+        outman["layers"].append(nl)
+        if (li + 1) % 10 == 0 or li + 1 == len(man["layers"]):
+            print(
+                f"  q4 {li + 1}/{len(man['layers'])} layers, "
+                f"{dst.tell() / 1e9:.1f} GB out",
+                flush=True,
+            )
 
-    src.close(); dst.close()
-    with open(os.path.join(outdir, 'trunk.json'), 'w') as f:
+    src.close()
+    dst.close()
+    with open(os.path.join(outdir, "trunk.json"), "w") as f:
         json.dump(outman, f)
-    sz = os.path.getsize(os.path.join(outdir, 'trunk.bin'))
-    print(f'wrote {outdir}: {sz/1e9:.2f} GB, {nq} tensors Q4-quantised')
+    sz = os.path.getsize(os.path.join(outdir, "trunk.bin"))
+    print(f"wrote {outdir}: {sz / 1e9:.2f} GB, {nq} tensors Q4-quantised")
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())
