@@ -15,3 +15,5 @@ jobs:
         run: cc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict_codec.c -o /tmp/bench_bf16_dict_codec
       - name: Benchmark 256 MiB, 5 repeats
         run: /tmp/bench_bf16_dict_codec 256 5
+
+# This workflow is intentionally branch-local while the codec remains an experiment.
