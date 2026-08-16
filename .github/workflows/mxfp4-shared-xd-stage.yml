@@ -1,0 +1,30 @@
+name: MXFP4 shared-xdouble staging
+
+on:
+  push:
+    branches: [speedboost/mxfp4-shared-xdouble]
+    paths:
+      - '.github/workflows/mxfp4-shared-xd-stage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: speedboost/mxfp4-shared-xdouble
+      - name: Apply patch and self-remove
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/mxfp4_shared_xd_stage.py
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/mxfp4-shared-xd-stage.yml tools/mxfp4_shared_xd_stage.py
+          git add src/core/k3_ops.c
+          git commit -m 'perf: reuse widened activations across streamed MXFP4 experts'
+          git push origin HEAD:speedboost/mxfp4-shared-xdouble
