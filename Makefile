@@ -100,6 +100,8 @@ ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
 
 CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
+WORKER_SRC := src/cli/k3_worker.c
+WORKER_BIN := $(BIN)/k3-worker
 
 # Tests that need no checkpoint. These run in CI on every push.
 UNIT_TESTS := test_ops test_sample test_cache test_st test_cfg test_tok test_trunk_codec scale_test k3_model
@@ -120,7 +122,7 @@ TOK_FILES  ?= $(HOME)/k3model
 .PHONY: all test test-all bench portable debug asan ubsan format clean install help \
         tok cfg ops cache st oracle weights-test
 
-all: $(CLI_BIN)
+all: $(CLI_BIN) $(WORKER_BIN)
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -128,6 +130,9 @@ $(BUILD)/%.o: %.c
 
 $(CLI_BIN): $(CLI_SRC) $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
+
+$(WORKER_BIN): $(WORKER_SRC) $(CLI_SRC) $(ENGINE_OBJ) | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $(WORKER_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
 
 $(BIN):
 	@mkdir -p $(BIN)
@@ -262,9 +267,10 @@ format:
 # the two build systems are documented as interchangeable, so they must stay so.
 # third_party/json.h goes with them: k3_cfg.h includes it and exposes jval in its
 # signatures, so an installed k3_cfg.h without it does not compile.
-install: $(CLI_BIN)
+install: $(CLI_BIN) $(WORKER_BIN)
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 $(CLI_BIN) $(DESTDIR)$(PREFIX)/bin/k3
+	install -m 755 $(WORKER_BIN) $(DESTDIR)$(PREFIX)/bin/k3-worker
 	install -d $(DESTDIR)$(PREFIX)/include/k3
 	install -m 644 include/k3/*.h $(DESTDIR)$(PREFIX)/include/k3/
 	install -m 644 third_party/json.h $(DESTDIR)$(PREFIX)/include/k3/
