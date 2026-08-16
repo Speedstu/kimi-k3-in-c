@@ -245,6 +245,8 @@ def main():
                     help="routed experts in the tiny fixture (default 8; useful for cache/prefill stress)")
     ap.add_argument("--topk", type=int, default=2,
                     help="routed experts selected per token (default 2)")
+    ap.add_argument("--router-bf16", action="store_true",
+                    help="store MoE router gate matrices as native BF16, matching the released streamed K3 path")
     a = ap.parse_args()
 
     if a.dense_intermediate <= 0:
@@ -271,6 +273,11 @@ def main():
             if is_expert(name):
                 packed, scales = mxfp4_quant(w)
                 p.copy_(torch.from_numpy(mxfp4_dequant(packed, scales)))
+            elif a.router_bf16 and eng.endswith(".block_sparse_moe.gate.weight"):
+                # The released streamed binder preserves router gates in native BF16.
+                # Round the torch model too, so ref_logits describes the exact bytes
+                # this special fixture writes rather than the default F32 router.
+                p.copy_(torch.from_numpy(bf16_roundtrip(w)))
             elif is_reqn(eng, name):
                 p.copy_(torch.from_numpy(bf16_roundtrip(w)))
             # else: keep exact fp32 (reqw path)
@@ -339,6 +346,13 @@ def main():
             full[:cfg.kda_num_heads] = ww
             entry = [(eng, full)]
             print("  %-78s %s %s" % (eng, full.dtype, list(full.shape)))
+        elif a.router_bf16 and eng.endswith(".block_sparse_moe.gate.weight"):
+            # Emit BF16 directly through the order-preserving in-tree writer. Do not
+            # rewrite the safetensors file afterward: pack_trunk requires each layer's
+            # original contiguous tensor run to stay intact.
+            entry = [(eng, bf16_of(w))]
+            print("  %-78s %s %s  [native BF16 router]" %
+                  (eng, entry[0][1].dtype, list(entry[0][1].shape)))
         elif is_reqn(eng, name):
             entry = [(eng, bf16_of(w))]
             print("  %-78s %s %s" % (eng, entry[0][1].dtype, list(entry[0][1].shape)))
