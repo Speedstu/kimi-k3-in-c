@@ -1,0 +1,31 @@
+name: AVX-512 capability probe
+
+on:
+  push:
+    branches: [speedboost/avx512-probe]
+    paths:
+      - '.github/workflows/avx512-capability-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: CPU and compiler ISA
+        run: |
+          lscpu
+          echo '--- flags ---'
+          grep -m1 '^flags' /proc/cpuinfo
+          echo '--- compiler macros under -march=native ---'
+          echo | cc -march=native -dM -E - | grep -E '__AVX(2|512)|__FMA__' || true
+          echo '--- explicit AVX512 compile smoke ---'
+          cat >/tmp/a.c <<'C'
+          #include <immintrin.h>
+          #include <stdio.h>
+          int main(void){ __m512d x=_mm512_set1_pd(2.0); double a[8]; _mm512_storeu_pd(a,x); printf("%.0f\n",a[7]); return 0; }
+          C
+          cc -O2 -mavx512f -mavx512bw /tmp/a.c -o /tmp/a
+          if grep -qw avx512f /proc/cpuinfo; then /tmp/a; else echo 'AVX512 runtime unavailable on this runner'; fi
