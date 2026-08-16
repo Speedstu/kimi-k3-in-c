@@ -156,21 +156,24 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=None)
     ns = parser.parse_args(tuner_argv)
 
-    if not (ns.allocator_budget_gb > 0.0):
-        parser.error("--allocator-budget-gb must be > 0")
-    if not (ns.trunk_min_gb > 0.0):
-        parser.error("--trunk-min-gb must be > 0")
-    if ns.trunk_min_gb >= ns.allocator_budget_gb:
-        parser.error("--trunk-min-gb must be smaller than --allocator-budget-gb")
-    if ns.repeats < 1:
-        parser.error("--repeats must be >= 1")
+    # Command-shape conflicts are more actionable than downstream numeric validation.
+    # Report them first so a user who accidentally mixes a preset/manual budget with the
+    # tuner is told exactly which option is competing with the controlled experiment.
     if not candidate_arg_present(k3_args, "--trunk"):
         parser.error("memory autotune requires --trunk after the bare --")
-
     controlled = ("--trunk-gb", "--cache-gb", "--draft-trunk-gb", "--preset", "--out")
     for option in controlled:
         if candidate_arg_present(k3_args, option):
             parser.error(f"do not pass {option} after --; memory autotune controls allocator budgets")
+
+    if not (ns.allocator_budget_gb > 0.0):
+        parser.error("--allocator-budget-gb must be > 0")
+    if ns.repeats < 1:
+        parser.error("--repeats must be >= 1")
+    if not (ns.trunk_min_gb > 0.0):
+        parser.error("--trunk-min-gb must be > 0")
+    if ns.trunk_min_gb >= ns.allocator_budget_gb:
+        parser.error("--trunk-min-gb must be smaller than --allocator-budget-gb")
 
     have_draft = candidate_arg_present(k3_args, "--draft-trunk")
     cache_values = parse_float_candidates(ns.cache_candidates)
