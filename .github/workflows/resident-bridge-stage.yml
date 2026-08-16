@@ -5,6 +5,7 @@ on:
     branches: ['feature/resident-local-worker']
     paths:
       - 'tools/apply_resident_bridge_stage.py'
+      - 'tools/fix_resident_bridge_lint_stage.py'
       - '.github/workflows/resident-bridge-stage.yml'
 
 permissions:
@@ -21,7 +22,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Apply guarded bridge patch
-        run: python3 tools/apply_resident_bridge_stage.py
+        run: |
+          python3 tools/apply_resident_bridge_stage.py
+          python3 tools/fix_resident_bridge_lint_stage.py
       - name: Python syntax and lint
         run: |
           python -m pip install --quiet ruff
