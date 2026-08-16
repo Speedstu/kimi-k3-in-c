@@ -3,16 +3,18 @@ name: Batched MLA BF16 prefill parity
 on:
   workflow_dispatch:
   push:
-    branches: [speedboost/prefill-batched-mla-bf16]
     paths:
       - 'src/core/k3_ops.c'
-      - 'tools/patch_prefill_batched_mla_bf16.py'
-      - 'tools/fix_mla_batch_decl.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-mla-bf16-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
       - 'tools/make_tiny_checkpoint.py'
       - '.github/workflows/prefill-batched-mla-bf16-parity.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   exactness:
@@ -20,16 +22,9 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.ref_name }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-
-      - name: Apply exact MLA BF16 prefill transform once
-        run: |
-          python tools/patch_prefill_batched_mla_bf16.py
-          python tools/fix_mla_batch_decl.py
 
       - name: Strict AVX2 build and full weightless oracle
         run: |
@@ -52,8 +47,9 @@ jobs:
           import json
           c=json.load(open('/tmp/k3mla/config.json'))
           print(c['num_hidden_layers'])
-          full=c.get('full_attention_interval', c.get('full_attention_layers', 'unknown'))
-          print('fixture layers=', c['num_hidden_layers'], 'full_attention=', full, file=__import__('sys').stderr)
+          print('fixture layers=', c['num_hidden_layers'],
+                'full_attention_layers=', c.get('full_attn_layers', 'unknown'),
+                file=__import__('sys').stderr)
           PY
           )
           python tools/pack_trunk.py /tmp/k3mla /tmp/k3mla-trunk "$NLAYERS"
@@ -91,18 +87,3 @@ jobs:
             done
           done
           echo 'BATCHED MLA BF16 PREFILL EXACTNESS PASS (plain + cached, 1 + 4 threads)'
-
-      - name: Persist generated source after gates pass
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- src/core/k3_ops.c; then
-            echo 'source already committed'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/core/k3_ops.c
-          git commit -m 'perf: batch exact MLA BF16 prefill projections'
-          git fetch origin "${{ github.ref_name }}"
-          git rebase "origin/${{ github.ref_name }}"
-          git push origin HEAD:${{ github.ref_name }}
