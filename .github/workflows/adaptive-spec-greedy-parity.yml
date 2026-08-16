@@ -1,4 +1,4 @@
-# Permanent exactness gate for the cleaned adaptive-spec branch.
+# Permanent exactness gate for adaptive greedy speculation, including the cost controller.
 name: Greedy adaptive speculation parity
 
 on:
@@ -6,12 +6,14 @@ on:
   push:
     paths:
       - 'src/cli/k3_run.c'
+      - 'src/cli/k3_spec_auto.h'
       - 'tools/make_tiny_checkpoint.py'
       - 'tools/pack_trunk.py'
       - '.github/workflows/adaptive-spec-greedy-parity.yml'
   pull_request:
     paths:
       - 'src/cli/k3_run.c'
+      - 'src/cli/k3_spec_auto.h'
       - 'tools/make_tiny_checkpoint.py'
       - 'tools/pack_trunk.py'
       - '.github/workflows/adaptive-spec-greedy-parity.yml'
@@ -28,6 +30,42 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+
+      - name: Deterministic cost-controller probe
+        run: |
+          set -euo pipefail
+          cat >/tmp/spec_ctrl_test.c <<'C'
+          #include <assert.h>
+          #include "src/cli/k3_spec_auto.h"
+          int main(void) {
+              K3SpecAutoCost s;
+              int next;
+              k3_spec_auto_cost_init(&s);
+
+              /* Two stable h=4 measurements are required before probing h=5. */
+              k3_spec_auto_cost_observe(&s, 4, 0.50, 5);
+              assert(k3_spec_auto_cost_choose(&s, 4, 8, 4, 4) == 4);
+              k3_spec_auto_cost_observe(&s, 4, 0.50, 5);
+              next = k3_spec_auto_cost_choose(&s, 4, 8, 4, 4);
+              assert(next == 5 && s.probes == 1);
+
+              /* A candidate 50% slower per exact token is rejected and blocked. */
+              k3_spec_auto_cost_observe(&s, 5, 0.90, 6);
+              assert(k3_spec_auto_cost_choose(&s, 5, 8, 5, 5) == 5);
+              k3_spec_auto_cost_observe(&s, 5, 0.90, 6);
+              next = k3_spec_auto_cost_choose(&s, 5, 8, 5, 5);
+              assert(next == 4 && s.backoffs == 1);
+              assert((s.blocked_mask & (1u << 5)) != 0u);
+
+              /* Poor acceptance is an immediate hard shrink, timing-independent. */
+              k3_spec_auto_cost_init(&s);
+              assert(k3_spec_auto_cost_choose(&s, 8, 8, 8, 2) == 4);
+              return 0;
+          }
+          C
+          cc -std=c99 -Wall -Wextra -Werror -I. /tmp/spec_ctrl_test.c -o /tmp/spec_ctrl_test
+          /tmp/spec_ctrl_test
+          echo 'synthetic cost controller: PASS'
 
       - name: Strict AVX2 build and full oracle
         run: |
@@ -52,11 +90,11 @@ jobs:
           )
           python tools/pack_trunk.py /tmp/k3auto /tmp/k3auto-trunk "$NLAYERS"
 
-      - name: Fixed and growing adaptive speculation emit exact serial greedy sequence
+      - name: Fixed and cost-aware speculation emit exact serial greedy sequence
         run: |
           set -euo pipefail
           D=/tmp/k3auto-out
-          BASE='/tmp/k3auto --trunk /tmp/k3auto-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 18 --incremental --threads 1 --temperature 0'
+          BASE='/tmp/k3auto --trunk /tmp/k3auto-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 36 --incremental --threads 1 --temperature 0'
           DRAFT='--draft-trunk /tmp/k3auto-trunk --draft-trunk-gb 0.05 --draft-topk 2'
 
           ./bin/k3 $BASE --out "$D/serial.json" >"$D/serial.log" 2>&1
@@ -77,13 +115,17 @@ jobs:
           assert auto['spec_auto'] == 1
           assert auto['spec_auto_rounds'] > 0
           assert auto['spec_auto_grows'] > 0, auto
-          assert 4 < auto['spec_auto_final'] <= 8, auto
           assert auto['spec_auto_accepted'] == auto['spec_auto_proposed'], auto
+          assert auto['spec_auto_cost_best'] > 0, auto
+          assert auto['spec_auto_cost_best_spt'] >= 0.0, auto
+          assert auto['spec_auto_cost_probes'] > 0, auto
+          assert 1 <= auto['spec_auto_final'] <= 8, auto
           assert cap['spec_auto_final'] <= 5, cap
-          print('serial/fixed/auto exact generated + full IDs: PASS')
-          print('grow path: rounds=%d accepted=%d/%d grows=%d final=%d/%d' % (
+          print('serial/fixed/cost-aware exact generated + full IDs: PASS')
+          print('cost-aware path: rounds=%d accepted=%d/%d probes=%d backoffs=%d best=%d final=%d/%d' % (
               auto['spec_auto_rounds'], auto['spec_auto_accepted'],
-              auto['spec_auto_proposed'], auto['spec_auto_grows'],
+              auto['spec_auto_proposed'], auto['spec_auto_cost_probes'],
+              auto['spec_auto_cost_backoffs'], auto['spec_auto_cost_best'],
               auto['spec_auto_final'], auto['spec_auto_limit']))
           PY
 
