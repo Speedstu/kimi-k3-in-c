@@ -5,10 +5,12 @@ on:
     paths:
       - 'benchmarks/autotune.py'
       - 'benchmarks/autotune_memory.py'
+      - 'benchmarks/autotune_all.py'
       - '.github/workflows/autotune-parity.yml'
       - 'README.md'
       - 'docs/AUTOTUNE.md'
       - 'docs/MEMORY_AUTOTUNE.md'
+      - 'docs/FULL_AUTOTUNE.md'
       - 'src/**'
       - 'include/**'
       - 'tools/make_tiny_checkpoint.py'
@@ -56,8 +58,7 @@ jobs:
             --ids 3,7,11,5,9 --gen 3 --incremental --temperature 0
           python - <<'PY'
           import json
-          p='/tmp/autotune.json'
-          x=json.load(open(p))
+          x=json.load(open('/tmp/autotune.json'))
           assert x['recommended']['threads'] in (1,2)
           assert x['recommended']['async_io_threads'] in (1,2)
           assert 'draft_topk' not in x['recommended']
@@ -96,8 +97,7 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
-          p='/tmp/autotune-draft.json'
-          x=json.load(open(p))
+          x=json.load(open('/tmp/autotune-draft.json'))
           assert x['recommended']['threads'] in (1,2)
           assert x['recommended']['async_io_threads'] in (1,2)
           assert x['recommended']['draft_topk'] in (1,2)
@@ -174,6 +174,53 @@ jobs:
           assert eligible > 0
           print('MACHINE-FIT MEMORY AUTOTUNE PARITY PASS', r)
           PY
+      - name: Full-machine orchestrator composes exact child tuners
+        run: |
+          rm -rf /tmp/full-autotune.json /tmp/full-autotune-stages
+          python benchmarks/autotune_all.py /tmp/k3tiny \
+            --k3-bin ./bin/k3 \
+            --allocator-budget-gb 0.10 \
+            --trunk-min-gb 0.02 \
+            --compute-candidates 1 \
+            --io-candidates 1 \
+            --io-seed 1 \
+            --draft-topk-candidates auto \
+            --draft-topk-seed 2 \
+            --cache-candidates 0.01,0.02 \
+            --draft-trunk-candidates 0.01,0.02 \
+            --auto-min-gb 0.01 \
+            --max-rss-gb 0.20 \
+            --repeats 1 \
+            --max-cycles 1 \
+            --out /tmp/full-autotune.json \
+            -- \
+            --trunk /tmp/k3trunk \
+            --draft-trunk /tmp/k3trunk --spec-auto --spec 8 \
+            --ids 3,7,11,5,9 --gen 8 --incremental --temperature 0
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          x=json.load(open('/tmp/full-autotune.json'))
+          r=x['recommended']
+          assert x['reference_generated_ids'][:3] == [92,168,13], x['reference_generated_ids']
+          assert len(x['reference_generated_ids']) == 8
+          assert r['threads'] == 1
+          assert r['async_io_threads'] == 1
+          assert r['draft_topk'] in (1,2)
+          assert abs(r['allocator_sum_gb'] - 0.10) < 1e-6, r
+          assert r['trunk_gb'] >= 0.02
+          assert r['cache_gb'] in (0.01,0.02)
+          assert r['draft_trunk_gb'] in (0.01,0.02)
+          assert r['environment'] == {'K3_ASYNC_IO_THREADS':'1'}
+          assert '--threads' in r['k3_args'] and '--trunk-gb' in r['k3_args']
+          assert '--cache-gb' in r['k3_args'] and '--draft-topk' in r['k3_args']
+          assert '--draft-trunk-gb' in r['k3_args']
+          kinds=[s['kind'] for s in x['stages']]
+          assert kinds[:2] == ['hardware','memory'], kinds
+          assert all(Path(s['report']).exists() for s in x['stages'])
+          assert len(x['stages']) in (2,3), kinds
+          print('FULL MACHINE AUTOTUNE PARITY PASS', r)
+          PY
       - name: Autotuners refuse ambiguous or invalid commands
         run: |
           set -euo pipefail
@@ -211,6 +258,11 @@ jobs:
             --trunk /tmp/k3trunk --ids 3,7,11,5,9 --gen 1 \
             >/tmp/memory-rss.log 2>&1
           rc6=$?
+          python benchmarks/autotune_all.py /tmp/k3tiny --k3-bin ./bin/k3 \
+            --allocator-budget-gb 0.1 --trunk-min-gb 0.02 -- \
+            --trunk /tmp/k3trunk --preset laptop --ids 3,7,11,5,9 --gen 1 \
+            >/tmp/full-preset.log 2>&1
+          rc7=$?
           set -e
           test "$rc1" -eq 2
           test "$rc2" -eq 2
@@ -218,12 +270,14 @@ jobs:
           test "$rc4" -eq 2
           test "$rc5" -eq 2
           test "$rc6" -eq 2
+          test "$rc7" -eq 2
           grep -q 'requires --draft-trunk' /tmp/no-draft.log
           grep -q 'do not pass --draft-topk' /tmp/ambiguous.log
           grep -q 'cannot read K3 config' /tmp/bad-config.log
           grep -q 'do not pass --preset' /tmp/memory-preset.log
           grep -q 'do not pass --trunk-gb' /tmp/memory-manual.log
           grep -q -- '--max-rss-gb must be > 0' /tmp/memory-rss.log
+          grep -q 'do not pass --preset' /tmp/full-preset.log
           echo 'autotune CLI/config guards: PASS'
 
   windows-python-cli:
@@ -236,8 +290,10 @@ jobs:
       - name: Python syntax and CLI parsing
         shell: pwsh
         run: |
-          python -m py_compile benchmarks/autotune.py benchmarks/autotune_memory.py
+          python -m py_compile benchmarks/autotune.py benchmarks/autotune_memory.py benchmarks/autotune_all.py
           python benchmarks/autotune.py --help | Out-Null
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python benchmarks/autotune_memory.py --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python benchmarks/autotune_all.py --help | Out-Null
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
