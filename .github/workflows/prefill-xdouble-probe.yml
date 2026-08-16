@@ -1,0 +1,27 @@
+name: Prefill xdouble probe
+
+on:
+  push:
+    branches: [speedboost/prefill-xdouble-probe]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build production kernels + probe
+        run: |
+          set -euo pipefail
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS \
+             -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_test.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off \
+             -Iinclude -Iinclude/k3 benchmarks/bench_prefill_xdouble.c /tmp/k3_ops_test.o \
+             -o /tmp/prefill_xdouble -lm -fopenmp -pthread
+      - name: One thread
+        run: OMP_NUM_THREADS=1 /tmp/prefill_xdouble
+      - name: Two threads
+        run: OMP_NUM_THREADS=2 /tmp/prefill_xdouble
+      - name: Four threads
+        run: OMP_NUM_THREADS=4 /tmp/prefill_xdouble
