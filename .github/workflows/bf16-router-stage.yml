@@ -26,6 +26,7 @@ jobs:
           python3 tools/pack_trunk.py /tmp/k3tiny /tmp/k3raw 13
 
           ./bin/k3 /tmp/k3tiny --ids 3,7,11,5,9 --gen 3 --incremental \
+            --cache-gb 0.02 \
             --dump-logits /tmp/resident_logits.bin --out /tmp/resident.json > /tmp/resident.log
           ./bin/k3 /tmp/k3tiny --ids 3,7,11,5,9 --gen 3 --incremental \
             --trunk /tmp/k3raw --trunk-gb 0.05 --cache-gb 0.02 \
