@@ -238,7 +238,7 @@ void   k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
  *
  * idx and w are written in DESCENDING score order. Fills at most topk entries.
  */
-void k3_router(int *idx, float *w, const float *x, const float *W,
+void k3_router(int *idx, float *w, const float *x, const void *W, int wdt,
                const float *bias, int hidden, int n_experts, int topk,
                int renorm, float routed_scale);
 
@@ -371,13 +371,12 @@ typedef struct K3ExpertSrc {
 } K3ExpertSrc;
 
 typedef struct {
-    /* gate stays fp32 on purpose. k3_router carries its own inline matmul rather than
-     * calling k3_matmul, so tagging it would change that function's signature and its
-     * fixture, to save 1.18 GB out of about 114 GB. Not worth the churn.
-     * w1/w3/w2 also stay fp32: that resident bank is indexed by pointer arithmetic and
-     * is only ever used by the fixtures, because the real model streams experts
-     * through src and multiplies them straight out of MXFP4. */
-    const float *gate, *bias;            /* router: [n_experts][hidden], [n_experts] */
+    /* The router gate is a large matrix and follows wdt just like the other trunk
+     * matrices. On the exact checkpoint it remains BF16 and is widened on read inside
+     * k3_router, eliminating a full gate-sized fp32 expansion per streamed layer. Draft
+     * I8R/Q4G gates are consumed in their native proposal-only formats too. */
+    const void  *gate;                   /* router: [n_experts][hidden], tagged by wdt */
+    const float *bias;                   /* [n_experts], elementwise: stays fp32       */
     const float *w1, *w3, *w2;           /* resident expert bank, fixtures only      */
     const float *latent_norm;            /* [latent], elementwise: stays fp32        */
     const void  *down, *up;              /* [latent][hidden], [hidden][latent]       */

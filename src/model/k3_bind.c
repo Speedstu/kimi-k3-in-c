@@ -219,8 +219,9 @@ static void plan_layer(Plan *p, const K3Cfg *c, int L, K3LayerBind *b, int is_ml
         reqn(p, &b->lay.dense_down, H * (int64_t)c->dense_inter, PRE "layers.%d.mlp.down_proj.weight", L);
     } else {
         const int64_t SI = (int64_t)c->moe_inter * c->n_shared;   /* fused: 6144 */
-        /* gate stays fp32: k3_router has its own inline matmul. See k3.h. */
-        reqw(p, &b->moe.gate, (int64_t)c->n_experts * H, -1,
+        /* Gate is a real matrix too. Exact BF16 is consumed directly by k3_router;
+         * draft I8R/Q4G is proposal-only and follows the layer's tagged matrix format. */
+        reqn(p, &b->moe.gate, (int64_t)c->n_experts * H,
              PRE "layers.%d.block_sparse_moe.gate.weight", L);
         reqw(p, &b->moe.bias, c->n_experts, -1,
              PRE "layers.%d.block_sparse_moe.gate.e_score_correction_bias", L);
@@ -306,14 +307,12 @@ void k3_bind_free(K3LayerBind *b)
 
 size_t k3_bind_widen_bytes(const K3Cfg *c)
 {
-    /* Only the BF16 vectors that kernels read elementwise are copied. Everything else
-     * is pointed at in place. The router gate dominates: it is BF16 on disk but stays
-     * fp32 in the engine because k3_router walks it with its own inline matmul. */
+    /* Only BF16 vectors that kernels read elementwise are copied. Large matrices,
+     * including the router gate, remain in their native tagged representation. */
     const size_t H = (size_t)c->hidden;
     size_t n = 6 * H                       /* in/post norm, attn-res and mlp-res pair  */
              + (size_t)c->q_lora + c->kv_lora   /* MLA q_a/kv_a layernorms             */
-             + (size_t)c->latent                /* routed_expert_norm                  */
-             + (size_t)c->n_experts * H;        /* router gate                          */
+             + (size_t)c->latent;               /* routed_expert_norm                  */
     return n * sizeof(float) + 4096;       /* slack for per-tensor 8-byte alignment    */
 }
 
