@@ -423,6 +423,10 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         printf("              split-first arena: layer 0 uses %.2f GB whole, then layers 1..%d "
                "reuse it as 2 x %.2f GB slots (no extra trunk RAM)\n",
                (double)arena_bytes / 1e9, tr->n_layers - 1, (double)ring_slot / 1e9);
+    if (split_first)
+        printf("              split-first arena: layer 0 uses %.2f GB whole, then layers 1..%d "
+               "reuse it as 2 x %.2f GB slots (no extra trunk RAM)\n",
+               (double)arena_bytes / 1e9, tr->n_layers - 1, (double)ring_slot / 1e9);
     if (codec_slot > 0)
         printf("              lossless dict15 blocks: %.2f GB codec scratch per ring slot "
                "(counted in trunk budget)\n", (double)codec_slot / 1e9);
@@ -692,6 +696,10 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
 void k3_trunk_prefetch(K3Trunk *tr, int L)
 {
     if (L < 0 || L >= tr->n_layers || L < tr->npin) return;
+    /* forward() asks for L+1 immediately after binding L. In split-first mode layer 0
+     * still occupies the WHOLE shared arena at that point, so L1 deliberately loads
+     * synchronously only after layer0 compute returns. From L1 onward two slots exist. */
+    if (tr->split_first && L == 1) return;
     /* forward() asks for L+1 immediately after binding L. In split-first mode layer 0
      * still occupies the WHOLE shared arena at that point, so L1 deliberately loads
      * synchronously only after layer0 compute returns. From L1 onward two slots exist. */
