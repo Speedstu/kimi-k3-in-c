@@ -10,7 +10,8 @@
  * Windows has no pread() in the UCRT, so the compatibility path serializes seek+read
  * per descriptor while preserving the descriptor's original position. This is the
  * correctness baseline; a later Win32 backend may replace it with overlapped handles
- * without changing callers or model math.
+ * without changing callers or model math. The resident worker separately uses
+ * unbuffered stdout on Win32 because the Microsoft CRT treats _IOLBF as full buffering.
  */
 #ifndef K3_PORTABLE_IO_H
 #define K3_PORTABLE_IO_H
