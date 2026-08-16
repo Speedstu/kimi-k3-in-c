@@ -1,0 +1,68 @@
+name: MXFP4 shared-xdouble parity
+
+on:
+  push:
+    branches: [speedboost/mxfp4-shared-xdouble]
+    paths:
+      - 'src/core/k3_ops.c'
+      - '.github/workflows/mxfp4-shared-xd-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
+      - '.github/workflows/mxfp4-shared-xd-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exact-streamed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Strict AVX2 build
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+
+      - name: Generate streamed tiny K3
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3tiny /tmp/k3trunk /tmp/xd-parity
+          mkdir -p /tmp/xd-parity
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11,5,9
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3trunk "$NLAYERS"
+
+      - name: Shared-xdouble ON is bit-identical to old conversion path
+        run: |
+          set -euo pipefail
+          D=/tmp/xd-parity
+          COMMON='/tmp/k3tiny --trunk /tmp/k3trunk --trunk-gb 0.05 --cache-gb 0.001 --ids 3,7,11,5,9 --gen 8 --incremental --threads 1 --temperature 0'
+          K3_NO_MX_XDOUBLE=1 ./bin/k3 $COMMON --dump-logits "$D/off.logits" --out "$D/off.json" >"$D/off.log" 2>&1
+          ./bin/k3 $COMMON --dump-logits "$D/on.logits" --out "$D/on.json" >"$D/on.log" 2>&1
+          cmp "$D/off.logits" "$D/on.logits"
+          python3 - <<'PY'
+          import json
+          d='/tmp/xd-parity'
+          a=json.load(open(d+'/off.json')); b=json.load(open(d+'/on.json'))
+          assert a['generated_ids']==b['generated_ids'], (a['generated_ids'],b['generated_ids'])
+          assert a['full_ids']==b['full_ids']
+          print('shared-xdouble exact ids:',a['generated_ids'])
+          PY
+          echo 'shared-xdouble logits + 8-token parity: PASS'
+
+      - name: Full regression suite
+        run: make test -j2
