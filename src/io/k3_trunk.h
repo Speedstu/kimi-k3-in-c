@@ -25,10 +25,9 @@
  *
  *   It IS hidden now. k3_trunk_prefetch hands layer L+1 to a reader thread while the
  *   main thread computes on layer L, which is what the fixed walk order makes safe: the
- *   next layer is always known, so there is nothing to predict. Measured on the released
- *   checkpoint at the laptop preset, this took 71.75 s/token to 42.27 s/token, a 1.70x
- *   improvement, and it beat running the same model with four times the memory and no
- *   overlap.
+ *   next layer is always known, so there is nothing to predict. The same reader also
+ *   prepares the layer's memory bind and BF16/Q4/I8 elementwise widening before
+ *   publishing the slot, so both storage and bind preparation overlap compute.
  *
  *   The second ring slot it needs costs a full slot, 2.37 GB at the floor, so it is only
  *   taken when the trunk budget can pay for it. Below that the ring stays at one slot and
@@ -96,10 +95,18 @@ typedef struct {
      * and freed by k3_trunk_close; do not free the parser arena separately. */
     char          *json_arena;
 
+    /* The config is owned by the caller and outlives the trunk in every engine path.
+     * The reader needs it to prepare the next K3LayerBind off the compute thread. */
+    const K3Cfg    *cfg;
+
     /* Pinned layers get exact-size allocations; only the streaming ring is uniform.
      * Uniform slots everywhere would size EVERY slot for layer 0, whose dense MLP makes
-     * it 2.34 GB against 1.27 GB for a normal layer, wasting about half the budget. */
+     * it 2.34 GB against 1.27 GB for a normal layer, wasting about half the budget.
+     * A pinned layer's raw bytes never change, so its memory bind/widening is prepared
+     * on first touch and then copied for every later token. */
     unsigned char **pin;        /* [npin] one exact allocation per pinned layer */
+    K3LayerBind   *pin_prepared;/* [npin] pointers into pin[L] + its widen tail   */
+    unsigned char *pin_prepared_valid; /* [npin] */
     unsigned char *arena;       /* shared reconstructed streaming arena        */
     unsigned char *codec_arena; /* [nslot] compressed-block O_DIRECT scratch     */
     int64_t      slot_bytes;    /* logical normal-layer slot + widen area       */
@@ -113,8 +120,15 @@ typedef struct {
     int32_t     *slot_of;       /* [n_layers], -1 when not resident             */
     int          ring;          /* next ring slot to reuse                      */
 
+    /* Each streaming slot owns a fully prepared memory bind. Tensor pointers inside it
+     * refer only to that slot's raw/widen bytes. The reader constructs it before
+     * publication; the compute thread copies it and rebases only self-pointers. */
+    K3LayerBind  *prepared;      /* [nslot] */
+    int          *prepared_layer;/* [nslot], -1 until preparation completed */
+
     /* One asynchronous reader owns one spare ring slot. The worker never publishes a
-     * layer name before its read succeeds; bind waits for completion before consuming it. */
+     * layer name before its read AND bind preparation succeed; bind waits for completion
+     * before consuming it. */
     void         *io_state;
 
     /* stats */
@@ -123,6 +137,10 @@ typedef struct {
     uint64_t     raw_bytes_reconstructed; /* raw bytes produced for the binder   */
     double       load_seconds;             /* pread only                          */
     double       decode_seconds;           /* dict15 reconstruction only          */
+    uint64_t     prepared_builds;          /* completed memory binds/widenings     */
+    uint64_t     prepared_hits;            /* prepared binds copied to compute     */
+    uint64_t     async_prepared_builds;    /* subset prepared on reader thread     */
+    double       prepare_seconds;           /* bind/widen wall across both threads  */
 } K3Trunk;
 
 /* budget_bytes sizes the slot array. Layers 0..K-1 are pinned, where K is as large as
@@ -130,12 +148,12 @@ typedef struct {
 int  k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes);
 void k3_trunk_close(K3Trunk *tr);
 
-/* Make layer L resident and point b's weight pointers at it. b must already have been
- * prepared by k3_bind_layer_mem, which resolves the layer's tensor shapes once. */
+/* Make layer L resident and copy its prepared memory bind into b. The copied bind owns
+ * no allocation; k3_bind_free() remains safe and only clears it. */
 int  k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b);
 
-/* Start an asynchronous read of layer L into its slot, if it is not resident. Safe to
- * call for a layer that is pinned or already loaded (it becomes a no-op). */
+/* Start an asynchronous read+decode+bind preparation of layer L into its slot, if it is
+ * not resident. Safe to call for a pinned/already loaded layer (it becomes a no-op). */
 void k3_trunk_prefetch(K3Trunk *tr, int L);
 
 void k3_trunk_report(const K3Trunk *tr, const char *label);
