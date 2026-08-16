@@ -1,0 +1,97 @@
+name: Trunk tensor index parity
+
+on:
+  push:
+    branches: [speedboost/trunk-tensor-index]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply sorted lookup transform
+        run: python tools/patch_trunk_tensor_index.py
+      - name: Strict build and full oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+      - name: Tiny streamed exact parity
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3idx /tmp/k3idx-trunk /tmp/k3idx-out
+          mkdir -p /tmp/k3idx-out
+          python tools/make_tiny_checkpoint.py /tmp/k3idx --seed 2070 --prompt-ids 3,7,11,5,9,2,4,6
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3idx/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3idx /tmp/k3idx-trunk "$NLAYERS"
+          IDS='3,7,11,5,9,2,4,6'
+          ./bin/k3 /tmp/k3idx --ids "$IDS" --gen 10 --incremental --threads 1 --temperature 0 \
+            --out /tmp/k3idx-out/resident.json >/tmp/k3idx-out/resident.log 2>&1
+          ./bin/k3 /tmp/k3idx --trunk /tmp/k3idx-trunk --trunk-gb 0.001 --cache-gb 0.001 \
+            --ids "$IDS" --gen 10 --incremental --threads 1 --temperature 0 \
+            --out /tmp/k3idx-out/streamed.json >/tmp/k3idx-out/streamed.log 2>&1
+          python - <<'PY'
+          import json
+          a=json.load(open('/tmp/k3idx-out/resident.json'))
+          b=json.load(open('/tmp/k3idx-out/streamed.json'))
+          assert b['generated_ids'] == a['generated_ids']
+          assert b['full_ids'] == a['full_ids']
+          print('SORTED TRUNK LOOKUP EXACT PARITY PASS')
+          PY
+      - name: Persist validated source and make gate permanent
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/io/k3_trunk.c src/io/k3_trunk.h
+          git commit -m 'perf: index trunk tensors by sorted name' || true
+          rm -f tools/patch_trunk_tensor_index.py
+          cat > .github/workflows/trunk-tensor-index.yml <<'YAML'
+          name: Trunk tensor index parity
+          on:
+            workflow_dispatch:
+            pull_request:
+              paths:
+                - 'src/io/k3_trunk.c'
+                - 'src/io/k3_trunk.h'
+                - '.github/workflows/trunk-tensor-index.yml'
+          permissions:
+            contents: read
+          jobs:
+            exactness:
+              runs-on: ubuntu-latest
+              timeout-minutes: 35
+              steps:
+                - uses: actions/checkout@v7
+                - uses: actions/setup-python@v7
+                  with:
+                    python-version: '3.12'
+                - name: Strict build and full oracle
+                  run: |
+                    set -euo pipefail
+                    make clean
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+          YAML
+          git add -A
+          git commit -m 'ci: make trunk tensor index gate permanent' || true
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
