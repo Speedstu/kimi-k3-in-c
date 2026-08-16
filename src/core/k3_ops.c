@@ -587,8 +587,9 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
         }
 
-        /* If the cache supports async top-k prefetch, start it as soon as routing has
-         * identified the experts. Nothing below touches the cache until prefetch_wait. */
+        /* Start top-k I/O as soon as routing identifies the experts. Down/shared compute
+         * is cache-independent; a pipeline-capable source then publishes experts one by one,
+         * while older sources retain the whole-batch barrier before routed computation. */
         int async_prefetch = 0, prefetch_known_ready = 0;
         if (!w->cache_only && w->src && w->src->prefetch_begin) {
             const int ar = w->src->prefetch_begin(w->src, w->layer, idx, nk);
