@@ -75,6 +75,12 @@ typedef struct {
      * Effective hit rate is (hits - prefetch_reads) / requests. */
     uint64_t     prefetch_reads;
     double       load_seconds;
+    /* Async top-k prefetch overlaps this storage work with independent MoE compute.
+     * The implementation state is opaque here so public users do not need pthread.h. */
+    void        *async_ctx;
+    int          async_io_threads;
+    uint64_t     async_batches;
+    double       async_wait_seconds;
     uint32_t    *hist;            /* [n_layers*n_experts] request counts       */
 
     /* THE ACCESS TRACE, and why it is worth recording.

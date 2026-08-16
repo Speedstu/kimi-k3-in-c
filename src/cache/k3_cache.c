@@ -6,6 +6,10 @@
 #include <string.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <pthread.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "k3_cache.h"
 
@@ -212,6 +216,80 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
     return ok;
 }
 
+typedef struct {
+    K3Cache *cache;
+    pthread_t thread;
+    int active;
+    int result;
+    int layer, n;
+    int ids[K3_MAX_TOPK];
+} K3AsyncPrefetch;
+
+static void *cache_async_main(void *arg)
+{
+    K3AsyncPrefetch *a = (K3AsyncPrefetch *)arg;
+#ifdef _OPENMP
+    /* I/O threads mostly sleep in pread. Give the device enough queue depth without
+     * spawning a second full compute-sized OpenMP team beside the model matmuls. */
+    omp_set_num_threads(a->cache->async_io_threads);
+#endif
+    a->result = cache_getmany(&a->cache->src, a->layer, a->ids, a->n);
+    return NULL;
+}
+
+static int cache_prefetch_wait(K3ExpertSrc *self);
+
+static int cache_prefetch_begin(K3ExpertSrc *self, int layer, const int *ids, int n)
+{
+    K3Cache *c = (K3Cache *)self;
+    K3AsyncPrefetch *a = (K3AsyncPrefetch *)c->async_ctx;
+    if (!a || n <= 0) return -1;
+    if (a->active) {
+        /* A previous caller forgot to wait. Do not race two batches through the same
+         * LRU/cache state: finish it first, loudly but safely. */
+        fprintf(stderr, "k3_cache: async prefetch begin found a previous batch active; waiting\n");
+        cache_prefetch_wait(self);
+    }
+
+    int any_miss = 0;
+    for (int i = 0; i < n; i++) {
+        const int e = ids[i];
+        if (e < 0 || e >= c->n_experts) continue;
+        const int32_t key = layer * c->n_experts + e;
+        if (key >= 0 && key < c->n_layers * c->n_experts && c->slot_of[key] < 0) {
+            any_miss = 1;
+            break;
+        }
+    }
+    if (!any_miss) return 0;
+
+    if (n > K3_MAX_TOPK) n = K3_MAX_TOPK;
+    a->cache = c; a->layer = layer; a->n = n; a->result = -1;
+    memcpy(a->ids, ids, (size_t)n * sizeof(int));
+    if (pthread_create(&a->thread, NULL, cache_async_main, a) != 0) return -1;
+    a->active = 1;
+    c->async_batches++;
+    return 1;
+}
+
+static int cache_prefetch_wait(K3ExpertSrc *self)
+{
+    K3Cache *c = (K3Cache *)self;
+    K3AsyncPrefetch *a = (K3AsyncPrefetch *)c->async_ctx;
+    if (!a || !a->active) return 0;
+    const double t0 = now_s();
+    const int rc = pthread_join(a->thread, NULL);
+    c->async_wait_seconds += now_s() - t0;
+    if (rc != 0) {
+        /* Continuing would allow get() to race a possibly-live writer into the cache.
+         * Abort instead of risking a plausible token from partially loaded weights. */
+        fprintf(stderr, "k3_cache: FATAL pthread_join failed for expert prefetch (%d)\n", rc);
+        abort();
+    }
+    a->active = 0;
+    return a->result;
+}
+
 /* Is this expert already resident, i.e. would get() serve it with no disk read? Used by
  * the draft model's cache-only routing to propose tokens without any expert I/O; if it
  * is resident, fill_q hands back the same bytes get() would. */
@@ -344,11 +422,29 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     }
     for (size_t i = 0; i < nkey; i++) c->slot_of[i] = -1;
     for (int i = 0; i < c->nslot; i++) c->key_of[i] = -1;
+
+    if (c->src.getmany && !getenv("K3_NOASYNC_PREFETCH")) {
+        K3AsyncPrefetch *a = (K3AsyncPrefetch *)calloc(1, sizeof *a);
+        if (!a) { k3_cache_free(c); return -1; }
+        c->async_ctx = a;
+        c->async_io_threads = 4;
+        const char *et = getenv("K3_ASYNC_IO_THREADS");
+        if (et) {
+            const int v = atoi(et);
+            if (v >= 1 && v <= K3_MAX_TOPK) c->async_io_threads = v;
+        }
+        c->src.prefetch_begin = cache_prefetch_begin;
+        c->src.prefetch_wait = cache_prefetch_wait;
+    } else if (c->src.getmany) {
+        fprintf(stderr, "k3_cache: async expert overlap DISABLED by K3_NOASYNC_PREFETCH\n");
+    }
     return 0;
 }
 
 void k3_cache_free(K3Cache *c)
 {
+    if (c->src.prefetch_wait) c->src.prefetch_wait(&c->src);
+    free(c->async_ctx);
     free(c->arena); free(c->slot_of); free(c->key_of);
     free(c->used_at); free(c->pinned); free(c->ref); free(c->pad); free(c->hist);
     free(c->trace);
@@ -393,6 +489,8 @@ void k3_cache_reset_stats(K3Cache *c)
      * per-window numerator against a since-startup subtrahend, which drives the result
      * negative and clamps it to zero at every cache size. */
     c->prefetch_reads = 0;
+    c->async_batches = 0;
+    c->async_wait_seconds = 0.0;
 }
 
 void k3_cache_report(const K3Cache *c, const char *label)
@@ -421,6 +519,11 @@ void k3_cache_report(const K3Cache *c, const char *label)
     printf("  read from disk: %.2f GB in %.2f s (%.0f MB/s while loading)\n",
            (double)c->bytes_read / 1e9, c->load_seconds,
            c->load_seconds > 0 ? (double)c->bytes_read / 1e6 / c->load_seconds : 0.0);
+    if (c->async_batches)
+        printf("  async overlap : %llu batches, caller waited %.2f s after independent compute "
+               "(I/O worker threads %d)\n",
+               (unsigned long long)c->async_batches, c->async_wait_seconds,
+               c->async_io_threads);
 }
 
 int k3_cache_dump_hist(const K3Cache *c, const char *path)
