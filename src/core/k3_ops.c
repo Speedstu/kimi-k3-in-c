@@ -577,9 +577,13 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
     uintptr_t xdp = ((uintptr_t)(sdn + E) + 7u) & ~(uintptr_t)7u;
     double *zxd   = (double *)xdp;       /* [L] shared by w1+w3 across ALL routed experts */
     double *actxd = zxd + L;             /* [I] refreshed once per expert for w2           */
-    static int no_mx_xdouble = -1, no_mx_rowpair = -1;
+    static int no_mx_xdouble = -1, force_mx_rowpair = -1;
     if (no_mx_xdouble < 0) no_mx_xdouble = getenv("K3_NO_MX_XDOUBLE") ? 1 : 0;
-    if (no_mx_rowpair < 0) no_mx_rowpair = getenv("K3_NO_MX_ROWPAIR") ? 1 : 0;
+    /* Repeated production-helper medians showed row-pair is ~3-6% slower on
+     * the AVX2 runner despite an earlier standalone prototype looking faster.
+     * Keep it only as an explicit experiment; the measured single-row path is
+     * the default. */
+    if (force_mx_rowpair < 0) force_mx_rowpair = getenv("K3_FORCE_MX_ROWPAIR") ? 1 : 0;
 #endif
 
     for (int t = 0; t < T; t++) {
@@ -621,7 +625,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         k3_mmw(z, xt, w->down, w->wdt, E, L);
 #if defined(__AVX2__)
         const int use_mx_xdouble = w->src && !no_mx_xdouble;
-        const int use_mx_rowpair = use_mx_xdouble && !no_mx_rowpair;
+        const int use_mx_rowpair = use_mx_xdouble && force_mx_rowpair;
         if (use_mx_xdouble)
             for (int i = 0; i < L; i++) zxd[i] = (double)z[i];
 #endif
