@@ -922,12 +922,31 @@ int main(int argc, char **argv)
         }
         free(owned_ids);
     }
-    if (np == 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
+    if (np == 0 && !load_state) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
     for (int i = 0; i < np; i++)
         if (prompt[i] < 0 || prompt[i] >= c.vocab) {
             fprintf(stderr, "token id %d is outside the vocabulary of %d\n", prompt[i], c.vocab);
             return 2;
         }
+
+    /* Peek a resume BEFORE every context / memory guard. The saved prefix is part of
+     * this request's real working set even though it is not repeated on argv. The old
+     * order only discovered `prior` after the 1.56 TB index/cache setup, so its guards
+     * understated KV and scratch by the entire conversation history. */
+    K3StateHdr shd;
+    int prior = 0;
+    if (load_state) {
+        if (!incremental) {
+            fprintf(stderr, "--load-state needs --incremental\n");
+            return 2;
+        }
+        if (k3_state_peek(load_state, &shd) != 0) return 1;
+        prior = shd.nseq;
+        if (prior < 0 || prior > K3_MAX_PROMPT + K3_MAX_GEN) {
+            fprintf(stderr, "saved state reports an invalid sequence length %d\n", prior);
+            return 2;
+        }
+    }
 
     /* Validate the request before allocating anything.
      *
@@ -944,9 +963,9 @@ int main(int argc, char **argv)
                 np, K3_MAX_PROMPT, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
-    if (np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
-        fprintf(stderr, "prompt %d + gen %d + 1 exceeds the %d-position ceiling\n",
-                np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
+    if (prior + np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
+        fprintf(stderr, "saved %d + prompt %d + gen %d + 1 exceeds the %d-position ceiling\n",
+                prior, np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
     /* THE REAL CONTEXT LIMIT is the MLA KV cache, not any array size. Check it against
@@ -954,13 +973,14 @@ int main(int argc, char **argv)
      * than letting a long prompt get 40 minutes into a run and then be OOM-killed. Only
      * incremental decode allocates the KV cache; full recompute carries no cache. */
     if (incremental) {
-        const double kv_need = (double)(np + gen + 1) * K3_KV_BYTES_PER_POS;
+        const int total_pos = prior + np + gen + 1;
+        const double kv_need = (double)total_pos * K3_KV_BYTES_PER_POS;
         const double avail   = mem_available_bytes();
         char kb[32], ab[32];
         human(kv_need, kb, sizeof kb);
         human(avail, ab, sizeof ab);
         printf("  KV cache : %s for %d positions (%.2f MB/position)\n",
-               kb, np + gen + 1, K3_KV_BYTES_PER_POS / 1e6);
+               kb, total_pos, K3_KV_BYTES_PER_POS / 1e6);
         if (avail > 0.0 && kv_need > avail * 0.9) {
             fprintf(stderr,
                 "\nREFUSING: the KV cache for %d positions needs %s but only %s is\n"
@@ -968,7 +988,7 @@ int main(int argc, char **argv)
                 "expanded k and v in fp32 across 24 layers, so context costs ~2.37 MB per\n"
                 "position regardless of budget. Shorten the request, or use full\n"
                 "recompute (drop --incremental), which carries no KV cache at all.\n",
-                np + gen + 1, kb, ab);
+                total_pos, kb, ab);
             return 2;
         }
     }
@@ -984,7 +1004,8 @@ int main(int argc, char **argv)
      * The count is printed by the "indexed N tensors from M shards" line below, once
      * k3_st_open has actually counted them. */
     printf("  model    : %s\n", dir);
-    printf("  prompt   : %d tokens, generating %d\n", np, gen);
+    if (prior) printf("  prompt   : %d saved + %d new tokens, generating %d\n", prior, np, gen);
+    else       printf("  prompt   : %d tokens, generating %d\n", np, gen);
     /* Echo the preset so a captured log is self-describing: a timing figure is
      * meaningless without the budget that produced it. */
     if (preset_name)
@@ -1031,7 +1052,7 @@ int main(int argc, char **argv)
         const double w_model = 2.0 * (double)c.vocab * E64 * 2    /* embed + lm_head, bf16 */
                              + 3.0 * E64 * 4;                     /* norms, aggregator */
         const double w_cache = cache_gb * 1e9;
-        const int Tm = np + gen + 1;
+        const int Tm = prior + np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
         const int Pp = c.kda_heads * c.kda_head_dim;
         const double w_state = (double)((size_t)Pp * c.kda_head_dim
@@ -1136,17 +1157,8 @@ int main(int argc, char **argv)
      * A resumed session must hold the saved history as well as the new tokens, so the
      * KV cache and every per-position buffer are sized for both. The header is read
      * here, before anything is allocated; the payload is restored after. */
-    K3StateHdr shd;
-    int prior = 0;
-    if (load_state) {
-        if (!incremental) {
-            fprintf(stderr, "--load-state needs --incremental\n");
-            return 2;
-        }
-        if (k3_state_peek(load_state, &shd) != 0) return 1;
-        prior = shd.nseq;
+    if (load_state)
         printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
-    }
     const int Tmax = prior + np + gen + 1;
     const int E = c.hidden;
     const int maxb = c.n_layers / c.attn_res_block + 2;
