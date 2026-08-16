@@ -14,28 +14,41 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: feature/windows-native-runtime
-      - name: Remove dead Q4 fallback counter once
+      - name: Apply remaining Windows source portability edits once
         run: |
           python3 - <<'PY'
           from pathlib import Path
+
+          # Q4: warning-clean scalar/non-AVX build, no arithmetic change.
           p=Path('src/core/k3_ops.c')
           s=p.read_text()
           old='for (int g = 0, off = 0; off < in; g++, off += K3_Q4_GROUP) {'
           new='for (int off = 0; off < in; off += K3_Q4_GROUP) {'
           n=s.count(old)
+          if n > 1:
+              raise SystemExit(f'refusing ambiguous Q4 patch: {n} matches')
+          if n == 1:
+              p.write_text(s.replace(old,new,1))
+
+          # k3_run: make auto-budgeting and the KV guard meaningful on native Windows.
+          p=Path('src/cli/k3_run.c')
+          s=p.read_text()
+          old='''static double mem_available_bytes(void)\n{\n    FILE *f = fopen("/proc/meminfo", "r");\n    if (!f) return 0.0;\n    char line[256];\n    double kb = 0.0;\n    while (fgets(line, sizeof line, f))\n        if (!strncmp(line, "MemAvailable:", 13)) { kb = atof(line + 13); break; }\n    fclose(f);\n    return kb * 1024.0;\n}\n'''
+          new='''static double mem_available_bytes(void)\n{\n#if defined(_WIN32)\n    MEMORYSTATUSEX ms;\n    memset(&ms, 0, sizeof ms);\n    ms.dwLength = sizeof ms;\n    return GlobalMemoryStatusEx(&ms) ? (double)ms.ullAvailPhys : 0.0;\n#else\n    FILE *f = fopen("/proc/meminfo", "r");\n    if (!f) return 0.0;\n    char line[256];\n    double kb = 0.0;\n    while (fgets(line, sizeof line, f))\n        if (!strncmp(line, "MemAvailable:", 13)) { kb = atof(line + 13); break; }\n    fclose(f);\n    return kb * 1024.0;\n#endif\n}\n'''
+          n=s.count(old)
           if n == 0:
-              print('Q4 group counter already clean')
+              if 'GlobalMemoryStatusEx(&ms)' not in s:
+                  raise SystemExit('mem_available_bytes source pattern not found')
           elif n == 1:
               p.write_text(s.replace(old,new,1))
-              print('patched Q4 group counter')
           else:
-              raise SystemExit(f'refusing ambiguous patch: {n} matches')
+              raise SystemExit(f'refusing ambiguous memory patch: {n} matches')
           PY
           if git diff --quiet; then exit 0; fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/core/k3_ops.c
-          git commit -m 'core: remove dead Q4 group counter'
+          git add src/core/k3_ops.c src/cli/k3_run.c
+          git commit -m 'port: query available memory on Windows'
           git push origin HEAD:feature/windows-native-runtime
 
-# Existing only while the Windows port is staged; removed before PR.
+# Temporary staging helper; deleted before PR.
