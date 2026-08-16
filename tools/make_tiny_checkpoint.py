@@ -22,6 +22,7 @@ The dtype of every tensor mirrors src/model/k3_bind.c's reqw/reqn split exactly:
   experts -> MXFP4 U8 (packed + scale), low-nibble-first, per-32 scale
 
 Usage: make_tiny_checkpoint.py <out_dir> [--seed N] [--prompt-ids a,b,c]
+                                      [--num-experts N] [--topk K]
 """
 from __future__ import annotations
 
@@ -195,9 +196,11 @@ def is_reqn(eng: str, name: str) -> bool:
 
 
 # ---------------------------------------------------------------- build
-def build(seed: int, dense_intermediate: int = 96):
+def build(seed: int, dense_intermediate: int = 96, num_experts: int = 8,
+          topk: int = 2):
     torch.manual_seed(seed)
-    cfg = tiny_config(moe_intermediate_size=64, intermediate_size=dense_intermediate)
+    cfg = tiny_config(moe_intermediate_size=64, intermediate_size=dense_intermediate,
+                      num_experts=num_experts, num_experts_per_token=topk)
     model = K3Model(cfg).to(torch.float32).eval()
     with torch.no_grad():
         for name, p in model.named_parameters():
@@ -238,12 +241,20 @@ def main():
     ap.add_argument("--prompt-ids", default="3,7,11,5,9")
     ap.add_argument("--dense-intermediate", type=int, default=96,
                     help="dense layer-0 intermediate width; 512 mimics K3's oversized first layer")
+    ap.add_argument("--num-experts", type=int, default=8,
+                    help="routed experts in the tiny fixture (default 8; useful for cache/prefill stress)")
+    ap.add_argument("--topk", type=int, default=2,
+                    help="routed experts selected per token (default 2)")
     a = ap.parse_args()
 
     if a.dense_intermediate <= 0:
         ap.error("--dense-intermediate must be positive")
+    if a.num_experts <= 0:
+        ap.error("--num-experts must be positive")
+    if a.topk <= 0 or a.topk > a.num_experts or a.topk > 64:
+        ap.error("--topk must be in 1..min(num-experts,64)")
     os.makedirs(a.out_dir, exist_ok=True)
-    cfg, model = build(a.seed, a.dense_intermediate)
+    cfg, model = build(a.seed, a.dense_intermediate, a.num_experts, a.topk)
     ids = [int(v) for v in a.prompt_ids.split(",") if v != ""]
     print("model: hidden %d, layers %d, vocab %d, experts %d, moe_inter %d" %
           (cfg.hidden_size, cfg.num_hidden_layers, cfg.vocab_size,

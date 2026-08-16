@@ -1,0 +1,112 @@
+name: Prefill expert-wave parity
+
+on:
+  push:
+    branches: [speedboost/prefill-expert-waves]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-expert-waves-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-expert-waves-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exactness-and-scheduling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Strict AVX2 build and weightless tests
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build 80-expert top-16 streamed stress checkpoint
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3wave /tmp/k3wave-trunk /tmp/k3wave-out
+          mkdir -p /tmp/k3wave-out
+          python tools/make_tiny_checkpoint.py /tmp/k3wave \
+            --seed 1234 --num-experts 80 --topk 16 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3wave/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3wave /tmp/k3wave-trunk "$NLAYERS"
+
+      - name: Old giant-prefetch schedule vs expert waves are binary-identical
+        run: |
+          set -uo pipefail
+          D=/tmp/k3wave-out
+          # Keep gen=1 deliberately: k3 resets cache statistics before each generated
+          # token, so the final report then covers the prefill window we are testing.
+          # A longer generation would erase the prefill async-batch counters before the
+          # final report and make the scheduling assertion compare decode-only stats.
+          COMMON='/tmp/k3wave --trunk /tmp/k3wave-trunk --trunk-gb 0.05 --cache-gb 0.0004 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --gen 1 --incremental --threads 1 --temperature 0'
+
+          K3_NO_PREFILL_PIPELINE=1 ./bin/k3 $COMMON --dump-logits "$D/old.logits" --out "$D/old.json" >"$D/old.log" 2>&1
+          old_rc=$?
+          ./bin/k3 $COMMON --dump-logits "$D/waves.logits" --out "$D/waves.json" >"$D/waves.log" 2>&1
+          waves_rc=$?
+
+          echo "old_rc=$old_rc waves_rc=$waves_rc"
+          echo '--- old log tail ---'
+          tail -n 80 "$D/old.log" || true
+          echo '--- waves log tail ---'
+          tail -n 80 "$D/waves.log" || true
+          echo '--- produced files ---'
+          ls -lh "$D" || true
+
+          if [ "$old_rc" -ne 0 ] || [ "$waves_rc" -ne 0 ]; then
+            echo 'one or both K3 runs failed' >&2
+            exit 1
+          fi
+
+          if cmp "$D/old.logits" "$D/waves.logits"; then
+            echo 'binary logits cmp: PASS'
+          else
+            echo 'binary logits cmp: FAIL' >&2
+            sha256sum "$D/old.logits" "$D/waves.logits" || true
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json, re
+          d='/tmp/k3wave-out'
+          a=json.load(open(d+'/old.json')); b=json.load(open(d+'/waves.json'))
+          assert a['generated_ids']==b['generated_ids'], (a['generated_ids'],b['generated_ids'])
+          assert a['full_ids']==b['full_ids']
+          old=open(d+'/old.log',errors='replace').read()
+          new=open(d+'/waves.log',errors='replace').read()
+          def batches(s):
+              pats = [
+                  r'async overlap\s*:\s*(\d+) batches',
+                  r'async[^\n]*?(\d+) batches',
+              ]
+              for pat in pats:
+                  m=re.findall(pat,s,re.I)
+                  if m: return int(m[-1])
+              return 0
+          ob, nb=batches(old), batches(new)
+          print('prefill-wave exact ids:',a['generated_ids'])
+          print('async batches old/new:',ob,nb)
+          print(f'::notice::prefill-wave summary logits_equal=1 ids_equal=1 async_old={ob} async_waves={nb}')
+          assert nb > ob, (ob,nb)
+          print('PREFILL EXPERT WAVES PARITY + SCHEDULING PASS')
+          PY
