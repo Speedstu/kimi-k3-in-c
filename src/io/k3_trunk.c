@@ -212,14 +212,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
      * It requires offset, length and buffer all aligned. pack_trunk.py pads every run
      * to 4096 and the slots come from posix_memalign. If the filesystem refuses
      * O_DIRECT, fall back rather than fail: correctness does not depend on it. */
-    tr->direct = 1;
-    tr->fd = open(p, O_RDONLY | O_DIRECT);
-    if (tr->fd >= 0 && k3_set_direct(tr->fd) != 0)
-        tr->direct = 0;   /* Darwin refused F_NOCACHE: reads stay buffered but correct */
-    if (tr->fd < 0) {
-        tr->direct = 0;
-        tr->fd = open(p, O_RDONLY);
-    }
+    tr->fd = k3_open_read(p, 1, &tr->direct);
     if (tr->fd < 0) { fprintf(stderr, "k3_trunk: cannot open %s\n", p); return -1; }
     {
         jval *a = json_get(root, "align");
@@ -231,8 +224,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
                             "falling back to buffered reads (repack to enable O_DIRECT)\n",
                     (long long)want, K3_TRUNK_ALIGN);
             close(tr->fd);
-            tr->direct = 0;
-            tr->fd = open(p, O_RDONLY);
+            tr->fd = k3_open_read(p, 0, &tr->direct);
             if (tr->fd < 0) return -1;
         }
     }
