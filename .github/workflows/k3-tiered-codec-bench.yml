@@ -1,0 +1,53 @@
+name: K3 tiered codec benchmark
+
+on:
+  push:
+    branches: [speedboost/dict7-tiered-research]
+    paths:
+      - 'benchmarks/bench_bf16_dict7_tiered.c'
+      - 'benchmarks/bench_bf16_dict_codec.c'
+      - '.github/workflows/k3-tiered-codec-bench.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  linux-avx2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and compare decoders
+        run: |
+          set -euo pipefail
+          cc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict_codec.c -o /tmp/dict15
+          cc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict7_tiered.c -o /tmp/tiered
+          echo '=== dict15 baseline ==='
+          /tmp/dict15 256 5 | tee /tmp/d15.log
+          echo '=== dict7 tiered ==='
+          /tmp/tiered 256 5 | tee /tmp/d7.log
+          grep -q 'byte-identical roundtrip: PASS' /tmp/d15.log
+          grep -q 'byte-identical roundtrip: PASS' /tmp/d7.log
+
+  windows-avx2:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Build and compare decoders natively
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          gcc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict_codec.c -o /tmp/dict15.exe
+          gcc -O3 -mavx2 -Wall -Wextra -Werror benchmarks/bench_bf16_dict7_tiered.c -o /tmp/tiered.exe
+          echo '=== dict15 baseline ==='
+          /tmp/dict15.exe 256 5 | tee /tmp/d15.log
+          echo '=== dict7 tiered ==='
+          /tmp/tiered.exe 256 5 | tee /tmp/d7.log
+          grep -q 'byte-identical roundtrip: PASS' /tmp/d15.log
+          grep -q 'byte-identical roundtrip: PASS' /tmp/d7.log
