@@ -15,22 +15,42 @@ s = p.read_text()
 s = once(s,
 '''CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
+
+# Tests that need no checkpoint. These run in CI on every push.
 ''',
 '''CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 WORKER_SRC := src/cli/k3_worker.c
 WORKER_BIN := $(BIN)/k3-worker
+
+# Tests that need no checkpoint. These run in CI on every push.
 ''', "make vars")
-s = once(s, 'all: $(CLI_BIN)\n', 'all: $(CLI_BIN) $(WORKER_BIN)\n', "make all")
+s = once(s,
+'''# ---------------------------------------------------------------------------- targets --
+.PHONY: all test test-all bench portable debug asan ubsan format clean install help \\
+        tok cfg ops cache st oracle weights-test
+
+all: $(CLI_BIN)
+''',
+'''# ---------------------------------------------------------------------------- targets --
+.PHONY: all test test-all bench portable debug asan ubsan format clean install help \\
+        tok cfg ops cache st oracle weights-test
+
+all: $(CLI_BIN) $(WORKER_BIN)
+''', "make all")
 s = once(s,
 '''$(CLI_BIN): $(CLI_SRC) $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
+
+$(BIN):
 ''',
 '''$(CLI_BIN): $(CLI_SRC) $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
 
 $(WORKER_BIN): $(WORKER_SRC) $(CLI_SRC) $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $(WORKER_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
+
+$(BIN):
 ''', "make worker rule")
 s = once(s,
 '''install: $(CLI_BIN)
@@ -50,6 +70,8 @@ s = once(s,
 '''add_executable(k3_cli src/cli/k3_run.c)
 set_target_properties(k3_cli PROPERTIES OUTPUT_NAME k3)
 target_link_libraries(k3_cli PRIVATE k3)
+
+# ---------------------------------------------------------------------------- tests --
 ''',
 '''add_executable(k3_cli src/cli/k3_run.c)
 set_target_properties(k3_cli PROPERTIES OUTPUT_NAME k3)
@@ -58,6 +80,8 @@ target_link_libraries(k3_cli PRIVATE k3)
 add_executable(k3_worker src/cli/k3_worker.c)
 set_target_properties(k3_worker PROPERTIES OUTPUT_NAME k3-worker)
 target_link_libraries(k3_worker PRIVATE k3)
+
+# ---------------------------------------------------------------------------- tests --
 ''', "cmake worker target")
 s = once(s, 'install(TARGETS k3_cli RUNTIME DESTINATION bin)\n',
          'install(TARGETS k3_cli k3_worker RUNTIME DESTINATION bin)\n', "cmake install")
