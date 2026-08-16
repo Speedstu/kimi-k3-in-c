@@ -46,7 +46,7 @@ jobs:
           set -uo pipefail
           D=/tmp/k3auto-out
           BASE='/tmp/k3auto --trunk /tmp/k3auto-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 18 --incremental --threads 1 --temperature 0'
-          DRAFT='--draft-trunk /tmp/k3auto-trunk --draft-trunk-gb 0.05 --draft-topk 0'
+          DRAFT='--draft-trunk /tmp/k3auto-trunk --draft-trunk-gb 0.05 --draft-topk 2'
           run_one() {
             name="$1"; shift
             set +e
@@ -55,7 +55,7 @@ jobs:
             set -e
             echo "===== $name rc=$rc ====="
             test -f "$D/$name.json" && echo "json=present" || echo "json=MISSING"
-            tail -n 60 "$D/$name.log" || true
+            tail -n 80 "$D/$name.log" || true
             echo
             return 0
           }
@@ -65,18 +65,14 @@ jobs:
           run_one auto5 $DRAFT --spec-auto --spec 5
           python3 - <<'PY'
           import json, os
-          d='/tmp/k3auto-out'
-          names=['serial','fixed4','auto8','auto5']
-          objs={}
+          d='/tmp/k3auto-out'; names=['serial','fixed4','auto8','auto5']; objs={}
           for n in names:
-              p=f'{d}/{n}.json'
-              print('\nJSON', n, 'exists=', os.path.exists(p))
+              p=f'{d}/{n}.json'; print('\nJSON',n,'exists=',os.path.exists(p))
               if os.path.exists(p):
                   try:
                       o=json.load(open(p)); objs[n]=o
-                      keys=['generated_ids','full_ids','spec_auto','spec_auto_rounds','spec_auto_proposed','spec_auto_accepted','spec_auto_final','spec_auto_limit','spec_auto_grows','spec_auto_shrinks','seconds_per_token','hybrid_rounds','hybrid_drafted','hybrid_accepted']
-                      for k in keys:
-                          if k in o: print(k, '=', o[k])
+                      for k in ['generated_ids','full_ids','spec_auto','spec_auto_rounds','spec_auto_proposed','spec_auto_accepted','spec_auto_final','spec_auto_limit','spec_auto_grows','spec_auto_shrinks','seconds_per_token','hybrid_rounds','hybrid_drafted','hybrid_accepted']:
+                          if k in o: print(k,'=',o[k])
                   except Exception as e: print('JSON parse error:',repr(e))
           if 'serial' in objs:
               s=objs['serial']
@@ -84,11 +80,10 @@ jobs:
                   if n not in objs: continue
                   o=objs[n]
                   for key in ['generated_ids','full_ids']:
-                      a=s.get(key,[]); b=o.get(key,[])
-                      ok=a==b
-                      print(f'COMPARE {n} {key}:', ok, 'lens', len(a), len(b))
+                      a=s.get(key,[]); b=o.get(key,[]); ok=a==b
+                      print(f'COMPARE {n} {key}:',ok,'lens',len(a),len(b))
                       if not ok:
-                          m=min(len(a),len(b)); pos=next((i for i in range(m) if a[i]!=b[i]), m)
+                          m=min(len(a),len(b)); pos=next((i for i in range(m) if a[i]!=b[i]),m)
                           print(' first_diff=',pos,'serial=',a[pos:pos+8],'other=',b[pos:pos+8])
           PY
           false
