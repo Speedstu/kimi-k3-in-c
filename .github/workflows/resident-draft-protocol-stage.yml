@@ -1,0 +1,36 @@
+name: Stage resident draft protocol fix
+
+on:
+  push:
+    branches: ['feature/resident-sampled-draft']
+    paths:
+      - 'tools/fix_resident_draft_protocol_stage.py'
+      - '.github/workflows/resident-draft-protocol-stage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/resident-sampled-draft
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply protocol parser fix
+        run: python3 tools/fix_resident_draft_protocol_stage.py
+      - name: Syntax and lint
+        run: |
+          python -m pip install --quiet ruff
+          python -m py_compile local/k3_local.py
+          ruff check local/k3_local.py
+      - name: Commit validated source
+        run: |
+          git config user.name Speedstu
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add local/k3_local.py
+          git diff --cached --quiet || git commit -m 'fix: parse resident draft metrics with exact protocol width'
+          git push origin HEAD:feature/resident-sampled-draft
