@@ -1,0 +1,85 @@
+name: Prefill xdouble probe
+
+on:
+  push:
+    branches: [speedboost/prefill-xdouble]
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_prefill_xdouble.c'
+      - '.github/workflows/prefill-xdouble-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exactness-and-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Strict AVX2 build and full tests
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build production-shape xdouble probe
+        run: |
+          set -euo pipefail
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS \
+             -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_test.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off \
+             benchmarks/bench_prefill_xdouble.c /tmp/k3_ops_test.o \
+             -o /tmp/prefill_xd -lm -fopenmp -pthread
+
+      - name: Real K3 shape repeated medians
+        run: |
+          set -euo pipefail
+          for n in 1 2 4; do
+            echo "=== OMP_NUM_THREADS=$n ==="
+            OMP_NUM_THREADS=$n /tmp/prefill_xd | tee "/tmp/xd-${n}.log"
+            grep -q 'PREFILL XDOUBLE EXACTNESS PASS' "/tmp/xd-${n}.log"
+          done
+
+      - name: Generate streamed tiny K3
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3xd /tmp/k3xd-trunk /tmp/k3xd-out
+          mkdir -p /tmp/k3xd-out
+          python tools/make_tiny_checkpoint.py /tmp/k3xd --seed 1234 \
+            --num-experts 80 --topk 16 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3xd/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3xd /tmp/k3xd-trunk "$NLAYERS"
+
+      - name: Old float conversion vs prefill xdouble are binary-identical
+        run: |
+          set -euo pipefail
+          D=/tmp/k3xd-out
+          COMMON='/tmp/k3xd --trunk /tmp/k3xd-trunk --trunk-gb 0.05 --cache-gb 0.0004 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --gen 1 --incremental --threads 1 --temperature 0'
+          K3_NO_PREFILL_XDOUBLE=1 ./bin/k3 $COMMON --dump-logits "$D/old.logits" --out "$D/old.json" >"$D/old.log" 2>&1
+          ./bin/k3 $COMMON --dump-logits "$D/xd.logits" --out "$D/xd.json" >"$D/xd.log" 2>&1
+          cmp "$D/old.logits" "$D/xd.logits"
+          python3 - <<'PY'
+          import json
+          d='/tmp/k3xd-out'
+          a=json.load(open(d+'/old.json')); b=json.load(open(d+'/xd.json'))
+          assert a['generated_ids']==b['generated_ids'], (a['generated_ids'], b['generated_ids'])
+          assert a['full_ids']==b['full_ids']
+          print('prefill-xdouble exact ids:', a['generated_ids'])
+          PY
+          echo 'PREFILL XDOUBLE END-TO-END PARITY PASS'
