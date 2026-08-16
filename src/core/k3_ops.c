@@ -532,7 +532,8 @@ size_t k3_mla_scratch(const K3Cfg *c, int T)
  * the MoE caller, so thousands of output rows do not repeat the same cvtps2pd work. */
 static void k3_matmul_mxfp4_xd(float *y, const double *x,
                                const unsigned char *packed,
-                               const unsigned char *scales, int in, int rows, int group);
+                               const unsigned char *scales, int in, int rows, int group,
+                               int rowpair);
 #endif
 
 /* ------------------------------------------------------- Stable LatentMoE ---- */
@@ -576,8 +577,9 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
     uintptr_t xdp = ((uintptr_t)(sdn + E) + 7u) & ~(uintptr_t)7u;
     double *zxd   = (double *)xdp;       /* [L] shared by w1+w3 across ALL routed experts */
     double *actxd = zxd + L;             /* [I] refreshed once per expert for w2           */
-    static int no_mx_xdouble = -1;
+    static int no_mx_xdouble = -1, no_mx_rowpair = -1;
     if (no_mx_xdouble < 0) no_mx_xdouble = getenv("K3_NO_MX_XDOUBLE") ? 1 : 0;
+    if (no_mx_rowpair < 0) no_mx_rowpair = getenv("K3_NO_MX_ROWPAIR") ? 1 : 0;
 #endif
 
     for (int t = 0; t < T; t++) {
@@ -619,6 +621,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         k3_mmw(z, xt, w->down, w->wdt, E, L);
 #if defined(__AVX2__)
         const int use_mx_xdouble = w->src && !no_mx_xdouble;
+        const int use_mx_rowpair = use_mx_xdouble && !no_mx_rowpair;
         if (use_mx_xdouble)
             for (int i = 0; i < L; i++) zxd[i] = (double)z[i];
 #endif
@@ -672,13 +675,13 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                 if (use_mx_xdouble) {
                     /* z is identical for every selected expert in this token. Widen it
                      * once above and reuse it for both gate/up matrices across top-k. */
-                    k3_matmul_mxfp4_xd(gu,     zxd, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
-                    k3_matmul_mxfp4_xd(gu + I, zxd, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
+                    k3_matmul_mxfp4_xd(gu,     zxd, q.p1, q.s1, L, I, K3_MXFP4_GROUP, use_mx_rowpair);
+                    k3_matmul_mxfp4_xd(gu + I, zxd, q.p3, q.s3, L, I, K3_MXFP4_GROUP, use_mx_rowpair);
                     k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
                     /* act changes per expert, but widening it ONCE still replaces one
                      * conversion per output row in w2. */
                     for (int i = 0; i < I; i++) actxd[i] = (double)act[i];
-                    k3_matmul_mxfp4_xd(edn, actxd, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+                    k3_matmul_mxfp4_xd(edn, actxd, q.p2, q.s2, I, L, K3_MXFP4_GROUP, use_mx_rowpair);
                 } else
 #endif
                 {
@@ -1412,7 +1415,8 @@ static void k3_e8m0_init(void)
 #if defined(__AVX2__)
 static void k3_matmul_mxfp4_xd(float *y, const double *x,
                                const unsigned char *packed,
-                               const unsigned char *scales, int in, int rows, int group)
+                               const unsigned char *scales, int in, int rows, int group,
+                               int rowpair)
 {
     if (group != 32 || (in & 31)) {
         /* No production K3 expert takes this branch. Keep a defensive exact fallback by
@@ -1433,50 +1437,147 @@ static void k3_matmul_mxfp4_xd(float *y, const double *x,
          0,  1,  2,  3,  4,  6,  8, 12,
          0, -1, -2, -3, -4, -6, -8,-12);
 
+    /* Existing #22 single-row implementation is kept as the exact A/B fallback. */
+    if (!rowpair || rows < 2) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (rows > 64)
 #endif
-    for (int r = 0; r < rows; r++) {
-        const unsigned char *pr = packed + (size_t)r * pcols;
-        const unsigned char *sr = scales + (size_t)r * ngrp;
-        double acc = 0.0;
-        for (int g = 0; g < ngrp; g++) {
-            const unsigned char sb = sr[g];
-            if (sb == 255) continue;
-            const unsigned char *pb = pr + (size_t)g * 16;
-            const double *xg = x + (size_t)g * 32;
-            const __m128i b = _mm_loadu_si128((const __m128i *)pb);
-            const __m128i lo = _mm_shuffle_epi8(half_units, _mm_and_si128(b, mask));
-            const __m128i hi = _mm_shuffle_epi8(
-                half_units, _mm_and_si128(_mm_srli_epi16(b, 4), mask));
-            const __m128i q0 = _mm_unpacklo_epi8(lo, hi);
-            const __m128i q1 = _mm_unpackhi_epi8(lo, hi);
-            const __m256i i0 = _mm256_cvtepi8_epi32(q0);
-            const __m256i i1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q0, 8));
-            const __m256i i2 = _mm256_cvtepi8_epi32(q1);
-            const __m256i i3 = _mm256_cvtepi8_epi32(_mm_srli_si128(q1, 8));
-            __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
-#define K3_XD_F4(V, I128, O) do {                                              \
-                (V) = _mm256_fmadd_pd(_mm256_cvtepi32_pd((I128)),              \
-                                      _mm256_loadu_pd(xg + (O)), (V));          \
-            } while (0)
-            K3_XD_F4(v0, _mm256_castsi256_si128(i0),       0);
-            K3_XD_F4(v1, _mm256_extracti128_si256(i0, 1),  4);
-            K3_XD_F4(v0, _mm256_castsi256_si128(i1),       8);
-            K3_XD_F4(v1, _mm256_extracti128_si256(i1, 1), 12);
-            K3_XD_F4(v0, _mm256_castsi256_si128(i2),      16);
-            K3_XD_F4(v1, _mm256_extracti128_si256(i2, 1), 20);
-            K3_XD_F4(v0, _mm256_castsi256_si128(i3),      24);
-            K3_XD_F4(v1, _mm256_extracti128_si256(i3, 1), 28);
-#undef K3_XD_F4
-            double a[4];
-            _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
-            const double sub2 = (a[0] + a[1]) + (a[2] + a[3]);
-            acc += sub2 * ((double)K3_E8M0[sb] * 0.5);
+        for (int r = 0; r < rows; r++) {
+            const unsigned char *pr = packed + (size_t)r * pcols;
+            const unsigned char *sr = scales + (size_t)r * ngrp;
+            double acc = 0.0;
+            for (int g = 0; g < ngrp; g++) {
+                const unsigned char sb = sr[g];
+                if (sb == 255) continue;
+                const unsigned char *pb = pr + (size_t)g * 16;
+                const double *xg = x + (size_t)g * 32;
+                const __m128i b = _mm_loadu_si128((const __m128i *)pb);
+                const __m128i lo = _mm_shuffle_epi8(half_units, _mm_and_si128(b, mask));
+                const __m128i hi = _mm_shuffle_epi8(
+                    half_units, _mm_and_si128(_mm_srli_epi16(b, 4), mask));
+                const __m128i q0 = _mm_unpacklo_epi8(lo, hi);
+                const __m128i q1 = _mm_unpackhi_epi8(lo, hi);
+                const __m256i i0 = _mm256_cvtepi8_epi32(q0);
+                const __m256i i1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q0, 8));
+                const __m256i i2 = _mm256_cvtepi8_epi32(q1);
+                const __m256i i3 = _mm256_cvtepi8_epi32(_mm_srli_si128(q1, 8));
+                __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+#define K3_XD_SINGLE_F4(V, I128, O) do {                                      \
+                    (V) = _mm256_fmadd_pd(_mm256_cvtepi32_pd((I128)),          \
+                                          _mm256_loadu_pd(xg + (O)), (V));      \
+                } while (0)
+                K3_XD_SINGLE_F4(v0, _mm256_castsi256_si128(i0),       0);
+                K3_XD_SINGLE_F4(v1, _mm256_extracti128_si256(i0, 1),  4);
+                K3_XD_SINGLE_F4(v0, _mm256_castsi256_si128(i1),       8);
+                K3_XD_SINGLE_F4(v1, _mm256_extracti128_si256(i1, 1), 12);
+                K3_XD_SINGLE_F4(v0, _mm256_castsi256_si128(i2),      16);
+                K3_XD_SINGLE_F4(v1, _mm256_extracti128_si256(i2, 1), 20);
+                K3_XD_SINGLE_F4(v0, _mm256_castsi256_si128(i3),      24);
+                K3_XD_SINGLE_F4(v1, _mm256_extracti128_si256(i3, 1), 28);
+#undef K3_XD_SINGLE_F4
+                double a4[4];
+                _mm256_storeu_pd(a4, _mm256_add_pd(v0, v1));
+                const double sub2 = (a4[0] + a4[1]) + (a4[2] + a4[3]);
+                acc += sub2 * ((double)K3_E8M0[sb] * 0.5);
+            }
+            y[r] = (float)acc;
         }
-        y[r] = (float)acc;
+        return;
+    }
+
+    /* Two rows share the same 32 activation values. Load those eight 256-bit x vectors
+     * once per group, then run two completely independent weight decodes/accumulators.
+     * Each row retains exactly the #22 FMA lane assignment, reduction and scale order. */
+    const int npair = rows / 2;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (npair > 32)
+#endif
+    for (int rp = 0; rp < npair; rp++) {
+        const int r0 = 2 * rp, r1 = r0 + 1;
+        const unsigned char *p0 = packed + (size_t)r0 * pcols;
+        const unsigned char *p1 = packed + (size_t)r1 * pcols;
+        const unsigned char *s0 = scales + (size_t)r0 * ngrp;
+        const unsigned char *s1 = scales + (size_t)r1 * ngrp;
+        double acc0 = 0.0, acc1 = 0.0;
+
+        for (int g = 0; g < ngrp; g++) {
+            const unsigned char sb0 = s0[g], sb1 = s1[g];
+            if (sb0 == 255 && sb1 == 255) continue;
+            const double *xg = x + (size_t)g * 32;
+            const __m256d x0 = _mm256_loadu_pd(xg + 0);
+            const __m256d x1 = _mm256_loadu_pd(xg + 4);
+            const __m256d x2 = _mm256_loadu_pd(xg + 8);
+            const __m256d x3 = _mm256_loadu_pd(xg + 12);
+            const __m256d x4 = _mm256_loadu_pd(xg + 16);
+            const __m256d x5 = _mm256_loadu_pd(xg + 20);
+            const __m256d x6 = _mm256_loadu_pd(xg + 24);
+            const __m256d x7 = _mm256_loadu_pd(xg + 28);
+
+#define K3_XD_PAIR_ROW(ACC, PB, SB) do {                                      \
+                if ((SB) != 255) {                                            \
+                    const __m128i rb = _mm_loadu_si128((const __m128i *)(PB)); \
+                    const __m128i rlo = _mm_shuffle_epi8(half_units,           \
+                        _mm_and_si128(rb, mask));                              \
+                    const __m128i rhi = _mm_shuffle_epi8(half_units,           \
+                        _mm_and_si128(_mm_srli_epi16(rb, 4), mask));           \
+                    const __m128i rq0 = _mm_unpacklo_epi8(rlo, rhi);           \
+                    const __m128i rq1 = _mm_unpackhi_epi8(rlo, rhi);           \
+                    const __m256i ri0 = _mm256_cvtepi8_epi32(rq0);            \
+                    const __m256i ri1 = _mm256_cvtepi8_epi32(                  \
+                        _mm_srli_si128(rq0, 8));                               \
+                    const __m256i ri2 = _mm256_cvtepi8_epi32(rq1);            \
+                    const __m256i ri3 = _mm256_cvtepi8_epi32(                  \
+                        _mm_srli_si128(rq1, 8));                               \
+                    __m256d rv0 = _mm256_setzero_pd();                         \
+                    __m256d rv1 = _mm256_setzero_pd();                         \
+                    rv0 = _mm256_fmadd_pd(_mm256_cvtepi32_pd(                 \
+                        _mm256_castsi256_si128(ri0)), x0, rv0);                \
+                    rv1 = _mm256_fmadd_pd(_mm256_cvtepi32_pd(                 \
+                        _mm256_extracti128_si256(ri0, 1)), x1, rv1);           \
+                    rv0 = _mm256_fmadd_pd(_mm256_cvtepi32_pd(                 \
+                        _mm256_castsi256_si128(ri1)), x2, rv0);                \
+                    rv1 = _mm256_fmadd_pd(_mm256_cvtepi32_pd(                 \
+                        _mm256_extracti128_si256(ri1, 1)), x3, rv1);           \
+                    rv0 = _mm256_fmadd_pd(_mm256_cvtepi32_pd(                 \
+                        _mm256_castsi256_si128(ri2)), x4, rv0);                \
+                    rv1 = _mm256_fmadd_pd(_mm256_cvtepi32_pd(                 \
+                        _mm256_extracti128_si256(ri2, 1)), x5, rv1);           \
+                    rv0 = _mm256_fmadd_pd(_mm256_cvtepi32_pd(                 \
+                        _mm256_castsi256_si128(ri3)), x6, rv0);                \
+                    rv1 = _mm256_fmadd_pd(_mm256_cvtepi32_pd(                 \
+                        _mm256_extracti128_si256(ri3, 1)), x7, rv1);           \
+                    double ra[4];                                              \
+                    _mm256_storeu_pd(ra, _mm256_add_pd(rv0, rv1));             \
+                    const double rsub = (ra[0] + ra[1]) + (ra[2] + ra[3]);    \
+                    (ACC) += rsub * ((double)K3_E8M0[(SB)] * 0.5);             \
+                }                                                              \
+            } while (0)
+            K3_XD_PAIR_ROW(acc0, p0 + (size_t)g * 16, sb0);
+            K3_XD_PAIR_ROW(acc1, p1 + (size_t)g * 16, sb1);
+#undef K3_XD_PAIR_ROW
+        }
+        y[r0] = (float)acc0;
+        y[r1] = (float)acc1;
+    }
+
+    if (rows & 1) {
+        const int r = rows - 1;
+        k3_matmul_mxfp4_xd(y + r, x,
+                           packed + (size_t)r * pcols,
+                           scales + (size_t)r * ngrp,
+                           in, 1, group, 0);
     }
 }
+
+#ifdef K3_TEST_INTERNALS
+void k3_test_matmul_mxfp4_xd(float *y, const double *x,
+                             const unsigned char *packed,
+                             const unsigned char *scales,
+                             int in, int rows, int group, int rowpair)
+{
+    k3_matmul_mxfp4_xd(y, x, packed, scales, in, rows, group, rowpair);
+}
+#endif
 #endif
 
 void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
