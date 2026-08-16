@@ -51,7 +51,7 @@ def encode_block(raw: bytes):
         codes[: len(q) // 2] |= q[1::2] << 4
     escapes = high[q == 15]
     payload = low.tobytes() + codes.tobytes() + escapes.tobytes()
-    return payload, dictionary.tolist(), int(len(escapes))
+    return payload, dictionary.tolist(), len(escapes)
 
 
 def main() -> int:
