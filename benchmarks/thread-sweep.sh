@@ -59,11 +59,15 @@ else
 fi
 
 # Validate, deduplicate and sort numerically. This also makes captured runs reproducible.
-mapfile -t candidates < <(
+sorted_candidates=()
+while IFS= read -r v; do
+  sorted_candidates[${#sorted_candidates[@]}]=$v
+done < <(
   printf '%s\n' "${candidates[@]}" |
     awk -v max="$cpu_count" '/^[0-9]+$/ && $1 >= 1 && $1 <= max { print $1 }' |
     sort -nu
 )
+candidates=("${sorted_candidates[@]}")
 if (( ${#candidates[@]} == 0 )); then
   echo "no valid thread candidates (machine reports $cpu_count logical CPUs)" >&2
   exit 2

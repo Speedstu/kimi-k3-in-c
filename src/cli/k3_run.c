@@ -50,6 +50,9 @@
 #include <string.h>
 #include <time.h>
 #include <sys/resource.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "k3.h"
 #include "k3_bind.h"
@@ -328,8 +331,10 @@ static void usage(FILE *f)
 "  --trunk-gb X          trunk ring / pinned-layer budget\n"
 "  --cache-gb X          routed-expert cache budget\n"
 "\n"
-"generation:\n"
+"generation / compute:\n"
 "  --gen N               tokens to generate (default 8)\n"
+"  --threads N           OpenMP compute threads for this run. Exact output is unchanged;\n"
+"                        use benchmarks/thread-sweep.sh to MEASURE the best N\n"
 "  --incremental         carry KV cache and recurrent state between tokens\n"
 "  --save-state PATH     write the carried state after the run, so the next turn of a\n"
 "                        conversation resumes instead of re-reading the whole prompt\n"
@@ -627,6 +632,7 @@ int main(int argc, char **argv)
     const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL;
     int gen = 8, want_layers = -1;
+    int threads = 0;              /* 0 = OpenMP/runtime default */
     double cache_gb = 64.0, trunk_gb = 16.0;
     int budget_auto = 0;
     int spec_n = 0;
@@ -645,6 +651,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
@@ -706,6 +713,27 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+
+    if (threads < 0 || threads > 4096) {
+        fprintf(stderr, "--threads must be in [1,4096] when supplied, got %d\n", threads);
+        return 2;
+    }
+#ifdef _OPENMP
+    if (threads > 0) {
+        /* Dynamic team resizing defeats a repeatable thread sweep: two runs with the
+         * same --threads could otherwise get different team sizes under system load. */
+        omp_set_dynamic(0);
+        omp_set_num_threads(threads);
+    }
+    const int compute_threads = omp_get_max_threads();
+#else
+    if (threads > 0 && threads != 1) {
+        fprintf(stderr, "--threads %d requested, but this binary was built without OpenMP\n",
+                threads);
+        return 2;
+    }
+    const int compute_threads = 1;
+#endif
 
     /* ---- auto budget ----
      * RAM-first: per token the engine re-reads the ENTIRE streamed trunk but only
@@ -880,6 +908,8 @@ int main(int argc, char **argv)
 
     char b1[32];
     printf("Kimi K3, pure C, released checkpoint\n");
+    printf("  threads  : %d compute%s\n", compute_threads,
+           threads > 0 ? " (explicit --threads)" : " (OpenMP/runtime default)");
     /* The directory, not a shard count: the index has not been built yet at this point.
      * The count is printed by the "indexed N tensors from M shards" line below, once
      * k3_st_open has actually counted them. */
@@ -1468,7 +1498,8 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"seconds_per_token\":%.4f}\n", NL, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"threads\":%d,\"seconds_per_token\":%.4f}\n",
+                NL, compute_threads, t_total / nout);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
