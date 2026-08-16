@@ -7,6 +7,7 @@ on:
       - 'src/cli/k3_worker.c'
       - 'src/cli/k3_run.c'
       - 'src/core/k3_sample.c'
+      - 'local/k3_local.py'
       - 'Makefile'
       - 'CMakeLists.txt'
       - '.github/workflows/worker-parity.yml'
@@ -15,6 +16,7 @@ on:
       - 'src/cli/k3_worker.c'
       - 'src/cli/k3_run.c'
       - 'src/core/k3_sample.c'
+      - 'local/k3_local.py'
       - 'Makefile'
       - 'CMakeLists.txt'
       - '.github/workflows/worker-parity.yml'
@@ -50,7 +52,8 @@ jobs:
       - name: Resident worker equals one-shot exact engine
         run: |
           python - <<'PY'
-          import json, subprocess, tempfile
+          import importlib.util, json, subprocess, sys, tempfile
+          from pathlib import Path
 
           MODEL='/tmp/k3tiny'; TRUNK='/tmp/k3tiny-trunk'
           COMMON=[MODEL,'--trunk',TRUNK,'--trunk-gb','0.05','--cache-gb','0.05']
@@ -90,7 +93,7 @@ jobs:
 
           b=a+w1+[5,9]
           w2,reuse=req(b,3); ref2=oneshot(b,3)
-          assert w2==ref2,(w2,ref2); assert reuse==1
+          assert w2==ref2,(w2,ref2); assert reuse==len(a)+len(w1),(reuse,b)
 
           c=[3,7,12]
           w3,reuse=req(c,2); ref3=oneshot(c,2)
@@ -101,8 +104,26 @@ jobs:
               if line.startswith('@K3RESET'): break
           w4,reuse=req(a,5,1.0,.95,424242); ref4=oneshot(a,5,1.0,.95,424242)
           assert w4==ref4,(w4,ref4); assert reuse==0
-
           p.stdin.write('QUIT\n'); p.stdin.flush(); p.wait(timeout=10)
           assert p.returncode==0
-          print('resident worker parity: PASS',w1,w2,w3,w4)
+
+          # Exercise the actual localhost backend wrapper too. Importing the module does
+          # not instantiate transformers; ResidentCBackend is pure stdlib + local C.
+          spec=importlib.util.spec_from_file_location('k3_local_worker_ci','local/k3_local.py')
+          mod=importlib.util.module_from_spec(spec); sys.modules[spec.name]=mod
+          spec.loader.exec_module(mod)
+          cfg=mod.BackendConfig(
+              model_dir=Path(MODEL), trunk_dir=Path(TRUNK), binary=Path('./bin/k3').resolve(),
+              preset='laptop', cache_gb=.05, trunk_gb=.05,
+              resident_worker=True, worker_binary=Path('./bin/k3-worker').resolve(),
+              worker_context=64)
+          backend=mod.ResidentCBackend(cfg)
+          try:
+              x,st1=backend.generate(a,max_tokens=2,temperature=0,top_p=1,seed=1,stop_id=-1)
+              assert x==ref1 and st1['state_cache_hit_tokens']==0
+              y,st2=backend.generate(b,max_tokens=3,temperature=0,top_p=1,seed=1,stop_id=-1)
+              assert y==ref2 and st2['state_cache_hit_tokens']==len(a)+len(ref1), st2
+          finally:
+              backend.close()
+          print('resident worker + Python bridge parity: PASS',w1,w2,w3,w4)
           PY
