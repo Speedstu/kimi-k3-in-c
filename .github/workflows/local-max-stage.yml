@@ -72,13 +72,16 @@ jobs:
           grep -q -- '--ids-file' <(./bin/k3 --help 2>&1)
           grep -q -- '--stop-id' <(./bin/k3 --help 2>&1)
 
-      - name: Commit materialized feature
+      - name: Commit materialized source
         run: |
+          # The job intentionally does not stage .github/workflows/ci.yml: GitHub's
+          # Actions token may not modify workflow files. The connector applies that
+          # one validated edit separately after this source push succeeds.
+          git restore .github/workflows/ci.yml
           git config user.name Speedstu
           git config user.email '164693733+Speedstu@users.noreply.github.com'
           git add Makefile CMakeLists.txt src/cli/k3_run.c src/core/k3_sample.c \
-                  include/k3/k3_sample.h tests/unit/test_sample.c local/k3_local.py \
-                  .github/workflows/ci.yml
+                  include/k3/k3_sample.h tests/unit/test_sample.c local/k3_local.py
           git diff --cached --check
           git commit -m 'feat: local K3 max-parity inference and API-compatible runtime [stage-applied]'
           git push origin HEAD:feature/local-k3-max-parity
