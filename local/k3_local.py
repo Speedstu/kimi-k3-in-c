@@ -1227,7 +1227,10 @@ def main() -> None:
         "--worker-context",
         type=int,
         default=1024,
-        help="resident KV capacity in positions; raise for long benchmark sessions",
+        help=(
+            "resident capacity in positions (2..1048576); virtual reservation is lazy, "
+            "but RAM still grows with positions actually used"
+        ),
     )
     sp.add_argument("--preset", default="laptop")
     sp.add_argument("--threads", type=int)

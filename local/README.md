@@ -171,19 +171,30 @@ when the entire previous sequence is an exact prefix. It reports the exact numbe
 prefix tokens reused. Any token mismatch causes a conversation-state reset, while the
 loaded checkpoint/trunk and expert cache remain warm.
 
-The resident KV capacity is explicit:
+The resident KV capacity is explicit and can now be configured up to the declared K3
+window:
 
 ```bash
---worker-context 1024   # default
+--worker-context 1024      # conservative default
+--worker-context 1048576   # maximum VIRTUAL capacity; not a laptop-RAM promise
 ```
+
+On a 64-bit POSIX build, large exact/draft KV regions use anonymous lazy mappings and do
+not fall back to a giant `calloc` if that virtual reservation fails. The worker prints the
+per-used-position KV cost and total virtual reservation at startup. CI boots a tiny K3
+worker with `--context 1048576`, performs an exact request, and rejects `1048577` before
+model allocation. This validates the capacity mechanism, not the feasibility of filling a
+million positions with the released model.
 
 The worker reserves KV address space lazily, and prompt prefill is processed in fixed
 64-token chunks so hidden/residual/scratch buffers no longer scale with the whole configured
 capacity. A conversation reset zeros only true KDA recurrent/ShortConv state: setting
 `cached=0` makes old MLA KV rows unreachable, and every row used by the next conversation
-is fully overwritten before it can be read. This avoids sweeping gigabytes of stale KV on
-a branch/reset while preserving exact output; permanent CI gates a 130-token prompt across
-two chunk boundaries and a long-to-short reset against one-shot K3.
+is fully overwritten before it can be read. On anonymous mappings the worker also gives
+the actually-touched dead KV pages back to the OS with best-effort `MADV_DONTNEED`, rather
+than writing zeros through gigabytes. This reclamation is a memory optimisation only;
+correctness still comes from the cache-position invariant. Permanent CI gates a 130-token
+prompt across two chunk boundaries and a long-to-short reset against one-shot K3.
 
 RAM is still proportional to **used** context. Expanded fp32 MLA KV costs roughly 2.37 MB
 per used position across the 24 MLA layers (and a resident draft has its own state), so
