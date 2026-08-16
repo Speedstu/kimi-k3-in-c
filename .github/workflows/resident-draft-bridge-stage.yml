@@ -1,0 +1,53 @@
+name: Stage resident draft bridge
+
+on:
+  push:
+    branches: ['feature/resident-sampled-draft']
+    paths:
+      - 'tools/apply_resident_draft_bridge_stage.py'
+      - '.github/workflows/resident-draft-bridge-stage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/resident-sampled-draft
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply guarded bridge patch
+        run: python3 tools/apply_resident_draft_bridge_stage.py
+      - name: Syntax lint and structural contract
+        run: |
+          python -m pip install --quiet ruff
+          python -m py_compile local/k3_local.py
+          ruff check local/k3_local.py
+          python - <<'PY'
+          import importlib.util, sys
+          from pathlib import Path
+          spec=importlib.util.spec_from_file_location('k3_local_rd','local/k3_local.py')
+          mod=importlib.util.module_from_spec(spec); sys.modules[spec.name]=mod
+          spec.loader.exec_module(mod)
+          cfg=mod.BackendConfig(model_dir=Path('/m'),trunk_dir=Path('/t'),binary=Path('/b'),
+              resident_worker=True,worker_binary=Path('/w'),worker_context=64,
+              draft_trunk=Path('/d'),draft_trunk_gb=2,draft_topk=2,spec=3,
+              trunk_gb=1,cache_gb=1)
+          obj=object.__new__(mod.ResidentCBackend); obj.cfg=cfg; obj.context=64
+          cmd=obj._command()
+          assert '--draft-trunk' in cmd and '/d' in cmd
+          assert cmd[cmd.index('--draft-topk')+1]=='2'
+          assert cmd[cmd.index('--spec')+1]=='3'
+          print('resident draft bridge command: PASS')
+          PY
+      - name: Commit validated bridge
+        run: |
+          git config user.name Speedstu
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add local/k3_local.py
+          git diff --cached --quiet || git commit -m 'feat: expose resident sampled draft through localhost bridge'
+          git push origin HEAD:feature/resident-sampled-draft
