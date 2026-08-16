@@ -195,9 +195,9 @@ def is_reqn(eng: str, name: str) -> bool:
 
 
 # ---------------------------------------------------------------- build
-def build(seed: int):
+def build(seed: int, dense_intermediate: int = 96):
     torch.manual_seed(seed)
-    cfg = tiny_config(moe_intermediate_size=64)
+    cfg = tiny_config(moe_intermediate_size=64, intermediate_size=dense_intermediate)
     model = K3Model(cfg).to(torch.float32).eval()
     with torch.no_grad():
         for name, p in model.named_parameters():
@@ -236,10 +236,14 @@ def main():
     ap.add_argument("out_dir")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--prompt-ids", default="3,7,11,5,9")
+    ap.add_argument("--dense-intermediate", type=int, default=96,
+                    help="dense layer-0 intermediate width; 512 mimics K3's oversized first layer")
     a = ap.parse_args()
 
+    if a.dense_intermediate <= 0:
+        ap.error("--dense-intermediate must be positive")
     os.makedirs(a.out_dir, exist_ok=True)
-    cfg, model = build(a.seed)
+    cfg, model = build(a.seed, a.dense_intermediate)
     ids = [int(v) for v in a.prompt_ids.split(",") if v != ""]
     print("model: hidden %d, layers %d, vocab %d, experts %d, moe_inter %d" %
           (cfg.hidden_size, cfg.num_hidden_layers, cfg.vocab_size,

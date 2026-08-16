@@ -100,10 +100,12 @@ typedef struct {
      * Uniform slots everywhere would size EVERY slot for layer 0, whose dense MLP makes
      * it 2.34 GB against 1.27 GB for a normal layer, wasting about half the budget. */
     unsigned char **pin;        /* [npin] one exact allocation per pinned layer */
-    unsigned char *arena;       /* [nslot] uniform RECONSTRUCTED ring slots     */
+    unsigned char *arena;       /* shared reconstructed streaming arena        */
     unsigned char *codec_arena; /* [nslot] compressed-block O_DIRECT scratch     */
-    int64_t      slot_bytes;    /* raw run + the widen area                     */
+    int64_t      slot_bytes;    /* logical normal-layer slot + widen area       */
+    int64_t      arena_bytes;   /* physical bytes allocated for arena            */
     int64_t      widen_bytes;   /* of slot_bytes, the fp32 expansion area       */
+    int          split_first;   /* layer 0 uses whole arena, then it becomes 2 slots */
     int64_t      codec_slot_bytes; /* max stored block, counted inside budget    */
     int          nslot;
     int          npin;          /* layers 0..npin-1 are pinned                  */

@@ -1,0 +1,117 @@
+name: Split ring exact parity
+
+on:
+  push:
+    branches: [speedboost/laptop-split-ring]
+    paths:
+      - 'src/io/k3_trunk.c'
+      - 'src/io/k3_trunk.h'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/split-ring-parity.yml'
+  pull_request:
+    paths:
+      - 'src/io/k3_trunk.c'
+      - 'src/io/k3_trunk.h'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/split-ring-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fat-layer0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build engine and fat-layer0 tiny fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' -j2
+          rm -rf /tmp/k3fat /tmp/k3fat-trunk /tmp/split-ring
+          mkdir -p /tmp/split-ring
+          python tools/make_tiny_checkpoint.py /tmp/k3fat --seed 1234 \
+            --prompt-ids 3,7,11 --dense-intermediate 512
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3fat/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3fat /tmp/k3fat-trunk "$NLAYERS"
+          python - <<'PY'
+          import json
+          j=json.load(open('/tmp/k3fat-trunk/trunk.json'))
+          s=[int(x['nbytes']) for x in j['layers']]
+          print('fat tiny layer bytes:',s)
+          print('layer0/max-rest:',s[0],max(s[1:]),s[0]/max(s[1:]))
+          assert s[0] > 1.5*max(s[1:]), (s[0],max(s[1:]))
+          PY
+
+      - name: Find one-slot budget and prove split-ring exactness
+        run: |
+          set -euo pipefail
+          MODEL=/tmp/k3fat
+          TRUNK=/tmp/k3fat-trunk
+          DIR=/tmp/split-ring
+          CHOSEN=''
+          # Decimal GB. The sweep is intentionally tiny-model-specific; the condition,
+          # not a magic budget, decides which point is valid.
+          for B in 0.00055 0.00060 0.00065 0.00070 0.00075 0.00080 0.00090 0.00100 0.00120; do
+            echo "=== probing trunk budget $B GB ==="
+            set +e
+            K3_NO_SPLIT_RING=1 ./bin/k3 "$MODEL" --trunk "$TRUNK" \
+              --trunk-gb "$B" --cache-gb 0.001 --ids 3,7,11 --gen 1 \
+              --incremental --threads 1 --out "$DIR/old-probe.json" >"$DIR/old-$B.log" 2>&1
+            ro=$?
+            ./bin/k3 "$MODEL" --trunk "$TRUNK" \
+              --trunk-gb "$B" --cache-gb 0.001 --ids 3,7,11 --gen 1 \
+              --incremental --threads 1 --out "$DIR/new-probe.json" >"$DIR/new-$B.log" 2>&1
+            rn=$?
+            set -e
+            if [ "$ro" -eq 0 ] && [ "$rn" -eq 0 ] \
+               && grep -q 'ring 1 slots' "$DIR/old-$B.log" \
+               && grep -q 'split-first arena:' "$DIR/new-$B.log" \
+               && grep -q 'ring 2 slots' "$DIR/new-$B.log"; then
+              CHOSEN=$B
+              echo "selected $B GB: old=1 slot, split=2 slots"
+              cat "$DIR/old-$B.log" | grep -E 'trunk stream|pinned .*ring' || true
+              cat "$DIR/new-$B.log" | grep -E 'trunk stream|split-first arena|pinned .*ring' || true
+              break
+            fi
+          done
+          test -n "$CHOSEN" || { echo 'no budget activated split ring against a one-slot baseline'; exit 1; }
+          echo "$CHOSEN" > "$DIR/budget.txt"
+
+          B=$CHOSEN
+          K3_NO_SPLIT_RING=1 ./bin/k3 "$MODEL" --trunk "$TRUNK" \
+            --trunk-gb "$B" --cache-gb 0.001 --ids 3,7,11 --gen 8 \
+            --incremental --threads 1 --dump-logits "$DIR/old.logits" \
+            --out "$DIR/old.json" >"$DIR/old-final.log" 2>&1
+          ./bin/k3 "$MODEL" --trunk "$TRUNK" \
+            --trunk-gb "$B" --cache-gb 0.001 --ids 3,7,11 --gen 8 \
+            --incremental --threads 1 --dump-logits "$DIR/new.logits" \
+            --out "$DIR/new.json" >"$DIR/new-final.log" 2>&1
+
+          cmp "$DIR/old.logits" "$DIR/new.logits"
+          python - <<'PY'
+          import json
+          d='/tmp/split-ring'
+          a=json.load(open(d+'/old.json'))
+          b=json.load(open(d+'/new.json'))
+          assert a['generated_ids']==b['generated_ids'],(a['generated_ids'],b['generated_ids'])
+          print('split-ring generated ids:',a['generated_ids'])
+          PY
+          grep -q 'ring 1 slots' "$DIR/old-final.log"
+          grep -q 'split-first arena:' "$DIR/new-final.log"
+          grep -q 'ring 2 slots' "$DIR/new-final.log"
+          echo 'split-ring logits + 8-token parity: PASS'
+
+      - name: Weightless regression suite
+        run: make test -j2

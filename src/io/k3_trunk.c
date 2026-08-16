@@ -309,9 +309,45 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         ring_slot = rs; npin = np;
     }
 
+    /* Low-RAM special case: on released K3 layer 0 is the only dense layer and
+     * is roughly twice a normal MoE trunk layer. At the laptop floor that one oversized
+     * layer forces a single ~2.37 GB ring slot, which disables all read/compute overlap.
+     *
+     * Reuse, rather than add, memory: layer 0 gets the whole arena synchronously. Once
+     * its compute is finished, the exact same bytes are viewed as two smaller slots for
+     * layers 1..N-1, enabling the existing one-layer-ahead reader without raising the
+     * trunk budget. K3_NO_SPLIT_RING=1 restores the old one-slot planner for A/B tests.
+     * The first layer must truly be oversized, otherwise this mode buys nothing. */
+    int split_first = 0;
+    int64_t arena_bytes = (int64_t)RING * ring_slot;
+    if (!getenv("K3_NO_SPLIT_RING") && RING == 1 && npin == 0 && tr->n_layers > 1) {
+        int64_t rest_big = 0;
+        for (int i = 1; i < tr->n_layers; i++)
+            if (tr->lay[i].nbytes > rest_big) rest_big = tr->lay[i].nbytes;
+        int64_t rest_slot = (rest_big + K3_TRUNK_ALIGN - 1)
+                            & ~(int64_t)(K3_TRUNK_ALIGN - 1);
+        rest_slot += (int64_t)widen;
+        rest_slot = (rest_slot + 4095) & ~(int64_t)4095;
+        int64_t first_slot = (tr->lay[0].nbytes + K3_TRUNK_ALIGN - 1)
+                             & ~(int64_t)(K3_TRUNK_ALIGN - 1);
+        first_slot += (int64_t)widen;
+        first_slot = (first_slot + 4095) & ~(int64_t)4095;
+        const int64_t two_rest = 2 * rest_slot;
+        const int64_t shared = first_slot > two_rest ? first_slot : two_rest;
+        const int64_t split_need = shared + 2 * codec_slot;
+        if (rest_big > 0 && first_slot > rest_slot && split_need <= budget_bytes) {
+            split_first = 1;
+            RING = 2;
+            ring_slot = rest_slot;
+            arena_bytes = shared;
+        }
+    }
+
     tr->npin = npin;
     tr->nslot = RING;
     tr->slot_bytes = ring_slot;
+    tr->arena_bytes = arena_bytes;
+    tr->split_first = split_first;
     tr->codec_slot_bytes = codec_slot;
 
     tr->pin = (unsigned char **)calloc((size_t)(npin ? npin : 1), sizeof(unsigned char *));
@@ -325,9 +361,9 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             return -1;
         }
     }
-    if (k3_alloc_direct((void **)&tr->arena, (size_t)RING * (size_t)ring_slot) != 0) {
-        fprintf(stderr, "k3_trunk: cannot allocate the %.2f GB streaming ring\n",
-                (double)RING * ring_slot / 1e9);
+    if (k3_alloc_direct((void **)&tr->arena, (size_t)arena_bytes) != 0) {
+        fprintf(stderr, "k3_trunk: cannot allocate the %.2f GB streaming arena\n",
+                (double)arena_bytes / 1e9);
         return -1;
     }
     if (codec_slot > 0 &&
@@ -379,6 +415,10 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
            "ring %d x %.2f GB\n",
            (double)total / 1e9, (double)stored_total / 1e9, npin, tr->n_layers,
            RING, (double)ring_slot / 1e9);
+    if (split_first)
+        printf("              split-first arena: layer 0 uses %.2f GB whole, then layers 1..%d "
+               "reuse it as 2 x %.2f GB slots (no extra trunk RAM)\n",
+               (double)arena_bytes / 1e9, tr->n_layers - 1, (double)ring_slot / 1e9);
     if (codec_slot > 0)
         printf("              lossless dict15 blocks: %.2f GB codec scratch per ring slot "
                "(counted in trunk budget)\n", (double)codec_slot / 1e9);
@@ -572,7 +612,32 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
     k3_trunk_binds++;
     unsigned char *base;
 
-    if (L < tr->npin) {
+    if (tr->split_first && L == 0) {
+        /* The previous token must have consumed its last prefetch before the whole arena
+         * can be reused for layer 0. Drain defensively: a future caller that changes the
+         * walk order must fail here rather than overwrite an in-flight read. */
+        K3TrunkIO *io = (K3TrunkIO *)tr->io_state;
+        if (io) {
+            pthread_mutex_lock(&io->mu);
+            while (io->busy && !io->stop)
+                pthread_cond_wait(&io->cv, &io->mu);
+            const int bad = io->stop || (io->done && io->result != 0);
+            io->done = 0;                 /* any successful unused prefetch is discarded */
+            pthread_mutex_unlock(&io->mu);
+            if (bad) {
+                fprintf(stderr, "k3_trunk: split-ring reader failed before layer 0\n");
+                return -1;
+            }
+        }
+        for (int i = 0; i < tr->nslot; i++) {
+            if (tr->layer_of[i] >= 0) tr->slot_of[tr->layer_of[i]] = -1;
+            tr->layer_of[i] = -1;
+        }
+        tr->ring = 0;
+        if (load_run(tr, 0, tr->arena, 0) != 0) return -1;
+        tr->misses++;
+        base = tr->arena;
+    } else if (L < tr->npin) {
         base = tr->pin[L];
         if (tr->slot_of[L] < 0) {            /* first touch: load once, keep forever */
             if (load_run(tr, L, base, 0) != 0) return -1;
@@ -623,6 +688,10 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
 void k3_trunk_prefetch(K3Trunk *tr, int L)
 {
     if (L < 0 || L >= tr->n_layers || L < tr->npin) return;
+    /* forward() asks for L+1 immediately after binding L. In split-first mode layer 0
+     * still occupies the WHOLE shared arena at that point, so L1 deliberately loads
+     * synchronously only after layer0 compute returns. From L1 onward two slots exist. */
+    if (tr->split_first && L == 1) return;
     for (int i = 0; i < tr->nslot; i++) if (tr->layer_of[i] == L) return;
 
     K3TrunkIO *io = (K3TrunkIO *)tr->io_state;
