@@ -1,0 +1,169 @@
+name: Windows lazy KV parity
+
+on:
+  push:
+    branches: [main, 'feature/**']
+    paths:
+      - 'include/sys/mman.h'
+      - 'src/cli/k3_worker.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - 'tools/qdq_trunk.py'
+      - '.github/workflows/windows-lazy-kv.yml'
+  pull_request:
+    paths:
+      - 'include/sys/mman.h'
+      - 'src/cli/k3_worker.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - 'tools/qdq_trunk.py'
+      - '.github/workflows/windows-lazy-kv.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native-1m-reserve:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          path-type: inherit
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+
+      - name: Strict native build
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          make CC=gcc ARCH='-march=native' \
+            CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -march=native -fopenmp -pthread -ffp-contract=off' \
+            -j2
+
+      - name: Generate tiny exact and Q4 draft trunks
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy psutil
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf .win-lazy
+          mkdir -p .win-lazy
+          python tools/make_tiny_checkpoint.py .win-lazy/k3tiny --seed 1234 --prompt-ids 3,7,11
+          NLAYERS=$(python -c "import json; print(json.load(open('.win-lazy/k3tiny/config.json'))['num_hidden_layers'])")
+          python tools/pack_trunk.py .win-lazy/k3tiny .win-lazy/k3trunk "$NLAYERS"
+          python tools/qdq_trunk.py .win-lazy/k3trunk .win-lazy/k3draft --bits 4 --group 0
+
+      - name: One-million capacity reserves VA without one-million-row commit
+        shell: pwsh
+        run: |
+          @'
+          import json
+          import psutil
+          import re
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          ROOT=Path.cwd()
+          MODEL=str((ROOT/'.win-lazy/k3tiny').resolve())
+          TRUNK=str((ROOT/'.win-lazy/k3trunk').resolve())
+          DRAFT=str((ROOT/'.win-lazy/k3draft').resolve())
+          K3=str((ROOT/'bin/k3.exe').resolve())
+          WORKER=str((ROOT/'bin/k3-worker.exe').resolve())
+          BASE=[MODEL,'--trunk',TRUNK,'--trunk-gb','0.05','--cache-gb','0.05',
+                '--draft-trunk',DRAFT,'--draft-trunk-gb','0.05',
+                '--draft-topk','1','--spec','2','--threads','2']
+
+          def start(context):
+              p=subprocess.Popen([WORKER,*BASE,'--context',str(context),
+                                   '--prefill-mb','32'],
+                                  stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT,text=True,bufsize=1)
+              assert p.stdin and p.stdout
+              reserve_gib=None
+              lines=[]
+              for line in p.stdout:
+                  lines.append(line.rstrip())
+                  m=re.search(r'context\s+\d+\s+reserves\s+([0-9.]+)\s+GiB',line)
+                  if m: reserve_gib=float(m.group(1))
+                  if line.startswith('@K3READY '):
+                      proc=psutil.Process(p.pid)
+                      time.sleep(.15)
+                      private=getattr(proc.memory_info(),'private',proc.memory_info().vms)
+                      return p,proc,private,reserve_gib,lines
+              raise AssertionError('worker exited before READY: '+repr(lines[-20:]))
+
+          def quit_worker(p):
+              if p.poll() is None:
+                  p.stdin.write('QUIT\n'); p.stdin.flush()
+                  for line in p.stdout:
+                      if line.startswith('@K3BYE'): break
+                  p.wait(timeout=10)
+              assert p.returncode==0,p.returncode
+
+          small,sp,spriv,sgib,slines=start(64)
+          quit_worker(small)
+
+          large,lp,lpriv,lgib,llines=start(1048576)
+          delta=lpriv-spriv
+          print(f'startup private context64  : {spriv/2**20:.1f} MiB')
+          print(f'startup private context1M  : {lpriv/2**20:.1f} MiB')
+          print(f'startup private delta      : {delta/2**20:.1f} MiB')
+          print(f'virtual reservation/model  : {lgib} GiB')
+          if lgib is None or lgib < 0.25:
+              raise AssertionError(f'1M test reservation is too small to be meaningful: {lgib}')
+          # seq/req arrays plus cached-scratch sizing may add a few MiB, but untouched KV
+          # must not add hundreds of MiB or GiB of private commit.
+          if delta > 256*2**20:
+              raise AssertionError(f'1M context committed too much at startup: {delta/2**20:.1f} MiB')
+
+          def request(p, rid, ids, gen, temp, top_p, seed):
+              p.stdin.write(f'REQ {rid} {len(ids)} {gen} {temp} {top_p} {seed} -1\n')
+              p.stdin.write(' '.join(map(str,ids))+'\n'); p.stdin.flush()
+              out=[]; reused=None
+              for line in p.stdout:
+                  if line.startswith(f'@K3TOKEN {rid} '): out.append(int(line.split()[2]))
+                  elif line.startswith(f'@K3ERROR {rid} '): raise AssertionError(line)
+                  elif line.startswith(f'@K3DONE {rid} '):
+                      reused=int(line.split()[4]); break
+              return out,reused
+
+          ids=[3,7,11]
+          got,reused=request(large,1,ids,6,1.0,.95,987654)
+          if reused != 0: raise AssertionError(reused)
+          time.sleep(.1)
+          after=lp.memory_info().private
+          print(f'private after real request : {after/2**20:.1f} MiB')
+
+          with tempfile.TemporaryDirectory() as td:
+              out=Path(td)/'run.json'
+              subprocess.run([K3,*BASE,'--ids',','.join(map(str,ids)),'--gen','6',
+                              '--incremental','--temperature','1.0','--top-p','.95',
+                              '--seed','987654','--out',str(out)],check=True,
+                             stdout=subprocess.DEVNULL)
+              ref=json.loads(out.read_text())['generated_ids']
+          if got != ref: raise AssertionError((got,ref))
+
+          # Exercise decommit + recommit: RESET must not invalidate the reservation, and
+          # the same exact request must still match after pages were returned.
+          large.stdin.write('RESET\n'); large.stdin.flush()
+          for line in large.stdout:
+              if line.startswith('@K3RESET'): break
+          time.sleep(.1)
+          reset_private=lp.memory_info().private
+          print(f'private after RESET        : {reset_private/2**20:.1f} MiB')
+          got2,reused2=request(large,2,ids,6,1.0,.95,987654)
+          if reused2 != 0 or got2 != ref: raise AssertionError((got2,ref,reused2))
+          quit_worker(large)
+
+          print('native Windows 1M reserve + on-demand commit + reset/recommit parity: PASS')
+          '@ | python -
