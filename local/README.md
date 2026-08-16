@@ -186,9 +186,13 @@ worker with `--context 1048576`, performs an exact request, and rejects `1048577
 model allocation. This validates the capacity mechanism, not the feasibility of filling a
 million positions with the released model.
 
-The worker reserves KV address space lazily, and prompt prefill is processed in fixed
-64-token chunks so hidden/residual/scratch buffers no longer scale with the whole configured
-capacity. A conversation reset zeros only true KDA recurrent/ShortConv state: setting
+The worker reserves KV address space lazily. Prompt prefill is also RAM-bounded, but no
+longer hard-coded to 64 tokens: by default `--prefill-mb 256` chooses the largest batch
+(up to 8192 tokens) whose hidden/residual/scratch estimate fits that transient budget. If
+an allocation still fails because of fragmentation/rlimits, the worker halves the chunk
+until it fits. Larger chunks matter because every chunk is another whole-model/trunk sweep;
+the right value is therefore a direct RAM-vs-I/O speed tradeoff. A conversation reset
+zeros only true KDA recurrent/ShortConv state: setting
 `cached=0` makes old MLA KV rows unreachable, and every row used by the next conversation
 is fully overwritten before it can be read. On anonymous mappings the worker also gives
 the actually-touched dead KV pages back to the OS with best-effort `MADV_DONTNEED`, rather
@@ -212,6 +216,30 @@ The older disk-backed prefix cache remains available with `--no-resident-worker`
 
 That fallback is useful for A/B tests and can retain multiple prefixes, but the resident
 worker is the low-latency path for the normal linear Kimi Code tool loop.
+
+### Prefill speed tuning
+
+The localhost server exposes the same controls:
+
+```bash
+--prefill-mb 256        # automatic transient-RAM budget, normal path
+--prefill-chunk 512     # manual override for measurement/debugging
+```
+
+Do not assume that the largest chunk is fastest: resident trunk pages, expert-cache size,
+NVMe bandwidth and available RAM all matter. Measure the actual machine with an already
+tokenised representative prompt:
+
+```bash
+python benchmarks/prefill-sweep.py ~/k3model ~/k3trunk-lossless prompt.ids \
+  --trunk-gb 3 --cache-gb 1 --budgets 64,128,256,512,1024 --repeats 2
+```
+
+The sweep starts the same local `k3-worker` for each budget, refuses to rank a candidate if
+its greedy token differs from the baseline, and prints the median request time plus the
+selected chunk. Use the recommended `--prefill-mb` for that PC/workload. Permanent CI also
+checks manual 1/16/64/128 and automatic chunks against one-shot exact K3, including the
+`temperature=1` sampled-draft path.
 
 ## Sampling correctness
 
