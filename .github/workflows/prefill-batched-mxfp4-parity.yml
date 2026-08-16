@@ -1,0 +1,101 @@
+name: Batched MXFP4 prefill parity
+
+on:
+  push:
+    branches: [speedboost/prefill-batched-mxfp4]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'tools/patch_prefill_batched_mxfp4.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-mxfp4-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-mxfp4-parity.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Apply batched MXFP4 source transform once
+        run: python tools/patch_prefill_batched_mxfp4.py
+
+      - name: Strict AVX2 build and weightless tests
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build repeated-expert streamed prefill fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3batch /tmp/k3batch-trunk /tmp/k3batch-out
+          mkdir -p /tmp/k3batch-out
+          # topk == num_experts guarantees that every prompt token reuses every expert,
+          # so the batched compute path is exercised rather than merely being compiled.
+          python tools/make_tiny_checkpoint.py /tmp/k3batch \
+            --seed 2026 --num-experts 8 --topk 8 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3batch/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3batch /tmp/k3batch-trunk "$NLAYERS"
+
+      - name: Per-token vs batched MXFP4 prefill are binary-identical
+        run: |
+          set -euo pipefail
+          D=/tmp/k3batch-out
+          COMMON='/tmp/k3batch --trunk /tmp/k3batch-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --gen 1 --incremental --threads 1 --temperature 0'
+
+          /usr/bin/time -f 'old_wall=%e' -o "$D/old.time" \
+            env K3_NO_PREFILL_BATCH_MXFP4=1 ./bin/k3 $COMMON \
+            --dump-logits "$D/old.logits" --out "$D/old.json" >"$D/old.log" 2>&1
+          /usr/bin/time -f 'batch_wall=%e' -o "$D/batch.time" \
+            ./bin/k3 $COMMON \
+            --dump-logits "$D/batch.logits" --out "$D/batch.json" >"$D/batch.log" 2>&1
+
+          cmp "$D/old.logits" "$D/batch.logits"
+          python3 - <<'PY'
+          import json
+          d='/tmp/k3batch-out'
+          a=json.load(open(d+'/old.json')); b=json.load(open(d+'/batch.json'))
+          assert a['generated_ids'] == b['generated_ids'], (a['generated_ids'], b['generated_ids'])
+          assert a['full_ids'] == b['full_ids']
+          print('binary logits: PASS')
+          print('generated/full ids: PASS')
+          print(open(d+'/old.time').read().strip())
+          print(open(d+'/batch.time').read().strip())
+          print('BATCHED MXFP4 PREFILL EXACTNESS PASS')
+          PY
+
+      - name: Commit generated source after all gates pass
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/core/k3_ops.c; then
+            echo 'source already committed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/core/k3_ops.c
+          git commit -m 'perf: batch exact MXFP4 expert compute across prefill tokens'
+          git push origin HEAD:${{ github.ref_name }}
