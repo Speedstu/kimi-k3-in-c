@@ -20,6 +20,19 @@ jobs:
       - name: Apply Q4 draft patch
         run: python3 tools/apply_q4_draft_stage.py .
 
+      - name: Fix staging-only binder typos
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/model/k3_bind.c')
+          s = p.read_text()
+          s = s.replace('const unsigned char b = pk[j >> 1];\n                    const int nib = (j & 1) ? (b >> 4) : (b & 0x0f);',
+                        'const unsigned char qb = pk[j >> 1];\n                    const int nib = (j & 1) ? (qb >> 4) : (qb & 0x0f);')
+          s = s.replace('fprintf(stderr, "k3_bind_mem: layer %d mixes I8R and Q4G matrices\n", L);',
+                        'fprintf(stderr, "k3_bind_mem: layer %d mixes I8R and Q4G matrices\\n", L);')
+          p.write_text(s)
+          PY
+
       - name: Check Q4 packer syntax
         run: python3 -m py_compile tools/q4_trunk.py
 
