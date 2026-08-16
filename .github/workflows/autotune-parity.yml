@@ -5,6 +5,8 @@ on:
     paths:
       - 'benchmarks/autotune.py'
       - '.github/workflows/autotune-parity.yml'
+      - 'README.md'
+      - 'docs/AUTOTUNE.md'
       - 'src/**'
       - 'include/**'
       - 'tools/make_tiny_checkpoint.py'
@@ -59,3 +61,17 @@ jobs:
           assert len(x['runs']) >= 6, len(x['runs'])
           print('AUTOTUNE PARITY PASS', x['recommended'])
           PY
+
+  windows-python-cli:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Python syntax and CLI parsing
+        shell: pwsh
+        run: |
+          python -m py_compile benchmarks/autotune.py
+          python benchmarks/autotune.py --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
