@@ -1,0 +1,108 @@
+name: Resident worker parity
+
+on:
+  push:
+    branches: [main, 'feature/**']
+    paths:
+      - 'src/cli/k3_worker.c'
+      - 'src/cli/k3_run.c'
+      - 'src/core/k3_sample.c'
+      - 'Makefile'
+      - 'CMakeLists.txt'
+      - '.github/workflows/worker-parity.yml'
+  pull_request:
+    paths:
+      - 'src/cli/k3_worker.c'
+      - 'src/cli/k3_run.c'
+      - 'src/core/k3_sample.c'
+      - 'Makefile'
+      - 'CMakeLists.txt'
+      - '.github/workflows/worker-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  tiny-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Dependencies and build
+        run: |
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+      - name: Generate tiny K3 and packed trunk
+        run: |
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3tiny-trunk "$NLAYERS"
+      - name: Resident worker equals one-shot exact engine
+        run: |
+          python - <<'PY'
+          import json, subprocess, tempfile
+
+          MODEL='/tmp/k3tiny'; TRUNK='/tmp/k3tiny-trunk'
+          COMMON=[MODEL,'--trunk',TRUNK,'--trunk-gb','0.05','--cache-gb','0.05']
+
+          def oneshot(ids, gen, temp=0.0, top_p=1.0, seed=1):
+              with tempfile.NamedTemporaryFile(suffix='.json') as f:
+                  cmd=['./bin/k3',*COMMON,'--ids',','.join(map(str,ids)),'--gen',str(gen),
+                       '--incremental','--temperature',str(temp),'--top-p',str(top_p),
+                       '--seed',str(seed),'--out',f.name]
+                  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL)
+                  return json.load(open(f.name))['generated_ids']
+
+          p=subprocess.Popen(['./bin/k3-worker',*COMMON,'--context','64'],
+                             stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT,text=True,bufsize=1)
+          assert p.stdin and p.stdout
+          for line in p.stdout:
+              if line.startswith('@K3READY '): break
+          else: raise AssertionError('worker exited before READY')
+
+          rid=0
+          def req(ids, gen, temp=0.0, top_p=1.0, seed=1):
+              nonlocal_rid[0]+=1; r=nonlocal_rid[0]
+              p.stdin.write(f'REQ {r} {len(ids)} {gen} {temp} {top_p} {seed} -1\n')
+              p.stdin.write(' '.join(map(str,ids))+'\n'); p.stdin.flush()
+              out=[]; reused=None
+              for line in p.stdout:
+                  if line.startswith(f'@K3TOKEN {r} '): out.append(int(line.split()[2]))
+                  elif line.startswith(f'@K3ERROR {r} '): raise AssertionError(line)
+                  elif line.startswith(f'@K3DONE {r} '):
+                      reused=int(line.split()[4]); break
+              return out,reused
+          nonlocal_rid=[0]
+
+          a=[3,7,11]
+          w1,reuse=req(a,2); ref1=oneshot(a,2)
+          assert w1==ref1,(w1,ref1); assert reuse==0
+
+          b=a+w1+[5,9]
+          w2,reuse=req(b,3); ref2=oneshot(b,3)
+          assert w2==ref2,(w2,ref2); assert reuse==1
+
+          c=[3,7,12]
+          w3,reuse=req(c,2); ref3=oneshot(c,2)
+          assert w3==ref3,(w3,ref3); assert reuse==0
+
+          p.stdin.write('RESET\n'); p.stdin.flush()
+          for line in p.stdout:
+              if line.startswith('@K3RESET'): break
+          w4,reuse=req(a,5,1.0,.95,424242); ref4=oneshot(a,5,1.0,.95,424242)
+          assert w4==ref4,(w4,ref4); assert reuse==0
+
+          p.stdin.write('QUIT\n'); p.stdin.flush(); p.wait(timeout=10)
+          assert p.returncode==0
+          print('resident worker parity: PASS',w1,w2,w3,w4)
+          PY
