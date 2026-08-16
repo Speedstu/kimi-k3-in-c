@@ -3,10 +3,8 @@ name: Batched MXFP4 prefill parity
 on:
   workflow_dispatch:
   push:
-    branches: [speedboost/prefill-batched-mxfp4]
     paths:
       - 'src/core/k3_ops.c'
-      - 'tools/patch_prefill_batched_mxfp4.py'
       - 'tools/make_tiny_checkpoint.py'
       - '.github/workflows/prefill-batched-mxfp4-parity.yml'
   pull_request:
@@ -16,7 +14,7 @@ on:
       - '.github/workflows/prefill-batched-mxfp4-parity.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   exactness:
@@ -24,15 +22,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
-
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-
-      - name: Apply batched MXFP4 source transform once
-        run: python tools/patch_prefill_batched_mxfp4.py
 
       - name: Strict AVX2 build and weightless tests
         run: |
@@ -64,41 +56,26 @@ jobs:
         run: |
           set -euo pipefail
           D=/tmp/k3batch-out
-          COMMON='/tmp/k3batch --trunk /tmp/k3batch-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --gen 1 --incremental --threads 1 --temperature 0'
+          BASE='/tmp/k3batch --trunk /tmp/k3batch-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --gen 1 --incremental --temperature 0'
 
-          /usr/bin/time -f 'old_wall=%e' -o "$D/old.time" \
-            env K3_NO_PREFILL_BATCH_MXFP4=1 ./bin/k3 $COMMON \
-            --dump-logits "$D/old.logits" --out "$D/old.json" >"$D/old.log" 2>&1
-          /usr/bin/time -f 'batch_wall=%e' -o "$D/batch.time" \
-            ./bin/k3 $COMMON \
-            --dump-logits "$D/batch.logits" --out "$D/batch.json" >"$D/batch.log" 2>&1
+          for T in 1 4; do
+            /usr/bin/time -f "old_t${T}_wall=%e" -o "$D/old-t${T}.time" \
+              env K3_NO_PREFILL_BATCH_MXFP4=1 ./bin/k3 $BASE --threads "$T" \
+              --dump-logits "$D/old-t${T}.logits" --out "$D/old-t${T}.json" >"$D/old-t${T}.log" 2>&1
+            /usr/bin/time -f "batch_t${T}_wall=%e" -o "$D/batch-t${T}.time" \
+              ./bin/k3 $BASE --threads "$T" \
+              --dump-logits "$D/batch-t${T}.logits" --out "$D/batch-t${T}.json" >"$D/batch-t${T}.log" 2>&1
 
-          cmp "$D/old.logits" "$D/batch.logits"
-          python3 - <<'PY'
-          import json
-          d='/tmp/k3batch-out'
-          a=json.load(open(d+'/old.json')); b=json.load(open(d+'/batch.json'))
+            cmp "$D/old-t${T}.logits" "$D/batch-t${T}.logits"
+            python3 - "$T" <<'PY'
+          import json, sys
+          d='/tmp/k3batch-out'; t=sys.argv[1]
+          a=json.load(open(f'{d}/old-t{t}.json')); b=json.load(open(f'{d}/batch-t{t}.json'))
           assert a['generated_ids'] == b['generated_ids'], (a['generated_ids'], b['generated_ids'])
           assert a['full_ids'] == b['full_ids']
-          print('binary logits: PASS')
-          print('generated/full ids: PASS')
-          print(open(d+'/old.time').read().strip())
-          print(open(d+'/batch.time').read().strip())
-          print('BATCHED MXFP4 PREFILL EXACTNESS PASS')
+          print(f'threads={t}: binary logits + ids PASS')
+          print(open(f'{d}/old-t{t}.time').read().strip())
+          print(open(f'{d}/batch-t{t}.time').read().strip())
           PY
-
-      - name: Commit generated source after all gates pass
-        if: github.event_name == 'push'
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- src/core/k3_ops.c; then
-            echo 'source already committed'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/core/k3_ops.c
-          git commit -m 'perf: batch exact MXFP4 expert compute across prefill tokens'
-          git fetch origin "${{ github.ref_name }}"
-          git rebase "origin/${{ github.ref_name }}"
-          git push origin HEAD:${{ github.ref_name }}
+          done
+          echo 'BATCHED MXFP4 PREFILL EXACTNESS PASS (1 + 4 threads)'
