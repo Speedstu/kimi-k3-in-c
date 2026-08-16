@@ -2,7 +2,7 @@ name: Local K3 parity
 
 on:
   push:
-    branches: [main, feature/local-k3-max-parity]
+    branches: [main, 'feature/**']
     paths:
       - 'src/**'
       - 'include/**'
@@ -138,6 +138,20 @@ jobs:
           assert r['generated_ids']==f['generated_ids'], (r['generated_ids'],f['generated_ids'])
           assert r['full_ids']==f['full_ids'], (r['full_ids'],f['full_ids'])
           print('save/resume exact parity: PASS', r['generated_ids'])
+          PY
+      - name: C token stream contains exactly the committed generated ids
+        run: |
+          ./bin/k3 /tmp/k3tiny --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+            --ids 3,7,11,5,9 --gen 5 --incremental --temperature 0 --stream-tokens \
+            --out /tmp/stream.json >/tmp/stream.log
+          python - <<'PY'
+          import json
+          expected=json.load(open('/tmp/stream.json'))['generated_ids']
+          got=[]
+          for line in open('/tmp/stream.log'):
+              if line.startswith('@K3TOKEN '): got.append(int(line.split()[1]))
+          assert got==expected, (got,expected)
+          print('committed token streaming: PASS', got)
           PY
       - name: stop-id stops on the emitted token
         run: |

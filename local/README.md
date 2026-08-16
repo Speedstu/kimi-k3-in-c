@@ -184,6 +184,7 @@ The C engine now supports:
 --seed N
 --stop-id N
 --ids-file PATH
+--stream-tokens
 ```
 
 Temperature 0 remains the legacy exact greedy path. Temperature 1 / top-p 1 is the coding
@@ -195,17 +196,42 @@ both target and draft probabilities. Until that is implemented, asking for sampl
 `--spec` / `--draft-trunk` is rejected instead of silently changing the target
 distribution.
 
+## True committed-token streaming
+
+With `stream: true`, the bridge starts the C engine with `--stream-tokens`. After a token
+has been verified and committed to the C sequence/output buffers, the engine immediately
+flushes one machine-readable line:
+
+```text
+@K3TOKEN <token-id>
+```
+
+The marker is emitted **after commit**, not when a speculative draft merely proposes a
+token. Python ignores all other human CLI diagnostics, accumulates the committed ids,
+re-decodes them through the official local K3 tokenizer, and sends new
+`reasoning_content`, response text, and completed tool calls to Kimi Code as SSE deltas.
+
+Byte-level tokenization has one awkward edge: an incomplete UTF-8 byte sequence can decode
+temporarily as U+FFFD until the next token arrives. The bridge therefore holds only that
+unstable suffix and releases it as soon as the next token makes the text stable; it never
+sends a character it would later need to retract.
+
+If the SSE client disconnects, the callback aborts and the C child is terminated instead
+of continuing a multi-minute generation nobody is consuming. At normal completion the
+bridge also compares every streamed marker id with the final `generated_ids` JSON; any
+protocol drift is an error.
+
+The permanent tiny-checkpoint CI independently performs the same comparison, so true
+streaming is part of the correctness gate rather than a UI-only feature.
+
 ## Current gaps, stated explicitly
 
 - **Text/coding first:** image/video/audio message parts are rejected instead of discarded.
   K3's vision path still needs to be integrated locally.
-- **Buffered SSE today:** the HTTP endpoint speaks the streaming wire protocol, including
-  reasoning/tool-call deltas and usage, but the one-shot C CLI currently finishes the turn
-  before Python emits those chunks. A resident C worker with token-by-token output is the
-  next latency/UX step.
-- **Process startup per turn:** saved state avoids history recompute but the one-shot CLI
-  still reopens the checkpoint for each request. A resident worker is required to remove
-  that startup tax.
+- **Process startup per turn:** true token streaming is live now, and saved state avoids
+  recomputing exact conversation prefixes, but the one-shot C process still reopens the
+  checkpoint/index/trunk/cache for each HTTP request. A resident C worker is the next
+  latency step and will also preserve the warm expert cache between tool turns.
 - **Long context:** the exact expanded fp32 MLA cache is the current context-memory wall.
   A latent-cache kernel can reduce it dramatically, but it must be numerically gated
   before becoming a default.
