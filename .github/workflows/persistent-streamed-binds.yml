@@ -1,0 +1,149 @@
+name: Persistent streamed bind parity
+
+on:
+  push:
+    branches: [speedboost/persistent-streamed-binds]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply persistent-bind transform
+        run: python tools/patch_persistent_streamed_binds.py
+      - name: Strict AVX2 build and full oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+      - name: Build tiny exact streamed fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3persist /tmp/k3persist-trunk /tmp/k3persist-out
+          mkdir -p /tmp/k3persist-out
+          python tools/make_tiny_checkpoint.py /tmp/k3persist --seed 2080 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3persist/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3persist /tmp/k3persist-trunk "$NLAYERS"
+      - name: Persistent reuse removes repeated binder work without changing a token
+        run: |
+          set -euo pipefail
+          D=/tmp/k3persist-out
+          IDS='3,7,11,5,9,2,4,6,8,10,12,14'
+          BASE='/tmp/k3persist --trunk /tmp/k3persist-trunk --trunk-gb 0.001 --cache-gb 0.001 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 12 --incremental --threads 1 --temperature 0'
+          K3_NO_PERSIST_WIDEN=1 ./bin/k3 $BASE --out "$D/disabled.json" >"$D/disabled.log" 2>&1
+          ./bin/k3 $BASE --out "$D/enabled.json" >"$D/enabled.log" 2>&1
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          d=Path('/tmp/k3persist-out')
+          a=json.load(open(d/'disabled.json')); b=json.load(open(d/'enabled.json'))
+          assert b['generated_ids'] == a['generated_ids'], (a['generated_ids'],b['generated_ids'])
+          assert b['full_ids'] == a['full_ids']
+          off=(d/'disabled.log').read_text(); on=(d/'enabled.log').read_text()
+          p_off=re.search(r'prepared binds (\d+) built, (\d+) copied \((\d+) prepared on reader\)',off)
+          p_on=re.search(r'prepared binds (\d+) built, (\d+) copied \((\d+) prepared on reader\)',on)
+          reuse=re.search(r'persistent streamed binds: (\d+) layer templates, (\d+) reuses, ([0-9.]+) MiB widen restored',on)
+          cache=re.search(r'persistent streamed-bind cache: ([0-9.]+) MiB for (\d+) layer widen templates',on)
+          assert p_off and p_on and reuse and cache, on[-5000:]
+          off_built=int(p_off.group(1)); on_built=int(p_on.group(1))
+          cached=int(reuse.group(1)); reused=int(reuse.group(2)); restored=float(reuse.group(3))
+          cache_mib=float(cache.group(1)); layers=int(cache.group(2))
+          assert cache_mib > 0 and cache_mib < 64.0, cache_mib
+          assert cached > 0 and reused > 0 and restored > 0, reuse.groups()
+          assert on_built < off_built, (on_built,off_built)
+          # After warm-up each streamed layer should avoid repeated binder/widen work.
+          assert off_built - on_built >= reused // 2, (off_built,on_built,reused)
+          print('PERSISTENT STREAMED BIND EXACT PARITY PASS')
+          print({'cache_mib':cache_mib,'layers':layers,'disabled_builds':off_built,
+                 'enabled_builds':on_built,'cached_layers':cached,'reuses':reused,
+                 'restored_mib':restored})
+          PY
+      - name: Persist validated source and make gate permanent
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/io/k3_trunk.c src/io/k3_trunk.h
+          git commit -m 'perf: persist streamed trunk bind widening' || true
+          rm -f tools/patch_persistent_streamed_binds.py
+          cat > .github/workflows/persistent-streamed-binds.yml <<'YAML'
+          name: Persistent streamed bind parity
+          on:
+            workflow_dispatch:
+            pull_request:
+              paths:
+                - 'src/io/k3_trunk.c'
+                - 'src/io/k3_trunk.h'
+                - '.github/workflows/persistent-streamed-binds.yml'
+          permissions:
+            contents: read
+          jobs:
+            exactness:
+              runs-on: ubuntu-latest
+              timeout-minutes: 35
+              steps:
+                - uses: actions/checkout@v7
+                - uses: actions/setup-python@v7
+                  with:
+                    python-version: '3.12'
+                - name: Strict AVX2 build and full oracle
+                  run: |
+                    set -euo pipefail
+                    make clean
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+                - name: Persistent cache path is exact and active
+                  run: |
+                    set -euo pipefail
+                    python -m pip install --quiet numpy
+                    python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+                    rm -rf /tmp/k3persist /tmp/k3persist-trunk /tmp/k3persist-out
+                    mkdir -p /tmp/k3persist-out
+                    python tools/make_tiny_checkpoint.py /tmp/k3persist --seed 2080 --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14
+                    NLAYERS=$(python - <<'PY'
+                    import json
+                    print(json.load(open('/tmp/k3persist/config.json'))['num_hidden_layers'])
+                    PY
+                    )
+                    python tools/pack_trunk.py /tmp/k3persist /tmp/k3persist-trunk "$NLAYERS"
+                    BASE='/tmp/k3persist --trunk /tmp/k3persist-trunk --trunk-gb 0.001 --cache-gb 0.001 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 12 --incremental --threads 1 --temperature 0'
+                    K3_NO_PERSIST_WIDEN=1 ./bin/k3 $BASE --out /tmp/k3persist-out/off.json >/tmp/k3persist-out/off.log 2>&1
+                    ./bin/k3 $BASE --out /tmp/k3persist-out/on.json >/tmp/k3persist-out/on.log 2>&1
+                    python - <<'PY'
+                    import json,re
+                    from pathlib import Path
+                    d=Path('/tmp/k3persist-out')
+                    a=json.load(open(d/'off.json')); b=json.load(open(d/'on.json'))
+                    assert a['generated_ids']==b['generated_ids'] and a['full_ids']==b['full_ids']
+                    off=(d/'off.log').read_text(); on=(d/'on.log').read_text()
+                    x=re.search(r'prepared binds (\d+) built',off); y=re.search(r'prepared binds (\d+) built',on)
+                    z=re.search(r'persistent streamed binds: (\d+) layer templates, (\d+) reuses, ([0-9.]+) MiB widen restored',on)
+                    assert x and y and z
+                    assert int(y.group(1)) < int(x.group(1))
+                    assert int(z.group(2)) > 0 and float(z.group(3)) > 0
+                    print('PERSISTENT STREAMED BIND PARITY PASS')
+                    PY
+          YAML
+          git add -A
+          git commit -m 'ci: make persistent streamed bind gate permanent' || true
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
