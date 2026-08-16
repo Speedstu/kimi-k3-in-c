@@ -331,13 +331,60 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
 
     size_t w = 0;
     int narrowed_all = 1;
-    int i8_seen = 0;
+    int i8_seen = 0, q4_seen = 0;
     for (int i = 0; i < p.n; i++) {
         Req *q = &p.r[i];
         int64_t off = 0, nb = 0; int dt = 0;
         if (src->find(src->ctx, q->name, &off, &nb, &dt) != 0) {
             fprintf(stderr, "k3_bind_mem: %s not present in the packed run\n", q->name);
             return -1;
+        }
+        /* Groupwise Q4 draft tensor. The Q4 packer requires each matrix row width
+         * to be a multiple of K3_Q4_GROUP, so the tensor is also just a sequence of
+         * independent 128-value blocks. Narrow matmul weights point directly into the
+         * run; elementwise tensors are dequantised into the existing widen area. */
+        if (dt == K3_DT_Q4G) {
+            if (q->narrow) {
+                *q->dest = run + off;
+                q4_seen = 1;
+                continue;
+            }
+            const int64_t take = q->take;
+            if (take < 0 || take % K3_Q4_GROUP != 0) {
+                fprintf(stderr, "k3_bind_mem: %s bad Q4 logical size\n", q->name);
+                return -1;
+            }
+            const int64_t blocks = take / K3_Q4_GROUP;
+            const int64_t wantb = blocks * (4 + K3_Q4_GROUP / 2);
+            if (nb != wantb) {
+                fprintf(stderr, "k3_bind_mem: %s bad Q4 layout (%lld bytes, want %lld)\n",
+                        q->name, (long long)nb, (long long)wantb);
+                return -1;
+            }
+            w = (w + 7u) & ~(size_t)7u;
+            if (w + (size_t)take * 4 > widen_cap) {
+                fprintf(stderr, "k3_bind_mem: widen area too small at %s\n", q->name);
+                return -1;
+            }
+            float *dst = (float *)(widen + w);
+            const unsigned char *rp = run + off;
+            for (int64_t g = 0; g < blocks; g++) {
+                float scale;
+                memcpy(&scale, rp, 4);
+                const unsigned char *pk = rp + 4;
+                float *dg = dst + g * K3_Q4_GROUP;
+                for (int j = 0; j < K3_Q4_GROUP; j++) {
+                    const unsigned char qb = pk[j >> 1];
+                    const int nib = (j & 1) ? (qb >> 4) : (qb & 0x0f);
+                    const int qv = nib < 8 ? nib : nib - 16;
+                    dg[j] = (float)qv * scale;
+                }
+                rp += 4 + K3_Q4_GROUP / 2;
+            }
+            *q->dest = dst;
+            w += (size_t)take * 4;
+            q4_seen = 1;
+            continue;
         }
         /* Per-row int8 draft weight: [f32 scale][int8 * cols] per row. A matmul weight is
          * pointed at directly and the layer is tagged K3_WI8; a tensor the engine reads
@@ -424,16 +471,20 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
         w += (size_t)q->take * 4;
     }
 
-    if (!narrowed_all && !i8_seen) {
+    if (!narrowed_all && !i8_seen && !q4_seen) {
         /* A large matrix was not BF16 in the packed run. The tag is per struct, so this
          * cannot be described; refuse rather than read fp32 bytes as bf16. */
         fprintf(stderr, "k3_bind_mem: layer %d has a non-BF16 large tensor\n", L);
         return -1;
     }
 
-    /* An int8 draft trunk has every matmul weight as I8R (norms stay f32), so one tag
-     * describes the layer. The two formats are never mixed within a packed trunk. */
-    const int lw = i8_seen ? K3_WI8 : K3_WBF16;
+    /* Derived draft trunks use one matrix format consistently within a layer. Refuse
+     * mixed Q4/I8 because the dtype tag is per weight struct, not per tensor. */
+    if (i8_seen && q4_seen) {
+        fprintf(stderr, "k3_bind_mem: layer %d mixes I8R and Q4G matrices\n", L);
+        return -1;
+    }
+    const int lw = q4_seen ? K3_WQ4G : (i8_seen ? K3_WI8 : K3_WBF16);
     b->kda.wdt = b->mla.wdt = b->moe.wdt = b->lay.wdt = lw;
     b->lay.kda = is_mla ? NULL : &b->kda;
     b->lay.mla = is_mla ? &b->mla : NULL;

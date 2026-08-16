@@ -176,23 +176,22 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
-void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv)
+/* Internal form with caller-owned u scratch. The hot model path has a D-float
+ * slice that is dead after q has been pre-scaled, so using it here removes one
+ * calloc/free pair per KDA head and token without changing any arithmetic. */
+static void k3_kda_step_ws(float *S, float *o, const float *q, const float *k,
+                           const float *v, const float *alpha, float beta,
+                           int dk, int dv, float *u)
 {
-    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
+    /* 1. channel-wise decay */
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
         for (int j = 0; j < dv; j++) row[j] *= a;
     }
 
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token. */
-    float *u = (float *)calloc((size_t)dv, sizeof(float));
-    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    /* 2. read the state along k: u = S^T k */
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -200,8 +199,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         for (int j = 0; j < dv; j++) u[j] += ki * row[j];
     }
 
-    /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
+    /* 3. rank-one delta write */
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
@@ -209,7 +207,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
     }
 
-    /* 4. output from the ALREADY UPDATED state: o = S^T q */
+    /* 4. output from the already-updated state */
     for (int j = 0; j < dv; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float qi = q[i];
@@ -217,6 +215,16 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float *row = S + (size_t)i * dv;
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
     }
+}
+
+void k3_kda_step(float *S, float *o, const float *q, const float *k,
+                 const float *v, const float *alpha, float beta, int dk, int dv)
+{
+    /* Public compatibility wrapper. Standalone callers retain the old API; the model
+     * hot path below supplies existing scratch and performs no heap allocation. */
+    float *u = (float *)malloc((size_t)dv * sizeof(float));
+    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    k3_kda_step_ws(S, o, q, k, v, alpha, beta, dk, dv, u);
     free(u);
 }
 
@@ -536,6 +544,8 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
 {
     const int E = c->hidden, L = c->latent, I = c->moe_inter;
     const int SI = I * c->n_shared;
+    const int K = (w->topk_override > 0 && w->topk_override < c->topk)
+                ? w->topk_override : c->topk;
 
     float *z    = scratch;              /* [L]    latent input              */
     float *accL = z    + L;             /* [L]    weighted expert aggregate */
@@ -551,17 +561,17 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         float *ot = out + (size_t)t * E;
 
         /* 1. route on the FULL width, before the down-projection */
-        k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
+        k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
 
-        int nk = c->topk;
+        int nk = K;
         /* Draft cache-only routing: keep only the top-k experts already resident, and
          * renormalise their weights so the mixture still sums as intended. This makes a
          * draft token read ZERO new expert bytes. It is an approximation, which is exactly
          * what a draft is; the exact model verifies every proposed token. */
         if (w->cache_only && w->src && w->src->resident) {
             int m = 0; float wsum = 0.0f;
-            for (int j = 0; j < c->topk; j++) {
+            for (int j = 0; j < K; j++) {
                 if (w->src->resident(w->src, w->layer, idx[j], NULL)) {
                     idx[m] = idx[j]; wt[m] = wt[j]; wsum += wt[j]; m++;
                 }
@@ -696,7 +706,9 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                               const K3Cfg *c, int T, float *scratch)
 {
     const int E = c->hidden, Ll = c->latent, I = c->moe_inter;
-    const int SI = I * c->n_shared, K = c->topk;
+    const int SI = I * c->n_shared;
+    const int K = (w->topk_override > 0 && w->topk_override < c->topk)
+                ? w->topk_override : c->topk;
 
     /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
      * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
@@ -879,8 +891,10 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
         for (int t = 0; t < T; t++) {
             const size_t off = (size_t)t * P + (size_t)h * D;
             for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
-            k3_kda_step(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
-                        al + off, bt[(size_t)t * H + h], D, D);
+            /* q[off:off+D] is dead after the copy above. Reuse it as the recurrence's
+             * D-float u workspace, removing heap traffic from the real KDA hot path. */
+            k3_kda_step_ws(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
+                           al + off, bt[(size_t)t * H + h], D, D, q + off);
         }
     }
 
@@ -1179,6 +1193,81 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
 #endif
         for (; i < in; i++) acc += (float)w[i] * x[i];
         y[o] = acc * scale;
+    }
+}
+
+/* Groupwise signed-int4 matmul for the speculative draft trunk. Layout per row:
+ * repeated groups of [f32 scale][ceil(n/2) packed bytes], group size 128. Nibbles are
+ * two's-complement signed values (-8..7), low nibble = even element. The packer uses
+ * symmetric absmax/7, so -8 is representable but normally unused.
+ *
+ * This kernel has intentionally NO exact-model determinism contract: Q4G is proposal
+ * only and exact bf16 K3 verifies every emitted token. That lets the AVX2 path use float
+ * FMA and a natural reduction. The goal is bandwidth: 0.53125 bytes/weight at full
+ * groups versus 1.0 for I8R and 2.0 for bf16. */
+void k3_matmul_q4g(float *y, const float *x, const void *W, int in, int out)
+{
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t rowb = k3_q4_row_bytes(in);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++) {
+        const unsigned char *bp = base + (size_t)o * rowb;
+        float acc = 0.0f;
+        for (int g = 0, off = 0; off < in; g++, off += K3_Q4_GROUP) {
+            int n = in - off;
+            if (n > K3_Q4_GROUP) n = K3_Q4_GROUP;
+            float scale;
+            memcpy(&scale, bp, 4);
+            const unsigned char *pk = bp + 4;
+            const float *xg = x + off;
+            float sub = 0.0f;
+            int i = 0;
+#if defined(__AVX2__)
+            __m256 v0 = _mm256_setzero_ps(), v1 = _mm256_setzero_ps();
+            __m256 v2 = _mm256_setzero_ps(), v3 = _mm256_setzero_ps();
+            const __m128i mask = _mm_set1_epi8(0x0f);
+            const __m128i sign = _mm_set1_epi8(0x08);
+            for (; i + 31 < n; i += 32) {
+                const __m128i b = _mm_loadu_si128((const __m128i *)(pk + (i >> 1)));
+                __m128i lo = _mm_and_si128(b, mask);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), mask);
+                lo = _mm_sub_epi8(_mm_xor_si128(lo, sign), sign);
+                hi = _mm_sub_epi8(_mm_xor_si128(hi, sign), sign);
+                const __m128i q0 = _mm_unpacklo_epi8(lo, hi);
+                const __m128i q1 = _mm_unpackhi_epi8(lo, hi);
+                v0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q0)),
+                                     _mm256_loadu_ps(xg + i), v0);
+                v1 = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q0, 8))),
+                    _mm256_loadu_ps(xg + i + 8), v1);
+                v2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q1)),
+                                     _mm256_loadu_ps(xg + i + 16), v2);
+                v3 = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q1, 8))),
+                    _mm256_loadu_ps(xg + i + 24), v3);
+            }
+            {
+                const __m256 vs = _mm256_add_ps(_mm256_add_ps(v0, v1),
+                                                 _mm256_add_ps(v2, v3));
+                __m128 z = _mm_add_ps(_mm256_castps256_ps128(vs),
+                                      _mm256_extractf128_ps(vs, 1));
+                z = _mm_add_ps(z, _mm_movehl_ps(z, z));
+                z = _mm_add_ss(z, _mm_shuffle_ps(z, z, 1));
+                sub = _mm_cvtss_f32(z);
+            }
+#endif
+            for (; i < n; i++) {
+                const unsigned char b = pk[i >> 1];
+                const int nib = (i & 1) ? (b >> 4) : (b & 0x0f);
+                const int q = nib < 8 ? nib : nib - 16;
+                sub += (float)q * xg[i];
+            }
+            acc += sub * scale;
+            bp += 4u + (size_t)(n + 1) / 2u;
+        }
+        y[o] = acc;
     }
 }
 

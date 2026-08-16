@@ -53,7 +53,7 @@ jobs:
       - name: Assert the suite was not silently empty
         run: |
           make CC=${{ matrix.cc }} ARCH="-mavx2 -mfma" test 2>&1 | tee /tmp/t.log
-          grep -q "22 passed, 0 failed, 0 skipped" /tmp/t.log
+          grep -q "23 passed, 0 failed, 0 skipped" /tmp/t.log
           grep -q "SCALE TEST PASSED"              /tmp/t.log
           grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" /tmp/t.log
           grep -q "ALL WEIGHTLESS TESTS PASSED"    /tmp/t.log
@@ -95,7 +95,7 @@ jobs:
       - name: Assert the suite was not silently empty
         run: |
           make test 2>&1 | tee "$RUNNER_TEMP/t.log"
-          grep -q "22 passed, 0 failed, 0 skipped" "$RUNNER_TEMP/t.log"
+          grep -q "23 passed, 0 failed, 0 skipped" "$RUNNER_TEMP/t.log"
           grep -q "SCALE TEST PASSED"              "$RUNNER_TEMP/t.log"
           grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" "$RUNNER_TEMP/t.log"
           grep -q "ALL WEIGHTLESS TESTS PASSED"    "$RUNNER_TEMP/t.log"
