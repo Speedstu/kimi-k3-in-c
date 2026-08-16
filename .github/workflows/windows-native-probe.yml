@@ -1,0 +1,37 @@
+name: Windows native probe
+
+on:
+  push:
+    branches: ['experiment/windows-native-probe']
+
+permissions:
+  contents: read
+
+jobs:
+  ucrt64:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+      - name: Toolchain
+        shell: msys2 {0}
+        run: |
+          uname -a
+          gcc --version
+          make --version
+      - name: Build current source and capture first native blockers
+        shell: msys2 {0}
+        run: |
+          set +e
+          make CC=gcc ARCH='-msse2' -j2 > /tmp/k3-win-build.log 2>&1
+          rc=$?
+          cat /tmp/k3-win-build.log
+          echo "BUILD_RC=$rc"
+          exit "$rc"
