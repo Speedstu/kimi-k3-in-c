@@ -13,8 +13,6 @@
  * Primary codes 0..6 select dict7; code 7 consumes one secondary nibble. Secondary
  * codes 0..14 select dict15; code 15 consumes one literal high byte. The low byte is
  * always stored verbatim. This is storage-only and byte-exact, never model quantisation.
- *
- * Build: cc -O3 -mavx2 -Wall -Wextra -o /tmp/bench benchmarks/bench_bf16_dict7_tiered.c
  */
 #define _POSIX_C_SOURCE 200809L
 #include <immintrin.h>
@@ -40,14 +38,20 @@ static uint32_t rng32(void)
     return x;
 }
 
-/* Expand the eight bits of one byte into eight byte lanes containing 0 or 1.
- * Example: 0b10000101 -> bytes {1,0,1,0,0,0,0,1}. This lets three bitplanes become
- * eight 3-bit dictionary codes with three multiplies instead of scalar shifts. */
-static inline uint64_t expand8(unsigned x)
+/* 2 KiB, hot in L1. Each entry expands one packed bitplane byte into eight byte lanes
+ * containing 0/1. A previous multiply trick was rejected by the byte-exact gate because
+ * carries corrupt some values with bit 7 set; the explicit table has no such ambiguity. */
+static uint64_t EXPAND8[256];
+static void init_expand8(void)
 {
-    return ((uint64_t)(x & 255u) * UINT64_C(0x0002040810204081))
-           & UINT64_C(0x0101010101010101);
+    for (unsigned x = 0; x < 256; x++) {
+        uint64_t v = 0;
+        for (unsigned b = 0; b < 8; b++)
+            v |= (uint64_t)((x >> b) & 1u) << (8u * b);
+        EXPAND8[x] = v;
+    }
 }
+static inline uint64_t expand8(unsigned x) { return EXPAND8[x & 255u]; }
 
 static inline int pop_lsb(unsigned *m)
 {
@@ -129,6 +133,8 @@ int main(int argc, char **argv)
     const size_t n = raw_bytes / 2;
     const size_t plane_bytes = (n + 7) / 8;
 
+    init_expand8();
+
     /* Ordered from the real K3 BF16 sample recorded by the research workflow. */
     const unsigned char d7[7] = {0x3c,0xbc,0x3b,0xbb,0xbd,0x3d,0x3a};
     const unsigned char d15[15] = {
@@ -141,7 +147,6 @@ int main(int argc, char **argv)
     unsigned char *p0=(unsigned char *)calloc(plane_bytes,1);
     unsigned char *p1=(unsigned char *)calloc(plane_bytes,1);
     unsigned char *p2=(unsigned char *)calloc(plane_bytes,1);
-    /* 5.85% primary escapes on real K3. Allocate generous capacity. */
     unsigned char *sec=(unsigned char *)calloc(n/16 + 4096,1);
     unsigned char *lit=(unsigned char *)malloc(n/1000 + 4096);
     if (!raw || !out || !low || !p0 || !p1 || !p2 || !sec || !lit) {
@@ -157,7 +162,6 @@ int main(int argc, char **argv)
             q1=(r>>8)%7u; hb=d7[q1];
         } else {
             q1=7;
-            /* Of all words, only ~0.000632% fall outside top22. */
             if (bucket < 999994u) { q2=(r>>16)%15u; hb=d15[q2]; }
             else { q2=15; hb=(unsigned char)(0x70u+((r>>20)&15u)); lit[nl++]=hb; }
             if (ne & 1u) sec[ne>>1] |= (unsigned char)(q2<<4);
