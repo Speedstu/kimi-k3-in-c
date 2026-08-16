@@ -1,0 +1,151 @@
+name: Hybrid ngram bypass parity
+
+on:
+  push:
+    branches: [speedboost/hybrid-ngram-bypass]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply greedy hybrid ngram transform
+        run: python tools/patch_hybrid_ngram_bypass.py
+      - name: Strict AVX2 build and full oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+      - name: Build repetitive tiny exact fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3ng /tmp/k3ng-trunk /tmp/k3ng-out
+          mkdir -p /tmp/k3ng-out
+          python tools/make_tiny_checkpoint.py /tmp/k3ng --seed 2090 \
+            --prompt-ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3ng/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3ng /tmp/k3ng-trunk "$NLAYERS"
+      - name: Greedy bypass keeps exact output and removes sequential draft proposal steps
+        run: |
+          set -euo pipefail
+          D=/tmp/k3ng-out
+          BASE='/tmp/k3ng --trunk /tmp/k3ng-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7 --gen 20 --incremental --threads 1 --temperature 0'
+          DRAFT='--draft-trunk /tmp/k3ng-trunk --draft-trunk-gb 0.05 --draft-topk 2 --spec-auto --spec 8'
+          K3_DRAFT_NO_NGRAM=1 ./bin/k3 $BASE $DRAFT --out "$D/off.json" >"$D/off.log" 2>&1
+          ./bin/k3 $BASE $DRAFT --out "$D/on.json" >"$D/on.log" 2>&1
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          d=Path('/tmp/k3ng-out')
+          off=json.load(open(d/'off.json')); on=json.load(open(d/'on.json'))
+          assert on['generated_ids'] == off['generated_ids'], (off['generated_ids'],on['generated_ids'])
+          assert on['full_ids'] == off['full_ids']
+          assert off['draft_ngram_rounds'] == 0, off
+          assert on['draft_ngram_rounds'] > 0, on
+          assert on['draft_ngram_proposed'] > 0, on
+          assert on['draft_model_steps'] < off['draft_model_steps'], (on['draft_model_steps'],off['draft_model_steps'])
+          saved=off['draft_model_steps']-on['draft_model_steps']
+          assert saved >= on['draft_ngram_proposed'], (saved,on['draft_ngram_proposed'])
+          print('HYBRID NGRAM BYPASS EXACT PARITY PASS')
+          print({'off_model_steps':off['draft_model_steps'], 'on_model_steps':on['draft_model_steps'],
+                 'ngram_rounds':on['draft_ngram_rounds'], 'ngram_proposed':on['draft_ngram_proposed'],
+                 'ngram_accepted':on['draft_ngram_accepted'], 'ngram_disabled':on['draft_ngram_disabled']})
+          PY
+      - name: Sampled draft path never enters ngram bypass
+        run: |
+          set -euo pipefail
+          D=/tmp/k3ng-out
+          ./bin/k3 /tmp/k3ng --trunk /tmp/k3ng-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --ids 3,7,11,3,7,11,3,7 --gen 8 --incremental --threads 1 --temperature 1 \
+            --seed 12345 --draft-trunk /tmp/k3ng-trunk --draft-trunk-gb 0.05 --draft-topk 2 \
+            --spec 4 --out "$D/sample.json" >"$D/sample.log" 2>&1
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/k3ng-out/sample.json'))
+          assert x['draft_ngram_rounds'] == 0, x
+          assert x['draft_ngram_proposed'] == 0, x
+          print('SAMPLED HYBRID PATH UNCHANGED: PASS')
+          PY
+      - name: Persist validated source and make gate permanent
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/cli/k3_run.c
+          git commit -m 'perf: bypass draft model with exact-verified ngrams' || true
+          rm -f tools/patch_hybrid_ngram_bypass.py
+          cat > .github/workflows/hybrid-ngram-bypass.yml <<'YAML'
+          name: Hybrid ngram bypass parity
+          on:
+            workflow_dispatch:
+            pull_request:
+              paths:
+                - 'src/cli/k3_run.c'
+                - '.github/workflows/hybrid-ngram-bypass.yml'
+          permissions:
+            contents: read
+          jobs:
+            exactness:
+              runs-on: ubuntu-latest
+              timeout-minutes: 35
+              steps:
+                - uses: actions/checkout@v7
+                - uses: actions/setup-python@v7
+                  with:
+                    python-version: '3.12'
+                - name: Strict AVX2 build and full oracle
+                  run: |
+                    set -euo pipefail
+                    make clean
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+                - name: Greedy ngram bypass is exact and active
+                  run: |
+                    set -euo pipefail
+                    python -m pip install --quiet numpy
+                    python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+                    rm -rf /tmp/k3ng /tmp/k3ng-trunk /tmp/k3ng-out
+                    mkdir -p /tmp/k3ng-out
+                    python tools/make_tiny_checkpoint.py /tmp/k3ng --seed 2090 --prompt-ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7
+                    NLAYERS=$(python - <<'PY'
+                    import json
+                    print(json.load(open('/tmp/k3ng/config.json'))['num_hidden_layers'])
+                    PY
+                    )
+                    python tools/pack_trunk.py /tmp/k3ng /tmp/k3ng-trunk "$NLAYERS"
+                    BASE='/tmp/k3ng --trunk /tmp/k3ng-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7 --gen 20 --incremental --threads 1 --temperature 0'
+                    DRAFT='--draft-trunk /tmp/k3ng-trunk --draft-trunk-gb 0.05 --draft-topk 2 --spec-auto --spec 8'
+                    K3_DRAFT_NO_NGRAM=1 ./bin/k3 $BASE $DRAFT --out /tmp/k3ng-out/off.json >/tmp/k3ng-out/off.log 2>&1
+                    ./bin/k3 $BASE $DRAFT --out /tmp/k3ng-out/on.json >/tmp/k3ng-out/on.log 2>&1
+                    python - <<'PY'
+                    import json
+                    a=json.load(open('/tmp/k3ng-out/off.json')); b=json.load(open('/tmp/k3ng-out/on.json'))
+                    assert a['generated_ids']==b['generated_ids'] and a['full_ids']==b['full_ids']
+                    assert a['draft_ngram_rounds']==0 and b['draft_ngram_rounds']>0
+                    assert b['draft_model_steps'] < a['draft_model_steps']
+                    assert b['draft_ngram_proposed']>0
+                    print('HYBRID NGRAM BYPASS PARITY PASS')
+                    PY
+          YAML
+          git add -A
+          git commit -m 'ci: make hybrid ngram bypass gate permanent' || true
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
