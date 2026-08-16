@@ -1,0 +1,47 @@
+name: Stage Kimi Code wire parity
+
+on:
+  push:
+    branches: [feature/local-k3-max-parity]
+    paths:
+      - tools/apply_kimi_wire_stage.py
+      - .github/workflows/kimi-wire-stage.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/local-k3-max-parity
+      - run: python3 tools/apply_kimi_wire_stage.py
+      - name: Python gates
+        run: |
+          python3 -m py_compile local/k3_local.py
+          python3 - <<'PY'
+          import importlib.util, sys
+          from pathlib import Path
+          p=Path('local/k3_local.py')
+          spec=importlib.util.spec_from_file_location('k3_local',p)
+          m=importlib.util.module_from_spec(spec); sys.modules[spec.name]=m; spec.loader.exec_module(m)
+          # XTML output parser still preserves thinking and calls.
+          x=('reason<|close|>think<|sep|><|open|>tools<|sep|>'
+             '<|open|>call tool="Bash" index="1"<|sep|>'
+             '<|open|>argument key="command" type="string"<|sep|>pwd'
+             '<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>')
+          r=m.parse_xtml(x)
+          assert r['reasoning_content']=='reason'
+          assert r['tool_calls'][0]['function']['name']=='Bash'
+          print('Kimi XTML wire smoke: PASS')
+          PY
+      - name: Commit source
+        run: |
+          git config user.name Speedstu
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add local/k3_local.py
+          git diff --cached --check
+          git commit -m 'feat: match Kimi Code thinking and streaming wire dialect [stage-applied]'
+          git push origin HEAD:feature/local-k3-max-parity
