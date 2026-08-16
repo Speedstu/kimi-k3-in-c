@@ -4,7 +4,7 @@ on:
   push:
     branches: [feature/local-k3-max-parity]
     paths:
-      - tools/apply_local_max_stage.py
+      - tools/apply_local_max_stage_v2.py
       - .github/workflows/local-max-stage.yml
 
 permissions:
@@ -19,7 +19,7 @@ jobs:
           ref: feature/local-k3-max-parity
 
       - name: Apply guarded source patch
-        run: python3 tools/apply_local_max_stage.py
+        run: python3 tools/apply_local_max_stage_v2.py
 
       - name: Build and run weightless gates
         run: |
