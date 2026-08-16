@@ -1,0 +1,105 @@
+name: Batched MLA BF16 prefill parity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [speedboost/prefill-batched-mla-bf16]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'tools/patch_prefill_batched_mla_bf16.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-mla-bf16-parity.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Apply exact MLA BF16 prefill transform once
+        run: python tools/patch_prefill_batched_mla_bf16.py
+
+      - name: Strict AVX2 build and full weightless oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build streamed MLA fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3mla /tmp/k3mla-trunk /tmp/k3mla-out
+          mkdir -p /tmp/k3mla-out
+          python tools/make_tiny_checkpoint.py /tmp/k3mla \
+            --seed 2031 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38
+          NLAYERS=$(python - <<'PY'
+          import json
+          c=json.load(open('/tmp/k3mla/config.json'))
+          print(c['num_hidden_layers'])
+          full=c.get('full_attention_interval', c.get('full_attention_layers', 'unknown'))
+          print('fixture layers=', c['num_hidden_layers'], 'full_attention=', full, file=__import__('sys').stderr)
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3mla /tmp/k3mla-trunk "$NLAYERS"
+
+      - name: Per-token MLA BF16 vs batched MLA BF16 are binary-identical
+        run: |
+          set -euo pipefail
+          D=/tmp/k3mla-out
+          BASE='/tmp/k3mla --trunk /tmp/k3mla-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38 --gen 1 --temperature 0'
+
+          for MODE in plain incremental; do
+            EXTRA=''
+            if [ "$MODE" = incremental ]; then EXTRA='--incremental'; fi
+            for T in 1 4; do
+              /usr/bin/time -f "old_${MODE}_t${T}_wall=%e" -o "$D/old-${MODE}-t${T}.time" \
+                env K3_NO_PREFILL_BATCH_MLA_BF16=1 ./bin/k3 $BASE $EXTRA --threads "$T" \
+                --dump-logits "$D/old-${MODE}-t${T}.logits" --out "$D/old-${MODE}-t${T}.json" \
+                >"$D/old-${MODE}-t${T}.log" 2>&1
+              /usr/bin/time -f "batch_${MODE}_t${T}_wall=%e" -o "$D/batch-${MODE}-t${T}.time" \
+                ./bin/k3 $BASE $EXTRA --threads "$T" \
+                --dump-logits "$D/batch-${MODE}-t${T}.logits" --out "$D/batch-${MODE}-t${T}.json" \
+                >"$D/batch-${MODE}-t${T}.log" 2>&1
+              cmp "$D/old-${MODE}-t${T}.logits" "$D/batch-${MODE}-t${T}.logits"
+              python3 - "$MODE" "$T" <<'PY'
+          import json, sys
+          d='/tmp/k3mla-out'; mode=sys.argv[1]; t=sys.argv[2]
+          a=json.load(open(f'{d}/old-{mode}-t{t}.json'))
+          b=json.load(open(f'{d}/batch-{mode}-t{t}.json'))
+          assert a['generated_ids'] == b['generated_ids'], (mode, t, a['generated_ids'], b['generated_ids'])
+          assert a['full_ids'] == b['full_ids']
+          print(f'{mode} threads={t}: binary logits + ids PASS')
+          print(open(f'{d}/old-{mode}-t{t}.time').read().strip())
+          print(open(f'{d}/batch-{mode}-t{t}.time').read().strip())
+          PY
+            done
+          done
+          echo 'BATCHED MLA BF16 PREFILL EXACTNESS PASS (plain + cached, 1 + 4 threads)'
+
+      - name: Persist generated source after gates pass
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/core/k3_ops.c; then
+            echo 'source already committed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/core/k3_ops.c
+          git commit -m 'perf: batch exact MLA BF16 prefill projections'
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
