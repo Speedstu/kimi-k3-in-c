@@ -1,0 +1,28 @@
+name: MXFP4 scale-table probe
+
+on:
+  push:
+    branches: [speedboost/mxfp4-scale-table-probe]
+    paths:
+      - 'benchmarks/bench_mxfp4_scale_table.c'
+      - '.github/workflows/mxfp4-scale-table-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off benchmarks/bench_mxfp4_scale_table.c -o /tmp/mx_scale -lm -fopenmp -pthread
+      - name: One thread
+        run: OMP_NUM_THREADS=1 /tmp/mx_scale
+      - name: Two threads
+        run: OMP_NUM_THREADS=2 /tmp/mx_scale
+      - name: Four threads
+        run: OMP_NUM_THREADS=4 /tmp/mx_scale
+      - name: Eight threads
+        run: OMP_NUM_THREADS=8 /tmp/mx_scale
