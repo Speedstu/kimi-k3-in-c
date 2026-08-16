@@ -39,6 +39,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libomp-dev
           make ARCH='-mavx2 -mfma' -j"$(nproc)"
+          make ARCH='-mavx2 -mfma' bin/test_sample -j"$(nproc)"
           ./bin/test_sample
       - name: Generate exact tiny K3 and a deliberately approximate draft
         run: |
