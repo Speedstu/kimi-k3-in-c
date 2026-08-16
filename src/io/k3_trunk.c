@@ -142,6 +142,63 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             if ((v = json_get(o, "nbytes")) && v->t == J_NUM) t->nbytes = (int64_t)v->num;
             if ((v = json_get(o, "dtype"))  && v->t == J_STR) t->dtype  = dt_of(v->str);
         }
+        if ((v = json_get(e, "stored_nbytes")) && v->t == J_NUM)
+            L->stored_nbytes = (int64_t)v->num;
+        jval *bs = json_get(e, "blocks");
+        if (bs) {
+            if (bs->t != J_ARR || bs->len <= 0) {
+                fprintf(stderr, "k3_trunk: layer %d has invalid blocks array\n", i);
+                goto bad;
+            }
+            L->nblocks = bs->len;
+            L->blocks = (K3TrunkBlock *)calloc((size_t)L->nblocks, sizeof(K3TrunkBlock));
+            if (!L->blocks) goto bad;
+            int64_t expect_raw = 0;
+            for (int bi = 0; bi < L->nblocks; bi++) {
+                jval *bo = bs->kids[bi];
+                K3TrunkBlock *b = &L->blocks[bi];
+                if ((v = json_get(bo, "file_off")) && v->t == J_NUM) b->file_off = (int64_t)v->num;
+                if ((v = json_get(bo, "stored_nbytes")) && v->t == J_NUM) b->stored_nbytes = (int64_t)v->num;
+                if ((v = json_get(bo, "encoded_nbytes")) && v->t == J_NUM) b->encoded_nbytes = (int64_t)v->num;
+                if ((v = json_get(bo, "raw_off")) && v->t == J_NUM) b->raw_off = (int64_t)v->num;
+                if ((v = json_get(bo, "raw_nbytes")) && v->t == J_NUM) b->raw_nbytes = (int64_t)v->num;
+                jval *co = json_get(bo, "codec");
+                if (!co || co->t != J_STR) { fprintf(stderr, "k3_trunk: layer %d block %d has no codec\n", i, bi); goto bad; }
+                if (!strcmp(co->str, "raw")) b->codec = 0;
+                else if (!strcmp(co->str, "dict15")) b->codec = 1;
+                else { fprintf(stderr, "k3_trunk: layer %d block %d unknown codec %s\n", i, bi, co->str); goto bad; }
+                if (b->raw_off != expect_raw || b->raw_nbytes <= 0 || b->stored_nbytes <= 0 ||
+                    b->encoded_nbytes <= 0 || b->encoded_nbytes > b->stored_nbytes ||
+                    (b->file_off % K3_TRUNK_ALIGN) || (b->stored_nbytes % K3_TRUNK_ALIGN)) {
+                    fprintf(stderr, "k3_trunk: layer %d block %d has invalid geometry\n", i, bi);
+                    goto bad;
+                }
+                if (b->codec == 1) {
+                    jval *da = json_get(bo, "dict");
+                    if (!da || da->t != J_ARR || da->len != K3_DICT15_SIZE) {
+                        fprintf(stderr, "k3_trunk: layer %d block %d needs a 15-byte dictionary\n", i, bi);
+                        goto bad;
+                    }
+                    for (int di = 0; di < K3_DICT15_SIZE; di++) {
+                        if (!da->kids[di] || da->kids[di]->t != J_NUM ||
+                            da->kids[di]->num < 0 || da->kids[di]->num > 255) {
+                            fprintf(stderr, "k3_trunk: layer %d block %d bad dictionary\n", i, bi);
+                            goto bad;
+                        }
+                        b->dict[di] = (unsigned char)da->kids[di]->num;
+                    }
+                } else if (b->encoded_nbytes != b->raw_nbytes) {
+                    fprintf(stderr, "k3_trunk: raw block length mismatch at layer %d block %d\n", i, bi);
+                    goto bad;
+                }
+                expect_raw += b->raw_nbytes;
+            }
+            if (expect_raw != L->nbytes) {
+                fprintf(stderr, "k3_trunk: layer %d blocks reconstruct %lld bytes, manifest says %lld\n",
+                        i, (long long)expect_raw, (long long)L->nbytes);
+                goto bad;
+            }
+        }
     }
     free(txt);                      /* arena holds the strings; txt itself is done */
 
@@ -181,8 +238,20 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     }
 
     const size_t widen = k3_bind_widen_bytes(c);
-    int64_t total = 0;
-    for (int i = 0; i < tr->n_layers; i++) total += tr->lay[i].nbytes;
+    int64_t total = 0, stored_total = 0, codec_slot = 0;
+    for (int i = 0; i < tr->n_layers; i++) {
+        total += tr->lay[i].nbytes;
+        if (tr->lay[i].nblocks) {
+            for (int bi = 0; bi < tr->lay[i].nblocks; bi++) {
+                const K3TrunkBlock *b = &tr->lay[i].blocks[bi];
+                stored_total += b->stored_nbytes;
+                if (b->stored_nbytes > codec_slot) codec_slot = b->stored_nbytes;
+            }
+        } else {
+            stored_total += tr->lay[i].nbytes;
+        }
+    }
+    codec_slot = (codec_slot + K3_TRUNK_ALIGN - 1) & ~(int64_t)(K3_TRUNK_ALIGN - 1);
 
     /* Pin a PREFIX of layers, each in an exact-size allocation, then keep a small ring
      * of uniform slots for everything else. Uniform slots everywhere would size every
@@ -218,7 +287,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
      * converges in two or three passes and is monotone, so the loop is bounded. At the
      * floor, where npin is 0, this correctly changes nothing: every layer streams and the
      * ring must still hold the biggest of them. */
-    int64_t ring_slot = 0, spent = 0;
+    int64_t ring_slot = 0;
     int npin = 0;
     for (int pass = 0; pass < 4; pass++) {
         int64_t big = 0;
@@ -233,9 +302,9 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
          * only ever tested ADDITIONAL pinned layers against it, so RING * rs was spent
          * whether or not it fitted. Drop to one slot rather than overshoot. */
         RING = RING_WANT;
-        while (RING > 1 && (int64_t)RING * rs > budget_bytes) RING--;
+        while (RING > 1 && (int64_t)RING * (rs + codec_slot) > budget_bytes) RING--;
 
-        int64_t sp = (int64_t)RING * rs;
+        int64_t sp = (int64_t)RING * (rs + codec_slot);
         int np = 0;
         while (np < tr->n_layers) {
             const int64_t need = tr->lay[np].nbytes + (int64_t)widen;
@@ -244,13 +313,14 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             np++;
         }
         if (np >= tr->n_layers) np = tr->n_layers;
-        if (rs == ring_slot && np == npin) { ring_slot = rs; spent = sp; break; }
-        ring_slot = rs; npin = np; spent = sp;
+        if (rs == ring_slot && np == npin) { ring_slot = rs; break; }
+        ring_slot = rs; npin = np;
     }
 
     tr->npin = npin;
     tr->nslot = RING;
     tr->slot_bytes = ring_slot;
+    tr->codec_slot_bytes = codec_slot;
 
     tr->pin = (unsigned char **)calloc((size_t)(npin ? npin : 1), sizeof(unsigned char *));
     if (!tr->pin) return -1;
@@ -266,6 +336,12 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     if (k3_alloc_direct((void **)&tr->arena, (size_t)RING * (size_t)ring_slot) != 0) {
         fprintf(stderr, "k3_trunk: cannot allocate the %.2f GB streaming ring\n",
                 (double)RING * ring_slot / 1e9);
+        return -1;
+    }
+    if (codec_slot > 0 &&
+        k3_alloc_direct((void **)&tr->codec_arena, (size_t)RING * (size_t)codec_slot) != 0) {
+        fprintf(stderr, "k3_trunk: cannot allocate %.2f GB codec scratch\n",
+                (double)RING * codec_slot / 1e9);
         return -1;
     }
     tr->layer_of = (int *)malloc((size_t)RING * sizeof(int));
@@ -307,11 +383,13 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         tr->io_state = NULL;
     }
 
-    printf("trunk stream: %.2f GB packed, %d/%d layers PINNED (%.2f GB), "
+    printf("trunk stream: %.2f GB raw / %.2f GB stored, %d/%d layers PINNED, "
            "ring %d x %.2f GB\n",
-           (double)total / 1e9, npin, tr->n_layers,
-           (double)(spent - (int64_t)RING * ring_slot) / 1e9,
+           (double)total / 1e9, (double)stored_total / 1e9, npin, tr->n_layers,
            RING, (double)ring_slot / 1e9);
+    if (codec_slot > 0)
+        printf("              lossless dict15 blocks: %.2f GB codec scratch per ring slot "
+               "(counted in trunk budget)\n", (double)codec_slot / 1e9);
     printf("              reads use %s\n",
            tr->direct ? "O_DIRECT (page cache bypassed)" : "buffered I/O");
     if (RING < RING_WANT)
@@ -345,8 +423,11 @@ void k3_trunk_close(K3Trunk *tr)
     }
     if (tr->fd >= 0) close(tr->fd);
     if (tr->pin) { for (int i = 0; i < tr->npin; i++) free(tr->pin[i]); free(tr->pin); }
-    free(tr->arena); free(tr->layer_of); free(tr->slot_of);
-    if (tr->lay) { for (int i = 0; i < tr->n_layers; i++) free(tr->lay[i].t); free(tr->lay); }
+    free(tr->arena); free(tr->codec_arena); free(tr->layer_of); free(tr->slot_of);
+    if (tr->lay) {
+        for (int i = 0; i < tr->n_layers; i++) { free(tr->lay[i].t); free(tr->lay[i].blocks); }
+        free(tr->lay);
+    }
     free(tr->json_arena);   /* every K3TrunkTensor.name points into this */
     memset(tr, 0, sizeof *tr);
     tr->fd = -1;            /* see k3_trunk_open: 0 is stdin, not "closed" */
@@ -385,19 +466,60 @@ static int k3_alloc_direct(void **out, size_t bytes)
     return 0;
 }
 
-static int load_run(K3Trunk *tr, int L, unsigned char *dst)
+static int pread_all(K3Trunk *tr, unsigned char *dst, int64_t nbytes, int64_t off)
 {
-    const K3TrunkLayer *lay = &tr->lay[L];
-    const double t0 = now_s();
     int64_t got = 0;
-    while (got < lay->nbytes) {
-        ssize_t r = pread(tr->fd, dst + got, (size_t)(lay->nbytes - got),
-                          (off_t)(lay->file_off + got));
-        if (r <= 0) { fprintf(stderr, "k3_trunk: short read on layer %d\n", L); return -1; }
+    const double t0 = now_s();
+    while (got < nbytes) {
+        ssize_t r = pread(tr->fd, dst + got, (size_t)(nbytes - got), (off_t)(off + got));
+        if (r <= 0) return -1;
         got += r;
     }
     tr->load_seconds += now_s() - t0;
     tr->bytes_read += (uint64_t)got;
+    return 0;
+}
+
+/* Read and, when needed, byte-exactly reconstruct one layer into dst. scratch_slot is
+ * the ring slot index, which gives async and synchronous readers disjoint codec buffers. */
+static int load_run(K3Trunk *tr, int L, unsigned char *dst, int scratch_slot)
+{
+    const K3TrunkLayer *lay = &tr->lay[L];
+    if (!lay->nblocks) {
+        if (pread_all(tr, dst, lay->nbytes, lay->file_off) != 0) {
+            fprintf(stderr, "k3_trunk: short read on layer %d\n", L);
+            return -1;
+        }
+        tr->raw_bytes_reconstructed += (uint64_t)lay->nbytes;
+        return 0;
+    }
+    if (!tr->codec_arena || scratch_slot < 0 || scratch_slot >= tr->nslot) return -1;
+    unsigned char *scratch = tr->codec_arena + (size_t)scratch_slot * tr->codec_slot_bytes;
+    for (int bi = 0; bi < lay->nblocks; bi++) {
+        const K3TrunkBlock *b = &lay->blocks[bi];
+        unsigned char *out = dst + b->raw_off;
+        if (b->codec == 0) {
+            if (pread_all(tr, out, b->stored_nbytes, b->file_off) != 0) {
+                fprintf(stderr, "k3_trunk: short raw block read layer %d block %d\n", L, bi);
+                return -1;
+            }
+        } else {
+            if (b->stored_nbytes > tr->codec_slot_bytes ||
+                pread_all(tr, scratch, b->stored_nbytes, b->file_off) != 0) {
+                fprintf(stderr, "k3_trunk: short compressed read layer %d block %d\n", L, bi);
+                return -1;
+            }
+            const double td = now_s();
+            const size_t used = k3_dict15_decode(out, (size_t)b->raw_nbytes, scratch,
+                                                  (size_t)b->encoded_nbytes, b->dict);
+            tr->decode_seconds += now_s() - td;
+            if (used == SIZE_MAX) {
+                fprintf(stderr, "k3_trunk: corrupt dict15 block layer %d block %d\n", L, bi);
+                return -1;
+            }
+        }
+        tr->raw_bytes_reconstructed += (uint64_t)b->raw_nbytes;
+    }
     return 0;
 }
 
@@ -417,7 +539,7 @@ static void *trunk_io_main(void *arg)
         K3Trunk *tr = io->tr;
         pthread_mutex_unlock(&io->mu);
 
-        const int rc = load_run(tr, L, tr->arena + (size_t)slot * tr->slot_bytes);
+        const int rc = load_run(tr, L, tr->arena + (size_t)slot * tr->slot_bytes, slot);
 
         pthread_mutex_lock(&io->mu);
         io->result = rc;
@@ -461,7 +583,7 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
     if (L < tr->npin) {
         base = tr->pin[L];
         if (tr->slot_of[L] < 0) {            /* first touch: load once, keep forever */
-            if (load_run(tr, L, base) != 0) return -1;
+            if (load_run(tr, L, base, 0) != 0) return -1;
             tr->slot_of[L] = L;
             tr->misses++;
         } else {
@@ -484,7 +606,7 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
                 if (tr->layer_of[slot] >= 0) tr->slot_of[tr->layer_of[slot]] = -1;
                 /* Mark the slot EMPTY before reading into it, not after. */
                 tr->layer_of[slot] = -1;
-                if (load_run(tr, L, tr->arena + (size_t)slot * tr->slot_bytes) != 0) return -1;
+                if (load_run(tr, L, tr->arena + (size_t)slot * tr->slot_bytes, slot) != 0) return -1;
                 tr->layer_of[slot] = L;
                 tr->misses++;
             }
@@ -541,6 +663,14 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
     printf("  read %.2f GB in %.2f s (%.0f MB/s)\n",
            (double)tr->bytes_read / 1e9, tr->load_seconds,
            tr->load_seconds > 0 ? (double)tr->bytes_read / 1e6 / tr->load_seconds : 0.0);
+    if (tr->raw_bytes_reconstructed > tr->bytes_read) {
+        printf("  reconstructed %.2f GB raw from %.2f GB stored (%.1f%% fewer bytes); "
+               "decode %.2f s (%.0f MB/s raw)\n",
+               (double)tr->raw_bytes_reconstructed / 1e9, (double)tr->bytes_read / 1e9,
+               100.0 * (1.0 - (double)tr->bytes_read / tr->raw_bytes_reconstructed),
+               tr->decode_seconds,
+               tr->decode_seconds > 0 ? (double)tr->raw_bytes_reconstructed / 1e6 / tr->decode_seconds : 0.0);
+    }
     /* The rate above is a DEVICE rate: load_seconds brackets the pread loop alone. The
      * breakdown below is the wall clock actually spent inside k3_trunk_bind, so the
      * difference between them is per-bind overhead rather than disk time.

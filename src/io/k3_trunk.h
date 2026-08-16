@@ -55,6 +55,7 @@
 
 #include "k3.h"
 #include "k3_bind.h"
+#include "k3_codec.h"
 
 #define K3_TRUNK_ALIGN 4096   /* pack_trunk.py pads runs to this so O_DIRECT works */
 
@@ -66,10 +67,23 @@ typedef struct {
 } K3TrunkTensor;
 
 typedef struct {
-    int64_t  file_off;     /* offset in trunk.bin */
-    int64_t  nbytes;
+    int64_t file_off;       /* absolute offset in trunk.bin, 4096 aligned */
+    int64_t stored_nbytes;  /* bytes read with O_DIRECT, includes tail padding */
+    int64_t encoded_nbytes; /* payload bytes before O_DIRECT padding */
+    int64_t raw_off;        /* destination offset in the reconstructed layer run */
+    int64_t raw_nbytes;
+    int     codec;          /* 0 raw, 1 dict15 */
+    unsigned char dict[K3_DICT15_SIZE];
+} K3TrunkBlock;
+
+typedef struct {
+    int64_t  file_off;     /* offset in trunk.bin (raw trunks) / first block */
+    int64_t  nbytes;       /* RECONSTRUCTED raw bytes; tensor offsets refer to these */
+    int64_t  stored_nbytes;/* physical bytes for compressed blocks, informational */
     K3TrunkTensor *t;
     int      nt;
+    K3TrunkBlock *blocks;  /* NULL for the original raw one-pread format */
+    int      nblocks;
 } K3TrunkLayer;
 
 typedef struct {
@@ -86,9 +100,11 @@ typedef struct {
      * Uniform slots everywhere would size EVERY slot for layer 0, whose dense MLP makes
      * it 2.34 GB against 1.27 GB for a normal layer, wasting about half the budget. */
     unsigned char **pin;        /* [npin] one exact allocation per pinned layer */
-    unsigned char *arena;       /* [nslot] uniform ring slots                   */
+    unsigned char *arena;       /* [nslot] uniform RECONSTRUCTED ring slots     */
+    unsigned char *codec_arena; /* [nslot] compressed-block O_DIRECT scratch     */
     int64_t      slot_bytes;    /* raw run + the widen area                     */
     int64_t      widen_bytes;   /* of slot_bytes, the fp32 expansion area       */
+    int64_t      codec_slot_bytes; /* max stored block, counted inside budget    */
     int          nslot;
     int          npin;          /* layers 0..npin-1 are pinned                  */
     int         *layer_of;      /* [nslot] which layer occupies each ring slot  */
@@ -101,8 +117,10 @@ typedef struct {
 
     /* stats */
     uint64_t     hits, misses;
-    uint64_t     bytes_read;
-    double       load_seconds;
+    uint64_t     bytes_read;             /* physical bytes read from trunk.bin */
+    uint64_t     raw_bytes_reconstructed; /* raw bytes produced for the binder   */
+    double       load_seconds;             /* pread only                          */
+    double       decode_seconds;           /* dict15 reconstruction only          */
 } K3Trunk;
 
 /* budget_bytes sizes the slot array. Layers 0..K-1 are pinned, where K is as large as
