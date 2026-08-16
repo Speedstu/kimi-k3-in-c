@@ -304,6 +304,11 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  * from x and caches nothing. Both paths must produce identical output; the op fixtures
  * gate the uncached path and tests/unit/k3_model.c gates them against each other.
  */
+#define K3_PREFILL_BATCH_MAX 64
+static void k3_matmul_bf16_batch(float *y, int ystride,
+                                  const float *const *xs, int batch,
+                                  const uint16_t *W, int in, int out);
+
 void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                    int T, float *scratch,
                    float *kvc, float *ropec, int cached, int cap)
@@ -319,17 +324,23 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     if (kvc && last >= cap)
         k3_fatal_bound("MLA KV cache position", (long)last, (long)cap - 1);
 
+    static int no_prefill_batch_mla_bf16 = -1;
+    if (no_prefill_batch_mla_bf16 < 0)
+        no_prefill_batch_mla_bf16 = getenv("K3_NO_PREFILL_BATCH_MLA_BF16") ? 1 : 0;
+    const int B = (T > 1 && T <= K3_PREFILL_BATCH_MAX) ? T : 1;
+    const int batch_mla = !no_prefill_batch_mla_bf16 && B > 1 && w->wdt == K3_WBF16;
+
     /* Scratch layout. Every region below is DISJOINT and must stay so. Overlapping
      * any two of them can appear to work, aliasing the gate buffer onto q, say, is
      * safe only while H*vh < H*qh holds, but that is an accident of the released
      * dimensions, not an invariant, and it breaks silently the moment v_head grows.
      * Size the buffer with k3_mla_scratch_cached(); do not compute it by hand. */
     float *q    = scratch;                          /* [T][H][qh]     */
-    float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient, one token */
-    float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
-    float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
-    float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores */
+    float *ct   = q    + (size_t)T * H * qh;        /* [B][kvw]       */
+    float *ql   = ct   + (size_t)B * kvw;           /* [B][q_lora]    */
+    float *acc  = ql   + (size_t)B * c->q_lora;     /* [H][vh]        */
+    float *gbuf = acc  + (size_t)H * vh;            /* [B][H][vh] gate */
+    float *sc   = gbuf + (size_t)B * H * vh;        /* [last+1] scores */
     /* Without a cache the keys/values live in scratch and cover only this call. */
     float *kvs  = sc   + (size_t)(last + 1);        /* [T][H][kvd]    */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
@@ -338,19 +349,51 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     #define K3_ROPE_AT(p) (ropec ? ropec + (size_t)(p) * qr      : rps + (size_t)(p) * qr)
 
     /* ---- per-token projections ---- */
-    for (int t = 0; t < T; t++) {
-        const int p = cached + t;
-        const float *xt = x + (size_t)t * E;
-        k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
-        k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
-        k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
+    if (batch_mla) {
+        const float *xp[K3_PREFILL_BATCH_MAX];
+        const float *qp[K3_PREFILL_BATCH_MAX];
+        const float *cp[K3_PREFILL_BATCH_MAX];
+        for (int t = 0; t < T; t++) xp[t] = x + (size_t)t * E;
 
-        /* ONE projection emits the compressed latent AND the shared rope slot */
-        k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
-        /* the norm covers the latent only, never the rope slot */
-        k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
-        memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
-        k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
+        /* Stage 1 has no token dependency: share BF16 row widening/cache traffic. */
+        k3_matmul_bf16_batch(ql, c->q_lora, xp, T,
+                             (const uint16_t *)w->q_a, E, c->q_lora);
+        k3_matmul_bf16_batch(ct, kvw, xp, T,
+                             (const uint16_t *)w->kv_a, E, kvw);
+
+        /* Norms and rope-slot publication keep their original token order. */
+        for (int t = 0; t < T; t++) {
+            const int p = cached + t;
+            float *qlt = ql + (size_t)t * c->q_lora;
+            float *ctt = ct + (size_t)t * kvw;
+            k3_rmsnorm(qlt, qlt, w->q_a_norm, c->q_lora, c->rms_eps);
+            k3_rmsnorm(ctt, ctt, w->kv_a_norm, c->kv_lora, c->rms_eps);
+            memcpy(K3_ROPE_AT(p), ctt + c->kv_lora, (size_t)qr * sizeof(float));
+            qp[t] = qlt;
+            cp[t] = ctt;
+        }
+
+        /* Stage 2 consumes the exact same normalised latents. The T cache positions
+         * are contiguous whether the cache is external or scratch-backed. */
+        k3_matmul_bf16_batch(q, H * qh, qp, T,
+                             (const uint16_t *)w->q_b, c->q_lora, H * qh);
+        k3_matmul_bf16_batch(K3_KV_AT(cached), H * kvd, cp, T,
+                             (const uint16_t *)w->kv_b, c->kv_lora, H * kvd);
+    } else {
+        for (int t = 0; t < T; t++) {
+            const int p = cached + t;
+            const float *xt = x + (size_t)t * E;
+            k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
+            k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
+            k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
+
+            /* ONE projection emits the compressed latent AND the shared rope slot */
+            k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
+            /* the norm covers the latent only, never the rope slot */
+            k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
+            memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
+            k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
+        }
     }
 
     /* ---- attention, per head, causal ---- */
@@ -384,12 +427,41 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
          * unlike KDA which norms first. :470-473 ---- */
-        if (w->g) {
-            k3_mmw(gbuf, x + (size_t)t * E, w->g, w->wdt, E, H * vh);
-            for (int i = 0; i < H * vh; i++)
-                acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
+        if (batch_mla) {
+            /* q[t] is dead after this token's causal attention. Its 18,432-float row
+             * is wider than the 12,288-float attention output, so retain the exact
+             * attention result there until gate/o_proj can share BF16 weights. */
+            memcpy(q + (size_t)t * H * qh, acc, (size_t)H * vh * sizeof(float));
+        } else {
+            if (w->g) {
+                k3_mmw(gbuf, x + (size_t)t * E, w->g, w->wdt, E, H * vh);
+                for (int i = 0; i < H * vh; i++)
+                    acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
+            }
+            k3_mmw(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, E);
         }
-        k3_mmw(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, E);
+    }
+
+    if (batch_mla) {
+        const float *xp[K3_PREFILL_BATCH_MAX];
+        const float *op[K3_PREFILL_BATCH_MAX];
+        for (int t = 0; t < T; t++) xp[t] = x + (size_t)t * E;
+
+        if (w->g)
+            k3_matmul_bf16_batch(gbuf, H * vh, xp, T,
+                                 (const uint16_t *)w->g, E, H * vh);
+
+        for (int t = 0; t < T; t++) {
+            float *at = q + (size_t)t * H * qh;
+            if (w->g) {
+                const float *gt = gbuf + (size_t)t * H * vh;
+                for (int i = 0; i < H * vh; i++)
+                    at[i] *= 1.0f / (1.0f + expf(-gt[i]));
+            }
+            op[t] = at;
+        }
+        k3_matmul_bf16_batch(out, E, op, T,
+                             (const uint16_t *)w->o, H * vh, E);
     }
     #undef K3_KV_AT
     #undef K3_ROPE_AT
@@ -513,11 +585,16 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode)
 {
     const int H = c->n_heads, qh = c->qk_nope + c->qk_rope, vh = c->v_head;
     const size_t kvd = (size_t)(c->qk_nope + vh);
+    /* Exact BF16 projection batching is intentionally bounded to the same 64-token
+     * prefill width as MoE. Above that width MLA takes the proven per-token path, so
+     * there is no reason to make long-context scratch grow by another O(T) gate block. */
+    const int B = (T > 1 && T <= K3_PREFILL_BATCH_MAX) ? T : 1;
     size_t n = (size_t)T * H * qh                      /* q            */
-             + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
-             + (size_t)c->q_lora
-             + (size_t)2 * H * vh                      /* acc, gbuf    */
-             + (size_t)(cap > T ? cap : T);            /* scores       */
+             + (size_t)B * (c->kv_lora + c->qk_rope)  /* batched ct   */
+             + (size_t)B * c->q_lora                  /* batched ql   */
+             + (size_t)H * vh                         /* acc          */
+             + (size_t)B * H * vh                     /* batched gate */
+             + (size_t)(cap > T ? cap : T);           /* scores       */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
     return n;
 }
@@ -761,10 +838,6 @@ size_t k3_moe_scratch(const K3Cfg *c)
 static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                               const K3Cfg *c, int T, float *scratch);
 
-#define K3_PREFILL_BATCH_MAX 64
-static void k3_matmul_bf16_batch(float *y, int ystride,
-                                  const float *const *xs, int batch,
-                                  const uint16_t *W, int in, int out);
 static void k3_matmul_mxfp4_batch(float *y, int ystride,
                                    const float *const *xs, int batch,
                                    const unsigned char *packed,
