@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Tune real K3 compute and async expert-I/O threads on the current machine.
+
+The tuner runs the SAME exact K3 request repeatedly, changing only:
+  * --threads N                  main OpenMP compute team
+  * K3_ASYNC_IO_THREADS=N       background expert-read team
+
+It refuses to recommend anything if generated_ids or full_ids change between runs.
+No model weights, routing settings, precision, cache size, prompt or sampling options
+are changed by this script.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Iterable
+
+
+@dataclass
+class Run:
+    phase: str
+    compute_threads: int
+    io_threads: int
+    repeat: int
+    seconds_per_token: float
+    generated_ids: list[int]
+    full_ids: list[int]
+    json_path: str
+    log_path: str
+
+
+def parse_candidates(text: str, *, max_value: int | None = None) -> list[int]:
+    vals: list[int] = []
+    for raw in text.replace(",", " ").split():
+        try:
+            v = int(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid integer candidate: {raw!r}") from exc
+        if v < 1:
+            raise argparse.ArgumentTypeError("thread candidates must be >= 1")
+        if max_value is not None and v > max_value:
+            continue
+        if v not in vals:
+            vals.append(v)
+    vals.sort()
+    if not vals:
+        raise argparse.ArgumentTypeError("candidate list is empty after validation")
+    return vals
+
+
+def default_compute_candidates(cpu_count: int) -> list[int]:
+    vals = [1]
+    x = 2
+    while x < cpu_count:
+        vals.append(x)
+        x *= 2
+    if cpu_count > 1:
+        vals.append(cpu_count)
+    return sorted(set(vals))
+
+
+def candidate_arg_present(args: Iterable[str], name: str) -> bool:
+    prefix = name + "="
+    return any(a == name or a.startswith(prefix) for a in args)
+
+
+def median_for(runs: list[Run], compute: int, io: int, phase: str | None = None) -> float:
+    vals = [
+        r.seconds_per_token
+        for r in runs
+        if r.compute_threads == compute and r.io_threads == io and (phase is None or r.phase == phase)
+    ]
+    if not vals:
+        raise RuntimeError(f"no timings for compute={compute}, io={io}, phase={phase}")
+    return statistics.median(vals)
+
+
+def best_candidate(runs: list[Run], *, phase: str, vary: str) -> int:
+    subset = [r for r in runs if r.phase == phase]
+    if not subset:
+        raise RuntimeError(f"phase {phase!r} has no runs")
+    values = sorted({r.compute_threads if vary == "compute" else r.io_threads for r in subset})
+    scored: list[tuple[float, int]] = []
+    for v in values:
+        samples = [
+            r.seconds_per_token
+            for r in subset
+            if (r.compute_threads if vary == "compute" else r.io_threads) == v
+        ]
+        scored.append((statistics.median(samples), v))
+    scored.sort()
+    return scored[0][1]
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="Autotune K3 compute + async expert-I/O threads using a real exact request.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python benchmarks/autotune.py ~/k3model --repeats 2 -- \\\n"
+            "    --trunk ~/k3trunk-lossless --preset laptop --incremental \\\n"
+            "    --ids 1008,10484,318,15383,387 --gen 2 --temperature 0\n\n"
+            "For a quick first pass, use a short deterministic request (for example --gen 2).\n"
+            "After tuning, run your normal longer prompt with the recommended settings."
+        ),
+    )
+    p.add_argument("model_dir")
+    p.add_argument("--k3-bin", default=None, help="K3 executable (default ./bin/k3 or .\\bin\\k3.exe on Windows)")
+    p.add_argument("--repeats", type=int, default=2, help="runs per candidate (default 2)")
+    p.add_argument("--compute-candidates", default=None, help="comma/space list; default powers of two plus logical CPU count")
+    p.add_argument("--io-candidates", default="1,2,4,8,16", help="async I/O thread candidates (default 1,2,4,8,16)")
+    p.add_argument("--strategy", choices=("coordinate", "grid"), default="coordinate",
+                   help="coordinate is much cheaper; grid exhaustively tests every pair")
+    p.add_argument("--io-seed", type=int, default=4, help="I/O threads used for the first compute sweep (default 4)")
+    p.add_argument("--out", default="k3-autotune.json", help="summary JSON path")
+    p.add_argument("--keep-run-files", action="store_true", help="keep each K3 JSON/log beside the summary")
+    p.add_argument("--timeout", type=float, default=None, help="optional timeout in seconds for each K3 run")
+    p.add_argument("k3_args", nargs=argparse.REMAINDER, help="normal K3 arguments after --")
+    ns = p.parse_args()
+
+    if ns.repeats < 1:
+        p.error("--repeats must be >= 1")
+    if ns.io_seed < 1 or ns.io_seed > 64:
+        p.error("--io-seed must be in 1..64")
+
+    k3_args = list(ns.k3_args)
+    if k3_args and k3_args[0] == "--":
+        k3_args = k3_args[1:]
+    if candidate_arg_present(k3_args, "--threads"):
+        p.error("do not pass --threads after --; autotune controls it")
+    if candidate_arg_present(k3_args, "--out"):
+        p.error("do not pass --out after --; autotune needs a private JSON result per run")
+
+    for disabled in ("K3_NOASYNC_PREFETCH", "K3_NOPREFETCH"):
+        if os.environ.get(disabled):
+            p.error(f"{disabled} is set; async I/O tuning would be meaningless. Unset it first.")
+
+    cpu_count = max(1, os.cpu_count() or 1)
+    compute = (
+        parse_candidates(ns.compute_candidates, max_value=cpu_count)
+        if ns.compute_candidates
+        else default_compute_candidates(cpu_count)
+    )
+    io = parse_candidates(ns.io_candidates, max_value=64)
+    io_seed = min(io, key=lambda x: (abs(x - ns.io_seed), x))
+
+    if ns.k3_bin:
+        k3_bin = Path(ns.k3_bin)
+    elif os.name == "nt":
+        k3_bin = Path("bin") / "k3.exe"
+    else:
+        k3_bin = Path("bin") / "k3"
+    if not k3_bin.exists():
+        p.error(f"K3 executable not found: {k3_bin}")
+
+    out_path = Path(ns.out).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    permanent_dir = out_path.with_suffix("").with_name(out_path.stem + "-runs")
+    temp_ctx = None
+    if ns.keep_run_files:
+        permanent_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = permanent_dir
+    else:
+        temp_ctx = tempfile.TemporaryDirectory(prefix="k3-autotune-")
+        run_dir = Path(temp_ctx.name)
+
+    runs: list[Run] = []
+    reference_generated: list[int] | None = None
+    reference_full: list[int] | None = None
+
+    def run_one(phase: str, cthreads: int, iothreads: int, repeat: int) -> Run:
+        nonlocal reference_generated, reference_full
+        safe_phase = phase.replace("/", "_")
+        stem = f"{safe_phase}-c{cthreads}-io{iothreads}-r{repeat}"
+        json_path = run_dir / f"{stem}.json"
+        log_path = run_dir / f"{stem}.log"
+        env = os.environ.copy()
+        env["K3_ASYNC_IO_THREADS"] = str(iothreads)
+        cmd = [str(k3_bin), ns.model_dir, *k3_args, "--threads", str(cthreads), "--out", str(json_path)]
+        print(f"  c={cthreads:>3} io={iothreads:>2} r={repeat}: ", end="", flush=True)
+        with log_path.open("w", encoding="utf-8", errors="replace") as log:
+            proc = subprocess.run(
+                cmd,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=ns.timeout,
+                check=False,
+            )
+        if proc.returncode != 0:
+            tail = ""
+            try:
+                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                tail = "\n".join(lines[-30:])
+            except OSError:
+                pass
+            raise RuntimeError(f"K3 failed with exit code {proc.returncode}\n{tail}")
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+            sec = float(data["seconds_per_token"])
+            generated = [int(x) for x in data["generated_ids"]]
+            full = [int(x) for x in data["full_ids"]]
+        except Exception as exc:  # noqa: BLE001 - report malformed result with path
+            raise RuntimeError(f"cannot parse K3 result {json_path}: {exc}") from exc
+        if not (sec > 0.0):
+            raise RuntimeError(f"invalid seconds_per_token={sec!r} in {json_path}")
+
+        if reference_generated is None:
+            reference_generated = generated
+            reference_full = full
+        elif generated != reference_generated or full != reference_full:
+            raise RuntimeError(
+                "REFUSING RESULT: token stream changed while tuning threads\n"
+                f"reference generated_ids={reference_generated}\n"
+                f"got       generated_ids={generated}\n"
+                f"candidate compute={cthreads}, io={iothreads}, repeat={repeat}\n"
+                "No recommendation was produced."
+            )
+        print(f"{sec:.6f} s/token")
+        r = Run(
+            phase=phase,
+            compute_threads=cthreads,
+            io_threads=iothreads,
+            repeat=repeat,
+            seconds_per_token=sec,
+            generated_ids=generated,
+            full_ids=full,
+            json_path=str(json_path) if ns.keep_run_files else "",
+            log_path=str(log_path) if ns.keep_run_files else "",
+        )
+        runs.append(r)
+        return r
+
+    def sweep(phase: str, pairs: list[tuple[int, int]]) -> None:
+        print(f"\n[{phase}] {len(pairs)} candidate pair(s), {ns.repeats} repeat(s) each")
+        # Alternate candidate order between repeats to reduce simple thermal/order bias.
+        for rep in range(1, ns.repeats + 1):
+            ordered = pairs if rep % 2 else list(reversed(pairs))
+            for cthreads, iothreads in ordered:
+                run_one(phase, cthreads, iothreads, rep)
+
+    print("K3 real-hardware autotune")
+    print(f"  logical CPUs       : {cpu_count}")
+    print(f"  compute candidates : {compute}")
+    print(f"  I/O candidates     : {io}")
+    print(f"  repeats            : {ns.repeats}")
+    print(f"  strategy           : {ns.strategy}")
+    print("  exactness guard    : generated_ids + full_ids must match on every run")
+
+    try:
+        if ns.strategy == "grid":
+            pairs = [(c, i) for c in compute for i in io]
+            sweep("grid", pairs)
+            pair_medians = {
+                (c, i): median_for(runs, c, i, "grid")
+                for c, i in pairs
+            }
+            best_c, best_io = min(pair_medians, key=pair_medians.get)
+        else:
+            sweep("compute-1", [(c, io_seed) for c in compute])
+            best_c1 = best_candidate(runs, phase="compute-1", vary="compute")
+            sweep("io", [(best_c1, i) for i in io])
+            best_io = best_candidate(runs, phase="io", vary="io")
+            sweep("compute-2", [(c, best_io) for c in compute])
+            best_c = best_candidate(runs, phase="compute-2", vary="compute")
+            # If the second compute pass moved, confirm I/O at the final compute count.
+            if best_c != best_c1:
+                sweep("io-confirm", [(best_c, i) for i in io])
+                best_io = best_candidate(runs, phase="io-confirm", vary="io")
+
+        # Use every measurement at the final pair when available; otherwise the phase that
+        # selected it has at least `repeats` samples.
+        final_samples = [
+            r.seconds_per_token
+            for r in runs
+            if r.compute_threads == best_c and r.io_threads == best_io
+        ]
+        final_median = statistics.median(final_samples)
+        summary = {
+            "model_dir": ns.model_dir,
+            "k3_bin": str(k3_bin),
+            "k3_args": k3_args,
+            "logical_cpus": cpu_count,
+            "strategy": ns.strategy,
+            "repeats": ns.repeats,
+            "compute_candidates": compute,
+            "io_candidates": io,
+            "recommended": {
+                "threads": best_c,
+                "async_io_threads": best_io,
+                "median_seconds_per_token": final_median,
+                "samples_at_final_pair": len(final_samples),
+            },
+            "reference_generated_ids": reference_generated,
+            "reference_full_ids": reference_full,
+            "runs": [asdict(r) for r in runs],
+        }
+        out_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        print("\nRECOMMENDED")
+        print(f"  --threads {best_c}")
+        if os.name == "nt":
+            print(f"  PowerShell: $env:K3_ASYNC_IO_THREADS='{best_io}'")
+            print(f"  cmd.exe   : set K3_ASYNC_IO_THREADS={best_io}")
+        else:
+            print(f"  K3_ASYNC_IO_THREADS={best_io}")
+        print(f"  observed median at final pair: {final_median:.6f} s/token")
+        print(f"  summary: {out_path}")
+        print("\nThe recommendation applies to this machine, storage path, cache/preset and request shape.")
+        print("Re-run after changing SSD, cache size, preset, or other major hardware/runtime conditions.")
+        return 0
+    finally:
+        if temp_ctx is not None:
+            temp_ctx.cleanup()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted; no recommendation produced.", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception as exc:  # noqa: BLE001 - CLI should fail loudly with one concise message
+        print(f"autotune failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
