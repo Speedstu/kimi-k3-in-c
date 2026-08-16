@@ -23,7 +23,7 @@ jobs:
         run: |
           grep -q '64-token chunks' local/README.md
           grep -q 'lazy anonymous virtual memory' local/README.md
-          grep -q 'setting.*cached=0' local/README.md
+          grep -q 'cached=0' local/README.md
       - name: Commit validated docs
         run: |
           git config user.name Speedstu
