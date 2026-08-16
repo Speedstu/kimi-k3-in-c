@@ -222,6 +222,8 @@ class BackendConfig:
     resident_worker: bool = True
     worker_binary: Path | None = None
     worker_context: int = 1024
+    prefill_mb: float = 256.0
+    prefill_chunk: int | None = None
 
 
 @dataclass
@@ -596,7 +598,11 @@ class ResidentCBackend:
             str(cache_gb),
             "--context",
             str(self.context),
+            "--prefill-mb",
+            str(self.cfg.prefill_mb),
         ]
+        if self.cfg.prefill_chunk is not None:
+            cmd += ["--prefill-chunk", str(self.cfg.prefill_chunk)]
         if self.cfg.threads is not None:
             cmd += ["--threads", str(self.cfg.threads)]
         if self.cfg.draft_trunk is not None:
@@ -1157,6 +1163,8 @@ def serve(args: argparse.Namespace) -> None:
         resident_worker=args.resident_worker,
         worker_binary=args.worker_binary.resolve() if args.resident_worker else None,
         worker_context=args.worker_context,
+        prefill_mb=args.prefill_mb,
+        prefill_chunk=args.prefill_chunk,
     )
     required_paths = [
         (cfg.model_dir, "model"),
@@ -1231,6 +1239,17 @@ def main() -> None:
             "resident capacity in positions (2..1048576); virtual reservation is lazy, "
             "but RAM still grows with positions actually used"
         ),
+    )
+    sp.add_argument(
+        "--prefill-mb",
+        type=float,
+        default=256.0,
+        help="transient resident prefill RAM budget in MiB (default: 256)",
+    )
+    sp.add_argument(
+        "--prefill-chunk",
+        type=int,
+        help="manual prefill chunk override; normally leave unset",
     )
     sp.add_argument("--preset", default="laptop")
     sp.add_argument("--threads", type=int)
