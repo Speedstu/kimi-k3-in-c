@@ -1,0 +1,23 @@
+name: Windows native stage
+
+on:
+  push:
+    branches: [feature/windows-native-runtime]
+
+jobs:
+  ucrt64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+      - name: Build native Windows engine
+        shell: msys2 {0}
+        run: |
+          gcc --version
+          make CC=gcc ARCH='-msse2' -j2
