@@ -1,0 +1,61 @@
+name: Real-hardware autotune parity
+
+on:
+  pull_request:
+    paths:
+      - 'benchmarks/autotune.py'
+      - '.github/workflows/autotune-parity.yml'
+      - 'src/**'
+      - 'include/**'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+  workflow_dispatch:
+
+jobs:
+  tiny-autotune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install tiny-checkpoint dependencies
+        run: |
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Strict AVX2 build
+        run: |
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+      - name: Generate streamed tiny K3
+        run: |
+          rm -rf /tmp/k3tiny /tmp/k3trunk
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11,5,9
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3trunk "$NLAYERS"
+      - name: Coordinate autotune preserves exact token stream
+        run: |
+          python benchmarks/autotune.py /tmp/k3tiny \
+            --k3-bin ./bin/k3 \
+            --repeats 1 \
+            --compute-candidates 1,2 \
+            --io-candidates 1,2 \
+            --io-seed 1 \
+            --out /tmp/autotune.json \
+            -- \
+            --trunk /tmp/k3trunk --trunk-gb 0.05 --cache-gb 0.001 \
+            --ids 3,7,11,5,9 --gen 3 --incremental --temperature 0
+          python - <<'PY'
+          import json
+          p='/tmp/autotune.json'
+          x=json.load(open(p))
+          assert x['recommended']['threads'] in (1,2)
+          assert x['recommended']['async_io_threads'] in (1,2)
+          assert x['reference_generated_ids'] == [92,168,13], x['reference_generated_ids']
+          assert len(x['runs']) >= 6, len(x['runs'])
+          print('AUTOTUNE PARITY PASS', x['recommended'])
+          PY
