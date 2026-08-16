@@ -1,3 +1,4 @@
+# Permanent correctness gate for the cost-aware greedy speculative horizon.
 name: Cost-aware adaptive speculation parity
 
 on:
