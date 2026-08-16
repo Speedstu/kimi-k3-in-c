@@ -8,6 +8,10 @@ The total tunable budget is held constant for every candidate:
 Only performance knobs change. Every candidate must emit the exact same generated_ids and
 full_ids or the tuner aborts without a recommendation. K3's own peak-RSS line is parsed
 and recorded as an observed diagnostic; the allocator budget is not a hard OS RSS cap.
+
+Optional machine-fit mode adds geometric automatic memory candidates and a post-run
+--max-rss-gb eligibility guard. The guard cannot prevent an OOM before K3 reports RSS;
+it only refuses to recommend allocations whose measured peak exceeded the requested cap.
 """
 from __future__ import annotations
 
@@ -25,6 +29,7 @@ from typing import Iterable
 
 
 RSS_RE = re.compile(r"PEAK RSS for the whole run:\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)")
+EPS = 1e-9
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,7 @@ class Run:
     repeat: int
     seconds_per_token: float
     peak_rss_gb: float | None
+    within_max_rss: bool | None
     generated_ids: list[int]
     full_ids: list[int]
     json_path: str
@@ -62,6 +68,39 @@ def parse_float_candidates(text: str) -> list[float]:
     if not vals:
         raise argparse.ArgumentTypeError("memory candidate list is empty")
     return vals
+
+
+def automatic_memory_candidates(available_gb: float, minimum_gb: float) -> list[float]:
+    """Return geometric candidates up to the available tunable memory.
+
+    No hardware-performance assumption is encoded here: candidates simply double from a
+    user-visible floor and always include the upper boundary. Invalid cache/draft pairs
+    are filtered later by the fixed total budget and exact-trunk minimum.
+    """
+    if not (available_gb > 0.0) or not (minimum_gb > 0.0) or minimum_gb > available_gb + EPS:
+        return []
+    vals: list[float] = []
+    value = minimum_gb
+    while value < available_gb - EPS:
+        rounded = round(value, 6)
+        if not vals or abs(rounded - vals[-1]) > 1e-12:
+            vals.append(rounded)
+        value *= 2.0
+    boundary = round(available_gb, 6)
+    if not vals or abs(boundary - vals[-1]) > 1e-12:
+        vals.append(boundary)
+    return vals
+
+
+def resolve_candidates(spec: str, available_gb: float, auto_min_gb: float) -> tuple[list[float], bool]:
+    if spec.strip().lower() == "auto":
+        vals = automatic_memory_candidates(available_gb, auto_min_gb)
+        if not vals:
+            raise argparse.ArgumentTypeError(
+                "automatic memory candidate set is empty; lower --auto-min-gb or trunk minimum"
+            )
+        return vals, True
+    return parse_float_candidates(spec), False
 
 
 def candidate_arg_present(args: Iterable[str], name: str) -> bool:
@@ -102,20 +141,34 @@ def allocation_for(budget: float, cache: float, draft: float, trunk_min: float) 
     return Allocation(round(trunk, 6), round(cache, 6), round(draft, 6))
 
 
+def allocation_within_rss(runs: list[Run], allocation: Allocation, max_rss_gb: float | None) -> bool:
+    if max_rss_gb is None:
+        return True
+    measured = [run for run in runs if run.allocation == allocation]
+    if not measured:
+        return False
+    return all(
+        run.peak_rss_gb is not None and run.peak_rss_gb <= max_rss_gb + EPS
+        for run in measured
+    )
+
+
 def median_for(runs: list[Run], phase: str, selector: str, value: float) -> float:
     samples: list[float] = []
     for run in runs:
         if run.phase != phase:
             continue
         actual = run.allocation.cache_gb if selector == "cache" else run.allocation.draft_trunk_gb
-        if abs(actual - value) < 1e-9:
+        if abs(actual - value) < EPS:
             samples.append(run.seconds_per_token)
     if not samples:
         raise RuntimeError(f"no samples for {phase} {selector}={value}")
     return statistics.median(samples)
 
 
-def best_value(runs: list[Run], phase: str, selector: str) -> float:
+def best_value(
+    runs: list[Run], phase: str, selector: str, max_rss_gb: float | None
+) -> float:
     values = sorted(
         {
             run.allocation.cache_gb if selector == "cache" else run.allocation.draft_trunk_gb
@@ -123,9 +176,29 @@ def best_value(runs: list[Run], phase: str, selector: str) -> float:
             if run.phase == phase
         }
     )
-    if not values:
-        raise RuntimeError(f"phase {phase!r} has no runs")
-    return min(values, key=lambda value: median_for(runs, phase, selector, value))
+    scored: list[tuple[float, float]] = []
+    for value in values:
+        matching = [
+            run
+            for run in runs
+            if run.phase == phase
+            and abs(
+                (run.allocation.cache_gb if selector == "cache" else run.allocation.draft_trunk_gb)
+                - value
+            )
+            < EPS
+        ]
+        if not matching:
+            continue
+        allocation = matching[0].allocation
+        if not allocation_within_rss(runs, allocation, max_rss_gb):
+            continue
+        scored.append((median_for(runs, phase, selector, value), value))
+    if not scored:
+        detail = f" under --max-rss-gb {max_rss_gb:g}" if max_rss_gb is not None else ""
+        raise RuntimeError(f"phase {phase!r} has no eligible measured candidate{detail}")
+    scored.sort()
+    return scored[0][1]
 
 
 def main() -> int:
@@ -146,11 +219,34 @@ def main() -> int:
     parser.add_argument("--k3-bin", default=None)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--strategy", choices=("coordinate", "grid"), default="coordinate")
-    parser.add_argument("--cache-candidates", default="0.5,1,4,8,16,32")
-    parser.add_argument("--draft-trunk-candidates", default="1,2,4,8,16")
+    parser.add_argument(
+        "--cache-candidates",
+        default="0.5,1,4,8,16,32",
+        help="comma/space GB list or 'auto' for geometric same-budget candidates",
+    )
+    parser.add_argument(
+        "--draft-trunk-candidates",
+        default="1,2,4,8,16",
+        help="comma/space GB list or 'auto' when a draft trunk is active",
+    )
+    parser.add_argument(
+        "--auto-min-gb",
+        type=float,
+        default=0.25,
+        help="smallest candidate used by automatic memory candidate generation (default 0.25)",
+    )
     parser.add_argument("--cache-seed-gb", type=float, default=1.0)
     parser.add_argument("--draft-seed-gb", type=float, default=4.0)
     parser.add_argument("--trunk-min-gb", type=float, default=1.0)
+    parser.add_argument(
+        "--max-rss-gb",
+        type=float,
+        default=None,
+        help=(
+            "post-run recommendation guard: exclude any allocation with an observed K3 peak RSS "
+            "above this value; not a preventive OOM/hard-RSS limit"
+        ),
+    )
     parser.add_argument("--out", default="k3-memory-autotune.json")
     parser.add_argument("--keep-run-files", action="store_true")
     parser.add_argument("--timeout", type=float, default=None)
@@ -174,10 +270,23 @@ def main() -> int:
         parser.error("--trunk-min-gb must be > 0")
     if ns.trunk_min_gb >= ns.allocator_budget_gb:
         parser.error("--trunk-min-gb must be smaller than --allocator-budget-gb")
+    if not (ns.auto_min_gb > 0.0):
+        parser.error("--auto-min-gb must be > 0")
+    if ns.max_rss_gb is not None and not (ns.max_rss_gb > 0.0):
+        parser.error("--max-rss-gb must be > 0")
 
     have_draft = candidate_arg_present(k3_args, "--draft-trunk")
-    cache_values = parse_float_candidates(ns.cache_candidates)
-    draft_values = parse_float_candidates(ns.draft_trunk_candidates) if have_draft else [0.0]
+    available = ns.allocator_budget_gb - ns.trunk_min_gb
+    try:
+        cache_values, cache_auto = resolve_candidates(ns.cache_candidates, available, ns.auto_min_gb)
+        if have_draft:
+            draft_values, draft_auto = resolve_candidates(
+                ns.draft_trunk_candidates, available, ns.auto_min_gb
+            )
+        else:
+            draft_values, draft_auto = [0.0], False
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     if ns.k3_bin:
         k3_bin = Path(ns.k3_bin)
@@ -272,7 +381,14 @@ def main() -> int:
                 f"candidate={alloc}\nNo recommendation was produced."
             )
         peak = parse_peak_rss_gb(log_text)
+        if ns.max_rss_gb is not None and peak is None:
+            raise RuntimeError(
+                "cannot enforce --max-rss-gb because K3 did not print its PEAK RSS diagnostic"
+            )
+        within_max_rss = None if ns.max_rss_gb is None else bool(peak <= ns.max_rss_gb + EPS)
         peak_text = f", peak RSS {peak:.3f} GB" if peak is not None else ""
+        if within_max_rss is False:
+            peak_text += f" (OVER {ns.max_rss_gb:g} GB limit)"
         print(f"{seconds:.6f} s/token{peak_text}")
         run = Run(
             phase=phase,
@@ -280,6 +396,7 @@ def main() -> int:
             repeat=repeat,
             seconds_per_token=seconds,
             peak_rss_gb=peak,
+            within_max_rss=within_max_rss,
             generated_ids=generated,
             full_ids=full,
             json_path=str(json_path) if ns.keep_run_files else "",
@@ -301,11 +418,16 @@ def main() -> int:
     print("K3 fixed-budget memory autotune")
     print(f"  allocator budget : {ns.allocator_budget_gb:.3f} GB")
     print(f"  trunk minimum    : {ns.trunk_min_gb:.3f} GB")
-    print(f"  cache candidates : {valid_cache}")
-    print(f"  draft candidates : {valid_draft if have_draft else 'not active'}")
+    print(f"  cache candidates : {valid_cache}{' (auto)' if cache_auto else ''}")
+    print(
+        f"  draft candidates : "
+        f"{(str(valid_draft) + (' (auto)' if draft_auto else '')) if have_draft else 'not active'}"
+    )
     print(f"  strategy         : {ns.strategy}")
+    if ns.max_rss_gb is not None:
+        print(f"  max observed RSS : {ns.max_rss_gb:.3f} GB recommendation guard")
     print("  exactness guard  : generated_ids + full_ids must match on every run")
-    print("  note             : peak RSS is observed, not constrained by allocator-budget-gb")
+    print("  note             : RSS guard is post-run; it cannot prevent an OOM before measurement")
 
     try:
         if ns.strategy == "grid":
@@ -318,39 +440,48 @@ def main() -> int:
             sweep("grid", allocations)
             medians: dict[Allocation, float] = {}
             for alloc in set(allocations):
+                if not allocation_within_rss(runs, alloc, ns.max_rss_gb):
+                    continue
                 samples = [r.seconds_per_token for r in runs if r.phase == "grid" and r.allocation == alloc]
                 medians[alloc] = statistics.median(samples)
+            if not medians:
+                detail = f" under --max-rss-gb {ns.max_rss_gb:g}" if ns.max_rss_gb is not None else ""
+                raise RuntimeError(f"grid search has no eligible measured allocation{detail}")
             best = min(medians, key=medians.get)
         elif not have_draft:
             allocations = [valid_allocation(cache, 0.0) for cache in valid_cache]
             sweep("cache", [a for a in allocations if a is not None])
-            best_cache = best_value(runs, "cache", "cache")
+            best_cache = best_value(runs, "cache", "cache", ns.max_rss_gb)
             best = valid_allocation(best_cache, 0.0)
             assert best is not None
         else:
             cache_allocs = [valid_allocation(cache, draft_seed) for cache in valid_cache]
             sweep("cache-1", [a for a in cache_allocs if a is not None])
-            best_cache_1 = best_value(runs, "cache-1", "cache")
+            best_cache_1 = best_value(runs, "cache-1", "cache", ns.max_rss_gb)
 
             draft_allocs = [valid_allocation(best_cache_1, draft) for draft in valid_draft]
             sweep("draft", [a for a in draft_allocs if a is not None])
-            best_draft = best_value(runs, "draft", "draft")
+            best_draft = best_value(runs, "draft", "draft", ns.max_rss_gb)
 
             if abs(best_draft - draft_seed) > 1e-12:
                 cache_confirm = [valid_allocation(cache, best_draft) for cache in valid_cache]
                 sweep("cache-2", [a for a in cache_confirm if a is not None])
-                best_cache = best_value(runs, "cache-2", "cache")
+                best_cache = best_value(runs, "cache-2", "cache", ns.max_rss_gb)
             else:
                 best_cache = best_cache_1
             best = valid_allocation(best_cache, best_draft)
             assert best is not None
 
-        final_samples = [r.seconds_per_token for r in runs if r.allocation == best]
+        if not allocation_within_rss(runs, best, ns.max_rss_gb):
+            raise RuntimeError("internal error: selected allocation violates the observed RSS guard")
+        final_runs = [run for run in runs if run.allocation == best]
+        final_samples = [run.seconds_per_token for run in final_runs]
         if not final_samples:
             raise RuntimeError("internal error: final allocation has no samples")
         final_median = statistics.median(final_samples)
-        peak_samples = [r.peak_rss_gb for r in runs if r.allocation == best and r.peak_rss_gb is not None]
+        peak_samples = [run.peak_rss_gb for run in final_runs if run.peak_rss_gb is not None]
         peak_median = statistics.median(peak_samples) if peak_samples else None
+        peak_max = max(peak_samples) if peak_samples else None
 
         summary = {
             "model_dir": ns.model_dir,
@@ -358,8 +489,12 @@ def main() -> int:
             "k3_args": k3_args,
             "allocator_budget_gb": ns.allocator_budget_gb,
             "trunk_min_gb": ns.trunk_min_gb,
+            "max_rss_gb": ns.max_rss_gb,
+            "auto_min_gb": ns.auto_min_gb,
             "strategy": ns.strategy,
             "repeats": ns.repeats,
+            "cache_candidates_auto": cache_auto,
+            "draft_trunk_candidates_auto": draft_auto if have_draft else False,
             "cache_candidates_gb": valid_cache,
             "draft_trunk_candidates_gb": valid_draft if have_draft else None,
             "recommended": {
@@ -369,6 +504,7 @@ def main() -> int:
                 "allocator_sum_gb": best.trunk_gb + best.cache_gb + best.draft_trunk_gb,
                 "median_seconds_per_token": final_median,
                 "median_peak_rss_gb": peak_median,
+                "max_peak_rss_gb": peak_max,
                 "samples_at_final_allocation": len(final_samples),
             },
             "reference_generated_ids": reference_generated,
@@ -391,9 +527,11 @@ def main() -> int:
         print(f"  fixed allocator sum: {best.trunk_gb + best.cache_gb + best.draft_trunk_gb:.3f} GB")
         if peak_median is not None:
             print(f"  observed median peak RSS: {peak_median:.3f} GB")
+        if peak_max is not None:
+            print(f"  observed max peak RSS: {peak_max:.3f} GB")
         print(f"  observed median: {final_median:.6f} s/token")
         print(f"  summary: {out_path}")
-        print("\nThis is a same-budget performance comparison, not an OS hard-RSS guarantee.")
+        print("\nThis is a same-budget performance comparison; RSS filtering is post-run, not an OOM guarantee.")
         return 0
     finally:
         if temp_ctx is not None:
