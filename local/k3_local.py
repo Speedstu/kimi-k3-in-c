@@ -215,6 +215,10 @@ class BackendConfig:
     threads: int | None = None
     cache_gb: float | None = None
     trunk_gb: float | None = None
+    draft_trunk: Path | None = None
+    draft_trunk_gb: float = 32.0
+    draft_topk: int = 4
+    spec: int = 4
 
 
 @dataclass
@@ -387,6 +391,17 @@ class CBackend:
                     cmd += ["--cache-gb", str(self.cfg.cache_gb)]
                 if self.cfg.trunk_gb is not None:
                     cmd += ["--trunk-gb", str(self.cfg.trunk_gb)]
+                if self.cfg.draft_trunk is not None:
+                    cmd += [
+                        "--draft-trunk",
+                        str(self.cfg.draft_trunk),
+                        "--draft-trunk-gb",
+                        str(self.cfg.draft_trunk_gb),
+                        "--draft-topk",
+                        str(self.cfg.draft_topk),
+                        "--spec",
+                        str(self.cfg.spec),
+                    ]
 
                 proc = subprocess.run(cmd, text=True, capture_output=True)
                 if proc.returncode != 0:
@@ -472,6 +487,17 @@ class CBackend:
                     cmd += ["--cache-gb", str(self.cfg.cache_gb)]
                 if self.cfg.trunk_gb is not None:
                     cmd += ["--trunk-gb", str(self.cfg.trunk_gb)]
+                if self.cfg.draft_trunk is not None:
+                    cmd += [
+                        "--draft-trunk",
+                        str(self.cfg.draft_trunk),
+                        "--draft-trunk-gb",
+                        str(self.cfg.draft_trunk_gb),
+                        "--draft-topk",
+                        str(self.cfg.draft_topk),
+                        "--spec",
+                        str(self.cfg.spec),
+                    ]
 
                 proc = subprocess.Popen(
                     cmd,
@@ -858,6 +884,10 @@ def serve(args: argparse.Namespace) -> None:
         threads=args.threads,
         cache_gb=args.cache_gb,
         trunk_gb=args.trunk_gb,
+        draft_trunk=args.draft_trunk.resolve() if args.draft_trunk else None,
+        draft_trunk_gb=args.draft_trunk_gb,
+        draft_topk=args.draft_topk,
+        spec=args.spec,
     )
     for path, label in [
         (cfg.model_dir, "model"),
@@ -866,6 +896,10 @@ def serve(args: argparse.Namespace) -> None:
     ]:
         if not path.exists():
             raise SystemExit(f"{label} path does not exist: {path}")
+    if cfg.draft_trunk is not None and not cfg.draft_trunk.exists():
+        raise SystemExit(f"draft trunk path does not exist: {cfg.draft_trunk}")
+    if cfg.draft_topk < 1 or cfg.spec < 1:
+        raise SystemExit("--draft-topk and --spec must both be >= 1")
 
     state_root: Path | None = None
     if not args.no_state_cache and args.state_cache_entries > 0:
@@ -877,6 +911,13 @@ def serve(args: argparse.Namespace) -> None:
     print(f"K3 Local listening on http://{args.host}:{args.port}/v1")
     print("inference network: OFF; tokenizer + weights are local-files-only")
     print("default parity profile: reasoning=max, temperature=1.0, top-p=1.0")
+    if cfg.draft_trunk is not None:
+        print(
+            f"sampled speculative draft: ON ({cfg.draft_trunk}, top-{cfg.draft_topk}, "
+            f"spec={cfg.spec}); exact K3 p/q verification remains authoritative"
+        )
+    else:
+        print("sampled speculative draft: OFF")
     if state_root is not None:
         print(
             f"conversation state cache: ON ({args.state_cache_entries} entry/entries; "
@@ -901,6 +942,14 @@ def main() -> None:
     sp.add_argument("--threads", type=int)
     sp.add_argument("--cache-gb", type=float)
     sp.add_argument("--trunk-gb", type=float)
+    sp.add_argument(
+        "--draft-trunk",
+        type=Path,
+        help="optional local Q4/I8/BF16 speculative draft trunk; exact K3 still verifies",
+    )
+    sp.add_argument("--draft-trunk-gb", type=float, default=32.0)
+    sp.add_argument("--draft-topk", type=int, default=4)
+    sp.add_argument("--spec", type=int, default=4)
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--port", type=int, default=8000)
     sp.add_argument(

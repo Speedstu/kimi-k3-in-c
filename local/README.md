@@ -190,11 +190,23 @@ The C engine now supports:
 Temperature 0 remains the legacy exact greedy path. Temperature 1 / top-p 1 is the coding
 agent profile. A fixed seed is reproducible inside this engine.
 
-Sampled speculative decoding is intentionally **not** faked. The existing speculative
-path is exact for greedy decode; proper sampled speculation needs rejection sampling using
-both target and draft probabilities. Until that is implemented, asking for sampling plus
-`--spec` / `--draft-trunk` is rejected instead of silently changing the target
-distribution.
+Sampled speculative decoding is now probability-correct. A draft proposal `y~q` is
+accepted with `min(1,p(y)/q(y))`; on the first rejection the correction is drawn from the
+normalised residual `(p-q)+`, and after a fully accepted block the extra token is sampled
+from exact K3's next distribution. This preserves the target K3 distribution while allowing
+a cheap Q4/I8 draft at `temperature=1`.
+
+To enable it for the localhost/Kimi Code bridge, add for example:
+
+```bash
+python local/k3_local.py serve \
+  --model-dir ~/k3model --trunk ~/k3trunk-lossless --preset laptop --threads N \
+  --draft-trunk ~/k3draft-q4 --draft-trunk-gb 32 --draft-topk 4 --spec 4
+```
+
+The draft can change acceptance rate and wall-clock speed, but exact K3 remains the
+verification/target distribution. Sweep draft top-k/spec length on the real machine rather
+than assuming one setting is universally fastest.
 
 ## True committed-token streaming
 
