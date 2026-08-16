@@ -54,7 +54,11 @@ jobs:
         run: |
           set -uo pipefail
           D=/tmp/k3wave-out
-          COMMON='/tmp/k3wave --trunk /tmp/k3wave-trunk --trunk-gb 0.05 --cache-gb 0.0004 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --gen 3 --incremental --threads 1 --temperature 0'
+          # Keep gen=1 deliberately: k3 resets cache statistics before each generated
+          # token, so the final report then covers the prefill window we are testing.
+          # A longer generation would erase the prefill async-batch counters before the
+          # final report and make the scheduling assertion compare decode-only stats.
+          COMMON='/tmp/k3wave --trunk /tmp/k3wave-trunk --trunk-gb 0.05 --cache-gb 0.0004 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --gen 1 --incremental --threads 1 --temperature 0'
 
           K3_NO_PREFILL_PIPELINE=1 ./bin/k3 $COMMON --dump-logits "$D/old.logits" --out "$D/old.json" >"$D/old.log" 2>&1
           old_rc=$?
@@ -102,6 +106,7 @@ jobs:
           ob, nb=batches(old), batches(new)
           print('prefill-wave exact ids:',a['generated_ids'])
           print('async batches old/new:',ob,nb)
+          print(f'::notice::prefill-wave summary logits_equal=1 ids_equal=1 async_old={ob} async_waves={nb}')
           assert nb > ob, (ob,nb)
           print('PREFILL EXPERT WAVES PARITY + SCHEDULING PASS')
           PY
