@@ -287,7 +287,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
      * converges in two or three passes and is monotone, so the loop is bounded. At the
      * floor, where npin is 0, this correctly changes nothing: every layer streams and the
      * ring must still hold the biggest of them. */
-    int64_t ring_slot = 0, spent = 0;
+    int64_t ring_slot = 0;
     int npin = 0;
     for (int pass = 0; pass < 4; pass++) {
         int64_t big = 0;
@@ -313,8 +313,8 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             np++;
         }
         if (np >= tr->n_layers) np = tr->n_layers;
-        if (rs == ring_slot && np == npin) { ring_slot = rs; spent = sp; break; }
-        ring_slot = rs; npin = np; spent = sp;
+        if (rs == ring_slot && np == npin) { ring_slot = rs; break; }
+        ring_slot = rs; npin = np;
     }
 
     tr->npin = npin;
