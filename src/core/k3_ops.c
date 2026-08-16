@@ -568,7 +568,7 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         float *ot = out + (size_t)t * E;
 
         /* 1. route on the FULL width, before the down-projection */
-        k3_router(idx, wt, xt, w->gate, w->wdt, w->bias, E, c->n_experts, K,
+        k3_router(idx, wt, xt, w->gate, w->gate_wdt, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
 
         int nk = K;
@@ -736,7 +736,7 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         const float *xt = x + (size_t)t * E;
         int   *it = ridx + (size_t)t * K;
         float *wtt = rwt + (size_t)t * K;
-        k3_router(it, wtt, xt, w->gate, w->wdt, w->bias, E, c->n_experts, K,
+        k3_router(it, wtt, xt, w->gate, w->gate_wdt, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
         k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {

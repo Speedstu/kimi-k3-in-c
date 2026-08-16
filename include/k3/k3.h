@@ -375,8 +375,9 @@ typedef struct {
      * matrices. On the exact checkpoint it remains BF16 and is widened on read inside
      * k3_router, eliminating a full gate-sized fp32 expansion per streamed layer. Draft
      * I8R/Q4G gates are consumed in their native proposal-only formats too. */
-    const void  *gate;                   /* router: [n_experts][hidden], tagged by wdt */
+    const void  *gate;                   /* router: [n_experts][hidden]                */
     const float *bias;                   /* [n_experts], elementwise: stays fp32       */
+    int          gate_wdt;               /* resident FP32; streamed/draft native dtype */
     const float *w1, *w3, *w2;           /* resident expert bank, fixtures only      */
     const float *latent_norm;            /* [latent], elementwise: stays fp32        */
     const void  *down, *up;              /* [latent][hidden], [hidden][latent]       */

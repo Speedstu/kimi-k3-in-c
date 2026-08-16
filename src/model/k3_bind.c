@@ -24,6 +24,7 @@ typedef struct {
     int64_t         want;      /* elements the engine expects, -1 to accept whatever */
     int64_t         take;      /* elements actually copied (A_log takes a prefix)    */
     int             narrow;    /* 1 = keep bf16 bytes, 0 = widen to fp32             */
+    int             router_gate;/* resident wide, streamed native storage              */
     const void    **dest;
     size_t          off;       /* byte offset into the blob, filled during sizing    */
 } Req;
@@ -44,6 +45,7 @@ static void req_(Plan *p, const void **dest, int narrow, int64_t want, int64_t t
     vsnprintf(q->name, sizeof q->name, fmt, ap);
     q->dest = dest; q->want = want; q->take = take < 0 ? want : take;
     q->narrow = narrow && p->narrow_ok;
+    q->router_gate = 0;
     q->t = NULL; q->off = 0;
     p->n++;
 }
@@ -63,6 +65,17 @@ static void reqn(Plan *p, const void **dest, int64_t want, const char *fmt, ...)
     va_list ap; va_start(ap, fmt);
     req_(p, dest, 1, want, -1, fmt, ap);
     va_end(ap);
+}
+
+/* ROUTER GATE: resident checkpoint binding widens once to FP32 (fastest repeated
+ * router), while streaming binding points directly at BF16/I8R/Q4G to avoid a full
+ * gate-sized conversion every layer/token. */
+static void reqg(Plan *p, const void **dest, int64_t want, const char *fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    req_(p, dest, 0, want, -1, fmt, ap);
+    va_end(ap);
+    p->r[p->n - 1].router_gate = 1;
 }
 
 static size_t align8(size_t x) { return (x + 7u) & ~(size_t)7u; }
@@ -219,9 +232,7 @@ static void plan_layer(Plan *p, const K3Cfg *c, int L, K3LayerBind *b, int is_ml
         reqn(p, &b->lay.dense_down, H * (int64_t)c->dense_inter, PRE "layers.%d.mlp.down_proj.weight", L);
     } else {
         const int64_t SI = (int64_t)c->moe_inter * c->n_shared;   /* fused: 6144 */
-        /* Gate is a real matrix too. Exact BF16 is consumed directly by k3_router;
-         * draft I8R/Q4G is proposal-only and follows the layer's tagged matrix format. */
-        reqn(p, &b->moe.gate, (int64_t)c->n_experts * H,
+        reqg(p, &b->moe.gate, (int64_t)c->n_experts * H,
              PRE "layers.%d.block_sparse_moe.gate.weight", L);
         reqw(p, &b->moe.bias, c->n_experts, -1,
              PRE "layers.%d.block_sparse_moe.gate.e_score_correction_bias", L);
@@ -289,6 +300,7 @@ int k3_bind_layer(const K3St *s, const K3Cfg *c, int L, K3LayerBind *b)
     /* Tag the structs to match how their matrices were ACTUALLY stored, which is what
      * plan_resolve just decided, not what this function hoped for. */
     b->kda.wdt = b->mla.wdt = b->moe.wdt = b->lay.wdt = wdt;
+    if (!is_dense) b->moe.gate_wdt = K3_WF32;
 
     /* Exactly one of kda/mla is non-NULL; the decoder branches on that, not on a flag. */
     b->lay.kda = is_mla ? NULL : &b->kda;
@@ -336,6 +348,40 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
         int64_t off = 0, nb = 0; int dt = 0;
         if (src->find(src->ctx, q->name, &off, &nb, &dt) != 0) {
             fprintf(stderr, "k3_bind_mem: %s not present in the packed run\n", q->name);
+            return -1;
+        }
+        if (q->router_gate) {
+            if (dt == K3_DT_BF16) {
+                if (nb != q->take * 2) {
+                    fprintf(stderr, "k3_bind_mem: %s bad BF16 router size\n", q->name);
+                    return -1;
+                }
+                *q->dest = run + off;
+                b->moe.gate_wdt = K3_WBF16;
+                continue;
+            }
+            if (dt == K3_DT_I8R) {
+                *q->dest = run + off;
+                b->moe.gate_wdt = K3_WI8;
+                i8_seen = 1;
+                continue;
+            }
+            if (dt == K3_DT_Q4G) {
+                *q->dest = run + off;
+                b->moe.gate_wdt = K3_WQ4G;
+                q4_seen = 1;
+                continue;
+            }
+            if (dt == K3_DT_F32) {
+                if (nb != q->take * 4) {
+                    fprintf(stderr, "k3_bind_mem: %s bad FP32 router size\n", q->name);
+                    return -1;
+                }
+                *q->dest = run + off;
+                b->moe.gate_wdt = K3_WF32;
+                continue;
+            }
+            fprintf(stderr, "k3_bind_mem: %s unsupported router dtype %d\n", q->name, dt);
             return -1;
         }
         /* Groupwise Q4 draft tensor. The Q4 packer requires each matrix row width
