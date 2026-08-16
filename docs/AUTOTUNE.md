@@ -50,7 +50,8 @@ RECOMMENDED
 
 On Windows it also prints the PowerShell and `cmd.exe` forms for the environment
 variable. The exact `N` and `M` must come from your machine; values from CI or another
-computer are not transferable recommendations.
+computer are not transferable recommendations. The tiny CI result is only a functional
+test of the tuner and must never be copied as a real-K3 hardware recommendation.
 
 ## Correctness guard
 
