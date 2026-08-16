@@ -3,15 +3,18 @@ name: Batched dense BF16 prefill parity
 on:
   workflow_dispatch:
   push:
-    branches: [speedboost/prefill-batched-dense-bf16]
     paths:
       - 'src/core/k3_ops.c'
-      - 'tools/patch_prefill_batched_dense_bf16.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-dense-bf16-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
       - 'tools/make_tiny_checkpoint.py'
       - '.github/workflows/prefill-batched-dense-bf16-parity.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   exactness:
@@ -19,14 +22,9 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.ref_name }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-
-      - name: Apply exact dense BF16 prefill transform once
-        run: python tools/patch_prefill_batched_dense_bf16.py
 
       - name: Strict AVX2 build and full weightless oracle
         run: |
@@ -85,18 +83,3 @@ jobs:
             done
           done
           echo 'BATCHED DENSE BF16 PREFILL EXACTNESS PASS (72 tokens, 64+8 chunks, plain + cached, 1 + 4 threads)'
-
-      - name: Persist generated source after gates pass
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- src/core/k3_ops.c; then
-            echo 'source already committed'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/core/k3_ops.c
-          git commit -m 'perf: batch exact dense BF16 prefill MLP'
-          git fetch origin "${{ github.ref_name }}"
-          git rebase "origin/${{ github.ref_name }}"
-          git push origin HEAD:${{ github.ref_name }}
