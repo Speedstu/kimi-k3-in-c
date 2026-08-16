@@ -1,0 +1,40 @@
+name: Split ring geometry probe
+
+on:
+  push:
+    branches: [speedboost/laptop-split-ring]
+    paths:
+      - '.github/workflows/split-ring-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  geometry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Generate tiny packed trunk and print layer sizes
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3trunk "$NLAYERS"
+          python - <<'PY'
+          import json
+          j=json.load(open('/tmp/k3trunk/trunk.json'))
+          s=[int(x['nbytes']) for x in j['layers']]
+          print('layer_bytes=',s)
+          print('layer0=',s[0],'max_rest=',max(s[1:]),'ratio=',s[0]/max(s[1:]))
+          print('one_big=',max(s),'two_rest=',2*max(s[1:]))
+          PY
