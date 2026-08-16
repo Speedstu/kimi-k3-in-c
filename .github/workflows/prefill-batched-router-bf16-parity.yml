@@ -1,0 +1,134 @@
+name: Batched BF16 router prefill parity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [speedboost/prefill-batched-router-bf16]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'tools/patch_prefill_batched_router_bf16.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-router-bf16-parity.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Apply exact BF16 router transform once
+        run: python tools/patch_prefill_batched_router_bf16.py
+
+      - name: Strict AVX2 build and full weightless oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build streamed tiny K3 with native BF16 router gates
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy safetensors
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3router /tmp/k3router-trunk /tmp/k3router-out
+          mkdir -p /tmp/k3router-out
+          IDS='3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54'
+          python tools/make_tiny_checkpoint.py /tmp/k3router --seed 2033 --prompt-ids "$IDS"
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import torch
+          from safetensors.torch import load_file, save_file
+          total = 0
+          for p in sorted(Path('/tmp/k3router').rglob('*.safetensors')):
+              d = load_file(str(p))
+              changed = 0
+              for k in list(d):
+                  if k.endswith('.block_sparse_moe.gate.weight'):
+                      d[k] = d[k].to(torch.bfloat16)
+                      changed += 1
+              if changed:
+                  tmp = str(p) + '.tmp'
+                  save_file(d, tmp)
+                  os.replace(tmp, p)
+                  total += changed
+          assert total > 0, 'no MoE router gates found to convert to BF16'
+          print('converted router gates to BF16:', total)
+          PY
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3router/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3router /tmp/k3router-trunk "$NLAYERS"
+          python - <<'PY'
+          import json
+          m=json.load(open('/tmp/k3router-trunk/trunk.json'))
+          gates=[]
+          for layer in m['layers']:
+              for name, meta in layer['tensors'].items():
+                  if name.endswith('.block_sparse_moe.gate.weight'):
+                      gates.append((name, meta['dtype']))
+          assert gates and all(dt == 'BF16' for _, dt in gates), gates
+          print('streamed router dtype gate: PASS, BF16 gates=', len(gates))
+          PY
+          echo "$IDS" >/tmp/k3router-out/ids.txt
+
+      - name: Scalar vs batched BF16 router are binary-identical
+        run: |
+          set -euo pipefail
+          D=/tmp/k3router-out
+          IDS=$(cat "$D/ids.txt")
+          BASE="/tmp/k3router --trunk /tmp/k3router-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids $IDS --gen 1 --temperature 0"
+          for MODE in plain incremental; do
+            EXTRA=''
+            if [ "$MODE" = incremental ]; then EXTRA='--incremental'; fi
+            for T in 1 4; do
+              /usr/bin/time -f "old_${MODE}_t${T}_wall=%e" -o "$D/old-${MODE}-t${T}.time" \
+                env K3_NO_PREFILL_BATCH_ROUTER_BF16=1 ./bin/k3 $BASE $EXTRA --threads "$T" \
+                --dump-logits "$D/old-${MODE}-t${T}.logits" --out "$D/old-${MODE}-t${T}.json" \
+                >"$D/old-${MODE}-t${T}.log" 2>&1
+              /usr/bin/time -f "batch_${MODE}_t${T}_wall=%e" -o "$D/batch-${MODE}-t${T}.time" \
+                ./bin/k3 $BASE $EXTRA --threads "$T" \
+                --dump-logits "$D/batch-${MODE}-t${T}.logits" --out "$D/batch-${MODE}-t${T}.json" \
+                >"$D/batch-${MODE}-t${T}.log" 2>&1
+              cmp "$D/old-${MODE}-t${T}.logits" "$D/batch-${MODE}-t${T}.logits"
+              python3 - "$MODE" "$T" <<'PY'
+          import json, sys
+          d='/tmp/k3router-out'; mode=sys.argv[1]; t=sys.argv[2]
+          a=json.load(open(f'{d}/old-{mode}-t{t}.json'))
+          b=json.load(open(f'{d}/batch-{mode}-t{t}.json'))
+          assert a['generated_ids'] == b['generated_ids'], (mode, t, a['generated_ids'], b['generated_ids'])
+          assert a['full_ids'] == b['full_ids']
+          print(f'{mode} threads={t}: binary logits + ids PASS')
+          print(open(f'{d}/old-{mode}-t{t}.time').read().strip())
+          print(open(f'{d}/batch-{mode}-t{t}.time').read().strip())
+          PY
+            done
+          done
+          echo 'BATCHED BF16 ROUTER PREFILL EXACTNESS PASS (plain + cached, 1 + 4 threads)'
+
+      - name: Persist generated source after gates pass
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/core/k3_ops.c; then
+            echo 'source already committed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/core/k3_ops.c
+          git commit -m 'perf: batch exact BF16 router prefill'
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
