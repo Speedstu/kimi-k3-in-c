@@ -718,7 +718,7 @@ class ResidentCBackend:
                         raise RuntimeError(f"resident K3 worker rejected/failed request (code {code})")
                     if line.startswith(f"@K3DRAFT {rid} "):
                         fields = line.split()
-                        if len(fields) != 8:
+                        if len(fields) != 7:
                             raise RuntimeError(f"malformed resident worker DRAFT line: {line!r}")
                         proposed = int(fields[3])
                         accepted = int(fields[4])
