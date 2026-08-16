@@ -45,9 +45,7 @@ jobs:
             --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
           NLAYERS=$(python - <<'PY'
           import json
-          x=json.load(open('/tmp/k3wave/config.json'))
-          print(x['num_hidden_layers'])
-          print('stress config:', x['n_routed_experts'], 'experts top', x['num_experts_per_tok'], file=__import__('sys').stderr)
+          print(json.load(open('/tmp/k3wave/config.json'))['num_hidden_layers'])
           PY
           )
           python tools/pack_trunk.py /tmp/k3wave /tmp/k3wave-trunk "$NLAYERS"
