@@ -1,0 +1,46 @@
+name: Stage resident worker
+
+on:
+  push:
+    branches: ['feature/resident-local-worker']
+    paths:
+      - 'src/cli/k3_worker.c'
+      - 'tools/apply_worker_build_stage.py'
+      - '.github/workflows/worker-stage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/resident-local-worker
+      - name: Apply guarded build wiring
+        run: python3 tools/apply_worker_build_stage.py
+      - name: Build both CLIs and run tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+          ./bin/k3-worker --help >/dev/null
+          make ARCH='-mavx2 -mfma' test -j"$(nproc)"
+      - name: Strict warnings
+        run: |
+          rm -rf build bin
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -Werror' -j"$(nproc)"
+      - name: CMake parity
+        run: |
+          cmake -S . -B /tmp/k3-worker-cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/k3-worker-cmake -j"$(nproc)"
+          test -x /tmp/k3-worker-cmake/k3-worker
+          ctest --test-dir /tmp/k3-worker-cmake --output-on-failure
+      - name: Commit validated wiring
+        run: |
+          git config user.name Speedstu
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add Makefile CMakeLists.txt
+          git diff --cached --quiet || git commit -m 'build: wire resident K3 worker into Make and CMake'
+          git push origin HEAD:feature/resident-local-worker
