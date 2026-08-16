@@ -1,0 +1,111 @@
+name: Diagnose async trunk prebind
+
+on:
+  push:
+    branches: [speedboost/async-trunk-prebind]
+    paths:
+      - 'src/io/k3_trunk.h'
+      - 'tools/patch_trunk_prebind.py'
+      - '.github/workflows/async-trunk-prebind-diagnostic.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Diagnose and persist status
+        shell: bash
+        run: |
+          set +e
+          STATUS=/tmp/prebind-status.txt
+          : > "$STATUS"
+          python tools/patch_trunk_prebind.py >/tmp/patch.log 2>&1
+          patch_rc=$?
+          echo "patch_rc=$patch_rc" >> "$STATUS"
+          cat /tmp/patch.log >> "$STATUS"
+
+          build_rc=99; oracle_rc=99; fixture_rc=99
+          if [ "$patch_rc" -eq 0 ]; then
+            make clean >/tmp/build.log 2>&1
+            make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2 >>/tmp/build.log 2>&1
+            build_rc=$?
+            echo "build_rc=$build_rc" >> "$STATUS"
+            tail -80 /tmp/build.log >> "$STATUS"
+          fi
+          if [ "$build_rc" -eq 0 ]; then
+            make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2 >/tmp/oracle.log 2>&1
+            oracle_rc=$?
+            echo "oracle_rc=$oracle_rc" >> "$STATUS"
+            tail -80 /tmp/oracle.log >> "$STATUS"
+          fi
+          if [ "$oracle_rc" -eq 0 ]; then
+            python -m pip install --quiet numpy >/tmp/fixture.log 2>&1
+            python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu >>/tmp/fixture.log 2>&1
+            rm -rf /tmp/k3prebind /tmp/k3prebind-trunk /tmp/k3prebind-out
+            mkdir -p /tmp/k3prebind-out
+            python tools/make_tiny_checkpoint.py /tmp/k3prebind --seed 2060 --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14 >>/tmp/fixture.log 2>&1
+            NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3prebind/config.json'))['num_hidden_layers'])
+          PY
+            )
+            python tools/pack_trunk.py /tmp/k3prebind /tmp/k3prebind-trunk "$NLAYERS" >>/tmp/fixture.log 2>&1
+            IDS='3,7,11,5,9,2,4,6,8,10,12,14'
+            ./bin/k3 /tmp/k3prebind --ids "$IDS" --gen 10 --incremental --threads 1 --temperature 0 --out /tmp/k3prebind-out/resident.json >>/tmp/fixture.log 2>&1
+            ./bin/k3 /tmp/k3prebind --trunk /tmp/k3prebind-trunk --trunk-gb 0.001 --cache-gb 0.001 --ids "$IDS" --gen 10 --incremental --threads 1 --temperature 0 --out /tmp/k3prebind-out/streamed.json >/tmp/streamed.log 2>&1
+            run_rc=$?
+            cat /tmp/streamed.log >>/tmp/fixture.log
+            if [ "$run_rc" -eq 0 ]; then
+              python - <<'PY' >>/tmp/fixture.log 2>&1
+          import json,re
+          from pathlib import Path
+          d=Path('/tmp/k3prebind-out')
+          a=json.load(open(d/'resident.json')); b=json.load(open(d/'streamed.json'))
+          assert b['generated_ids'] == a['generated_ids']
+          assert b['full_ids'] == a['full_ids']
+          log=Path('/tmp/streamed.log').read_text()
+          ring=re.search(r'(\d+)/(\d+) layers PINNED, ring (\d+) x', log)
+          assert ring, 'no trunk layout line'
+          npin,total,nslot=map(int,ring.groups())
+          prep=re.search(r'prepared binds (\d+) built, (\d+) copied \((\d+) prepared on reader\)',log)
+          assert prep, 'no prepared bind report'
+          built,copied,async_built=map(int,prep.groups())
+          print('layout',npin,total,nslot,'prepared',built,copied,async_built)
+          assert 0 < npin < total
+          assert nslot >= 2
+          assert async_built > 0
+          assert copied > built
+          PY
+              fixture_rc=$?
+            else
+              fixture_rc=$run_rc
+            fi
+            echo "fixture_rc=$fixture_rc" >> "$STATUS"
+            tail -160 /tmp/fixture.log >> "$STATUS"
+          fi
+
+          cp "$STATUS" prebind-status.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add prebind-status.txt
+          if [ "$patch_rc" -eq 0 ] && [ "$build_rc" -eq 0 ] && [ "$oracle_rc" -eq 0 ] && [ "$fixture_rc" -eq 0 ]; then
+            echo 'overall=PASS' >> prebind-status.txt
+            git add src/io/k3_trunk.c prebind-status.txt
+          else
+            echo 'overall=FAIL' >> prebind-status.txt
+            git add prebind-status.txt
+          fi
+          git commit -m 'ci: record async trunk prebind diagnostic'
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
