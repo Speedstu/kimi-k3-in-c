@@ -1,0 +1,49 @@
+name: Windows overlapped read benchmark
+
+on:
+  push:
+    branches: [experiment/windows-overlapped-bench]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          path-type: inherit
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+      - name: Create 512 MiB deterministic file
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p=Path('win-pread-bench.bin')
+          block=bytes(range(256))*4096  # 1 MiB
+          with p.open('wb', buffering=0) as f:
+              for _ in range(512):
+                  f.write(block)
+          print(p.stat().st_size)
+          '@ | python -
+      - name: Build benchmark
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          gcc -O2 -std=gnu99 -Wall -Wextra -Werror -march=native -fopenmp \
+            -Isrc/io benchmarks/windows-pread-bench.c -o windows-pread-bench.exe
+      - name: A/B same-file positioned reads
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          ./windows-pread-bench.exe win-pread-bench.bin 8 8 8 | tee windows-pread-bench.txt
+          grep -q 'checksum parity   : PASS' windows-pread-bench.txt
