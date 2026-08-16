@@ -1,0 +1,71 @@
+name: MXFP4 direct decode parity
+
+on:
+  push:
+    branches: [speedboost/mxfp4-direct-decode]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_mxfp4_exact.c'
+      - '.github/workflows/mxfp4-direct-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_mxfp4_exact.c'
+      - '.github/workflows/mxfp4-direct-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Strict AVX2 build and full tests
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build AVX2 and scalar reference probes
+        run: |
+          set -euo pipefail
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off \
+             -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_avx2.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -msse2 -fopenmp -pthread -ffp-contract=off \
+             -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_scalar.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off \
+             -Iinclude -Iinclude/k3 benchmarks/bench_mxfp4_exact.c /tmp/k3_ops_avx2.o \
+             -o /tmp/mx_avx2 -lm -fopenmp -pthread
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -msse2 -fopenmp -pthread -ffp-contract=off \
+             -Iinclude -Iinclude/k3 benchmarks/bench_mxfp4_exact.c /tmp/k3_ops_scalar.o \
+             -o /tmp/mx_scalar -lm -fopenmp -pthread
+
+      - name: Bit-identical real-shape outputs
+        run: |
+          set -euo pipefail
+          OMP_NUM_THREADS=1 /tmp/mx_scalar | tee /tmp/scalar.log
+          OMP_NUM_THREADS=1 /tmp/mx_avx2 | tee /tmp/avx2.log
+          python3 - <<'PY'
+          import re
+          def hashes(path):
+              out={}
+              for line in open(path):
+                  m=re.match(r'(w1w3|w2).*hash=([0-9a-f]+)',line)
+                  if m: out[m.group(1)]=m.group(2)
+              return out
+          a=hashes('/tmp/scalar.log'); b=hashes('/tmp/avx2.log')
+          assert a.keys()=={'w1w3','w2'}, a
+          assert a==b, (a,b)
+          print('scalar vs AVX2 MXFP4 hashes identical:',a)
+          PY
+
+      - name: Record low-thread speed
+        run: |
+          set -euo pipefail
+          OMP_NUM_THREADS=2 /tmp/mx_avx2 | tee /tmp/avx2-2t.log
+          OMP_NUM_THREADS=4 /tmp/mx_avx2 | tee /tmp/avx2-4t.log
