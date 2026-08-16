@@ -115,7 +115,7 @@ jobs:
           test "$rc1" -eq 2
           test "$rc2" -eq 2
           grep -q 'requires --draft-trunk' /tmp/no-draft.log
-          grep -q 'autotune controls --draft-topk' /tmp/ambiguous.log
+          grep -q 'do not pass --draft-topk' /tmp/ambiguous.log
           echo 'draft top-k CLI guards: PASS'
 
   windows-python-cli:
