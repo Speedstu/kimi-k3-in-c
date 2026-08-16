@@ -1,0 +1,85 @@
+name: Batched dense BF16 prefill parity
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-dense-bf16-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - '.github/workflows/prefill-batched-dense-bf16-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Strict AVX2 build and full weightless oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build 72-token streamed dense fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3dense /tmp/k3dense-trunk /tmp/k3dense-out
+          mkdir -p /tmp/k3dense-out
+          IDS='3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38'
+          python tools/make_tiny_checkpoint.py /tmp/k3dense --seed 2032 --prompt-ids "$IDS"
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3dense/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3dense /tmp/k3dense-trunk "$NLAYERS"
+          echo "$IDS" >/tmp/k3dense-out/ids.txt
+
+      - name: Per-token dense BF16 vs batched dense BF16 are binary-identical
+        run: |
+          set -euo pipefail
+          D=/tmp/k3dense-out
+          IDS=$(cat "$D/ids.txt")
+          BASE="/tmp/k3dense --trunk /tmp/k3dense-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids $IDS --gen 1 --temperature 0"
+          for MODE in plain incremental; do
+            EXTRA=''
+            if [ "$MODE" = incremental ]; then EXTRA='--incremental'; fi
+            for T in 1 4; do
+              /usr/bin/time -f "old_${MODE}_t${T}_wall=%e" -o "$D/old-${MODE}-t${T}.time" \
+                env K3_NO_PREFILL_BATCH_DENSE_BF16=1 ./bin/k3 $BASE $EXTRA --threads "$T" \
+                --dump-logits "$D/old-${MODE}-t${T}.logits" --out "$D/old-${MODE}-t${T}.json" \
+                >"$D/old-${MODE}-t${T}.log" 2>&1
+              /usr/bin/time -f "batch_${MODE}_t${T}_wall=%e" -o "$D/batch-${MODE}-t${T}.time" \
+                ./bin/k3 $BASE $EXTRA --threads "$T" \
+                --dump-logits "$D/batch-${MODE}-t${T}.logits" --out "$D/batch-${MODE}-t${T}.json" \
+                >"$D/batch-${MODE}-t${T}.log" 2>&1
+              cmp "$D/old-${MODE}-t${T}.logits" "$D/batch-${MODE}-t${T}.logits"
+              python3 - "$MODE" "$T" <<'PY'
+          import json, sys
+          d='/tmp/k3dense-out'; mode=sys.argv[1]; t=sys.argv[2]
+          a=json.load(open(f'{d}/old-{mode}-t{t}.json'))
+          b=json.load(open(f'{d}/batch-{mode}-t{t}.json'))
+          assert a['generated_ids'] == b['generated_ids'], (mode, t, a['generated_ids'], b['generated_ids'])
+          assert a['full_ids'] == b['full_ids']
+          print(f'{mode} threads={t}: binary logits + ids PASS')
+          print(open(f'{d}/old-{mode}-t{t}.time').read().strip())
+          print(open(f'{d}/batch-{mode}-t{t}.time').read().strip())
+          PY
+            done
+          done
+          echo 'BATCHED DENSE BF16 PREFILL EXACTNESS PASS (72 tokens, 64+8 chunks, plain + cached, 1 + 4 threads)'
