@@ -61,6 +61,7 @@
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
 #include "k3_sample.h" /* benchmark-parity temperature/top-p sampling */
+#include "k3_spec_auto.h" /* cost-aware greedy speculative horizon */
 
 static double now_s(void)
 {
@@ -364,10 +365,12 @@ static void usage(FILE *f)
 "                        serial decode by construction; needs --incremental. An extra\n"
 "                        verified position costs ~22%% of a serial token when the trunk\n"
 "                        streams, so repetitive text decodes up to several times faster\n"
-"  --spec-auto           greedy-only adaptive horizon: start at 4 drafts, grow after a\n"
-"                        fully accepted sweep and shrink after poor acceptance. Exact K3\n"
-"                        still verifies every emitted token. --spec N becomes the ceiling\n"
-"                        (default ceiling 8). Sampling keeps fixed --spec for seeded parity\n"
+"  --spec-auto           greedy-only adaptive horizon: start at 4 drafts. With a draft\n"
+"                        trunk, measure end-to-end seconds/exact-token at each width,\n"
+"                        probe wider batches and back off measured regressions; poor\n"
+"                        acceptance still shrinks immediately. Without a draft trunk the\n"
+"                        acceptance controller is used. --spec N is the ceiling (8 max).\n"
+"                        Sampling keeps fixed --spec for seeded parity\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "diagnostics:\n"
@@ -1292,6 +1295,8 @@ int main(int argc, char **argv)
     int spec_cur = spec_auto ? (spec_limit < 4 ? spec_limit : 4) : spec_limit;
     long spec_auto_rounds = 0, spec_auto_proposed = 0, spec_auto_accepted = 0;
     int spec_auto_grows = 0, spec_auto_shrinks = 0;
+    K3SpecAutoCost spec_cost;
+    k3_spec_auto_cost_init(&spec_cost);
 
     float *spec_snap = NULL;
     if (spec_n > 0) {
@@ -1467,10 +1472,12 @@ int main(int argc, char **argv)
             const int base = w.cached;
             int d[K3_SPEC_MAX], nd = 0;
             const int spec_now = spec_auto ? spec_cur : spec_n;
+            double spec_round_t0 = 0.0;
             if (spec_snap && spec_now > 0 &&
                 T + spec_now + 1 < Tmax && base + spec_now + 1 <= w.kv_cap) {
                 if (dw.trunk) {
                     const double hyb_draft_t0 = now_s();
+                    spec_round_t0 = hyb_draft_t0;
                     /* The draft model proposes: k sequential one-token steps through
                      * the draft trunk, chaining its own argmax. Its state is
                      * snapshotted first so a partial acceptance can rewind it the
@@ -1556,22 +1563,6 @@ int main(int argc, char **argv)
                         }
                         if (correction < 0) frc = -1;
                     }
-                    if (spec_auto) {
-                        spec_auto_rounds++;
-                        spec_auto_proposed += nd;
-                        spec_auto_accepted += m;
-                        if (m == nd && spec_cur < spec_limit) {
-                            spec_cur++;
-                            spec_auto_grows++;
-                        } else if (m * 2 < nd && spec_cur > 1) {
-                            int next = (spec_cur + 1) / 2;
-                            if (next < 1) next = 1;
-                            if (next < spec_cur) {
-                                spec_cur = next;
-                                spec_auto_shrinks++;
-                            }
-                        }
-                    }
                     if (m == nd) {
                         /* every fed position had true context; state is exact */
                         w.cached = base + nd + 1;
@@ -1605,6 +1596,34 @@ int main(int argc, char **argv)
                                         h, br, dks, NULL, NULL) == 0) dw.cached = base + m + 1;
                             else frc = -1;
                         }
+                    }
+                    if (spec_auto && frc == 0) {
+                        int next = spec_cur;
+                        spec_auto_rounds++;
+                        spec_auto_proposed += nd;
+                        spec_auto_accepted += m;
+                        if (dw.trunk && spec_round_t0 > 0.0) {
+                            /* Measure the whole speculative transaction: proposal, exact
+                             * verify/replay, and draft resync.  This is the wall-clock cost
+                             * the user actually pays for the m accepted drafts plus the
+                             * exact correction token. */
+                            const double round_s = now_s() - spec_round_t0;
+                            k3_spec_auto_cost_observe(&spec_cost, spec_now, round_s, m + 1);
+                            next = k3_spec_auto_cost_choose(&spec_cost, spec_cur, spec_limit,
+                                                            nd, m);
+                        } else {
+                            /* Free n-gram drafting has no meaningful proposal cost to learn;
+                             * keep the proven acceptance-only controller for that path. */
+                            if (m == nd && spec_cur < spec_limit)
+                                next = spec_cur + 1;
+                            else if (m * 2 < nd && spec_cur > 1) {
+                                next = (spec_cur + 1) / 2;
+                                if (next < 1) next = 1;
+                            }
+                        }
+                        if (next > spec_cur) spec_auto_grows++;
+                        else if (next < spec_cur) spec_auto_shrinks++;
+                        spec_cur = next;
                     }
                     if (frc == 0) {
                         for (int i = 0; i < m; i++) emit[emitn++] = d[i];
@@ -1703,6 +1722,13 @@ int main(int argc, char **argv)
                spec_auto_proposed ? 100.0 * spec_auto_accepted / spec_auto_proposed : 0.0,
                spec_cur, spec_limit, spec_auto_grows, spec_auto_shrinks);
     }
+    {
+        const int cbest = k3_spec_auto_cost_best(&spec_cost, spec_limit, 0);
+        if (spec_auto && cbest)
+            printf("  cost-aware horizon: best observed %d at %.4f s/exact-token, "
+                   "probes %d, backoffs %d\n", cbest, spec_cost.ema_spt[cbest],
+                   spec_cost.probes, spec_cost.backoffs);
+    }
     if (dw.trunk && hyb_rounds > 0) {
         printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
                "mean accepted run %.2f\n",
@@ -1738,6 +1764,8 @@ int main(int argc, char **argv)
     }
     k3_cache_report(&cache, "final step");
 
+    const int spec_cost_best = k3_spec_auto_cost_best(&spec_cost, spec_limit, 0);
+    const double spec_cost_best_spt = spec_cost_best ? spec_cost.ema_spt[spec_cost_best] : 0.0;
     FILE *f = fopen(outp, "w");
     if (f) {
         fprintf(f, "{\"prompt_ids\":[");
@@ -1755,13 +1783,16 @@ int main(int argc, char **argv)
                    "\"spec_auto_proposed\":%ld,\"spec_auto_accepted\":%ld,"
                    "\"spec_auto_final\":%d,\"spec_auto_limit\":%d,"
                    "\"spec_auto_grows\":%d,\"spec_auto_shrinks\":%d,"
+                   "\"spec_auto_cost_best\":%d,\"spec_auto_cost_best_spt\":%.9g,"
+                   "\"spec_auto_cost_probes\":%d,\"spec_auto_cost_backoffs\":%d,"
                    "\"seconds_per_token\":%.4f}\n",
                 NL, compute_threads, temperature, top_p, sample_seed, stop_id,
                 hyb_rounds, hyb_drafted, hyb_accepted,
                 hyb_drafted ? (double)hyb_accepted / hyb_drafted : 0.0,
                 hyb_draft_s, hyb_verify_s, spec_auto, spec_auto_rounds,
                 spec_auto_proposed, spec_auto_accepted, spec_cur, spec_limit,
-                spec_auto_grows, spec_auto_shrinks, t_total / nout);
+                spec_auto_grows, spec_auto_shrinks, spec_cost_best, spec_cost_best_spt,
+                spec_cost.probes, spec_cost.backoffs, t_total / nout);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
