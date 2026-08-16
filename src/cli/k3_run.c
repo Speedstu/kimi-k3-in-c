@@ -340,6 +340,8 @@ static void usage(FILE *f)
 "  --top-p X             nucleus cutoff in (0,1], default 1.0\n"
 "  --seed N              deterministic sampler seed (default 1)\n"
 "  --stop-id N           stop after emitting this token id (default disabled)\n"
+"  --stream-tokens       flush one machine-readable @K3TOKEN <id> line as each\n"
+"                        verified output token is committed; normal logs remain\n"
 "  --threads N           OpenMP compute threads for this run. Exact output is unchanged;\n"
 "                        use benchmarks/thread-sweep.sh to MEASURE the best N\n"
 "  --incremental         carry KV cache and recurrent state between tokens\n"
@@ -654,6 +656,7 @@ int main(int argc, char **argv)
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0;
+    int stream_tokens = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--ids-file") && i + 1 < argc) ids_file = argv[++i];
@@ -685,6 +688,7 @@ int main(int argc, char **argv)
             else { trunk_gb = atof(v); budget_auto = 0; }
         }
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
+        else if (!strcmp(argv[i], "--stream-tokens")) stream_tokens = 1;
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
@@ -1519,6 +1523,13 @@ int main(int argc, char **argv)
         for (int i = 0; i < emitn && nout < gen && T < Tmax; i++) {
             seq[T++] = emit[i];
             outtok[nout++] = emit[i];
+            if (stream_tokens) {
+                /* A unique prefix lets a parent process ignore the human diagnostics on
+                 * stdout. Flush AFTER the token is committed to seq/outtok so a client
+                 * never observes an uncommitted speculative proposal. */
+                printf("@K3TOKEN %d\n", emit[i]);
+                fflush(stdout);
+            }
             if (stop_id >= 0 && emit[i] == stop_id) { stop_hit = 1; break; }
         }
         if (stop_hit || T >= Tmax) break;

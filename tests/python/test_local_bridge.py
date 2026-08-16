@@ -133,6 +133,15 @@ class LocalBridgeTests(unittest.TestCase):
             call["function"]["arguments"], '{"command":"git status","timeout":15}'
         )
 
+
+    def test_safe_stream_delta_holds_unstable_unicode(self):
+        delta, previous = LocalK3._safe_delta("abc", "abc\ufffd")
+        self.assertEqual(delta, "")
+        self.assertEqual(previous, "abc")
+        delta, previous = LocalK3._safe_delta("abc", "abcé")
+        self.assertEqual(delta, "é")
+        self.assertEqual(previous, "abcé")
+
     def test_loopback_guard(self):
         self.assertTrue(_is_loopback_host("127.0.0.1"))
         self.assertTrue(_is_loopback_host("::1"))
