@@ -99,4 +99,6 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src/core/k3_ops.c
           git commit -m 'perf: batch exact MXFP4 expert compute across prefill tokens'
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
           git push origin HEAD:${{ github.ref_name }}
