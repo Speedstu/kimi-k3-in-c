@@ -1,0 +1,195 @@
+name: Native Windows parity
+
+on:
+  push:
+    branches: [main, 'feature/**']
+    paths:
+      - 'include/sys/mman.h'
+      - 'include/sys/resource.h'
+      - 'include/stdlib.h'
+      - 'include/unistd.h'
+      - 'src/io/k3_portable_io.h'
+      - 'src/io/k3_st.c'
+      - 'src/io/k3_trunk.c'
+      - 'src/cache/k3_cache.c'
+      - 'src/core/k3_ops.c'
+      - 'src/cli/k3_run.c'
+      - 'src/cli/k3_worker.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - 'tools/qdq_trunk.py'
+      - 'Makefile'
+      - '.github/workflows/windows-parity.yml'
+  pull_request:
+    paths:
+      - 'include/sys/mman.h'
+      - 'include/sys/resource.h'
+      - 'include/stdlib.h'
+      - 'include/unistd.h'
+      - 'src/io/k3_portable_io.h'
+      - 'src/io/k3_st.c'
+      - 'src/io/k3_trunk.c'
+      - 'src/cache/k3_cache.c'
+      - 'src/core/k3_ops.c'
+      - 'src/cli/k3_run.c'
+      - 'src/cli/k3_worker.c'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - 'tools/qdq_trunk.py'
+      - 'Makefile'
+      - '.github/workflows/windows-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native-ucrt64:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          path-type: inherit
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+
+      - name: Strict native build and weightless parity
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          gcc --version
+          python --version
+          make CC=gcc ARCH='-msse2' \
+            CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -msse2 -fopenmp -pthread -ffp-contract=off' \
+            -j2
+          make clean
+          make CC=gcc ARCH='-msse2' -j2 test 2>&1 | tee win-tests.log
+          grep -q '23 passed, 0 failed, 0 skipped' win-tests.log
+          grep -q 'VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY' win-tests.log
+          grep -q 'ALL WEIGHTLESS TESTS PASSED' win-tests.log
+          # Keep the scalar/SSE build as a compile+test gate, then use the runner's real
+          # x86 ISA for model parity. This is what a normal `make` does on Windows/MSYS2.
+          make clean
+          make CC=gcc ARCH='-march=native' -j2
+
+      - name: Generate native tiny K3 and Q4 draft
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf .win-ci
+          mkdir -p .win-ci
+          python tools/make_tiny_checkpoint.py .win-ci/k3tiny --seed 1234 --prompt-ids 3,7,11
+          NLAYERS=$(python -c "import json; print(json.load(open('.win-ci/k3tiny/config.json'))['num_hidden_layers'])")
+          python tools/pack_trunk.py .win-ci/k3tiny .win-ci/k3trunk "$NLAYERS"
+          python tools/qdq_trunk.py .win-ci/k3trunk .win-ci/k3draft --bits 4 --group 0
+
+      - name: Native one-shot, resident worker and sampled draft are token-identical
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          MODEL=str(Path('.win-ci/k3tiny').resolve())
+          TRUNK=str(Path('.win-ci/k3trunk').resolve())
+          DRAFT=str(Path('.win-ci/k3draft').resolve())
+          K3=str(Path('bin/k3.exe').resolve())
+          WORKER=str(Path('bin/k3-worker.exe').resolve())
+          BASE=[MODEL,'--trunk',TRUNK,'--trunk-gb','0.05','--cache-gb','0.05']
+
+          def oneshot(ids, gen, temp=0.0, top_p=1.0, seed=1, extra=()):
+              with tempfile.TemporaryDirectory() as td:
+                  out=Path(td)/'run.json'
+                  cmd=[K3,*BASE,*extra,'--ids',','.join(map(str,ids)),'--gen',str(gen),
+                       '--incremental','--temperature',str(temp),'--top-p',str(top_p),
+                       '--seed',str(seed),'--out',str(out)]
+                  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL)
+                  return json.loads(out.read_text())['generated_ids']
+
+          def start_worker(extra=()):
+              p=subprocess.Popen([WORKER,*BASE,'--context','64',*extra],
+                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT,text=True,bufsize=1)
+              assert p.stdin and p.stdout
+              for line in p.stdout:
+                  if line.startswith('@K3READY '):
+                      return p
+              raise AssertionError('native worker exited before READY')
+
+          counter=[0]
+          def req(p, ids, gen, temp=0.0, top_p=1.0, seed=1):
+              counter[0]+=1; r=counter[0]
+              p.stdin.write(f'REQ {r} {len(ids)} {gen} {temp} {top_p} {seed} -1\n')
+              p.stdin.write(' '.join(map(str,ids))+'\n'); p.stdin.flush()
+              toks=[]; reused=None; metrics=None
+              for line in p.stdout:
+                  if line.startswith(f'@K3TOKEN {r} '):
+                      toks.append(int(line.split()[2]))
+                  elif line.startswith(f'@K3DRAFT {r} '):
+                      x=line.split(); metrics=(int(x[2]),int(x[3]),int(x[4]))
+                  elif line.startswith(f'@K3ERROR {r} '):
+                      raise AssertionError(line)
+                  elif line.startswith(f'@K3DONE {r} '):
+                      reused=int(line.split()[4]); break
+              return toks,reused,metrics
+
+          a=[3,7,11]
+          p=start_worker()
+          w1,reuse,_=req(p,a,2); ref1=oneshot(a,2)
+          assert w1==ref1,(w1,ref1); assert reuse==0,reuse
+
+          b=a+w1+[5,9]
+          w2,reuse,_=req(p,b,3); ref2=oneshot(b,3)
+          assert w2==ref2,(w2,ref2)
+          assert reuse==len(a)+len(w1),(reuse,len(a)+len(w1))
+
+          c=[3,7,12]
+          w3,reuse,_=req(p,c,2); ref3=oneshot(c,2)
+          assert w3==ref3,(w3,ref3); assert reuse==0,reuse
+
+          p.stdin.write('RESET\n'); p.stdin.flush()
+          for line in p.stdout:
+              if line.startswith('@K3RESET'): break
+          w4,reuse,_=req(p,a,5,1.0,.95,424242)
+          ref4=oneshot(a,5,1.0,.95,424242)
+          assert w4==ref4,(w4,ref4); assert reuse==0,reuse
+          p.stdin.write('QUIT\n'); p.stdin.flush(); p.wait(timeout=10)
+          assert p.returncode==0,p.returncode
+
+          # Same native path with a deliberately approximate Q4 proposal model. Exact K3
+          # remains authoritative; this gate catches both RNG and warm draft-state drift.
+          DARGS=['--draft-trunk',DRAFT,'--draft-trunk-gb','0.05',
+                 '--draft-topk','1','--spec','2']
+          counter[0]=0
+          p=start_worker(DARGS)
+          d1,reuse,m1=req(p,a,6,1.0,.95,987654)
+          r1=oneshot(a,6,1.0,.95,987654,DARGS)
+          assert d1==r1,(d1,r1); assert reuse==0,reuse
+          assert m1 and m1[0]>0 and m1[1]>0,m1
+
+          dctx=a+d1+[5,9]
+          d2,reuse,m2=req(p,dctx,4,1.0,.95,123456)
+          r2=oneshot(dctx,4,1.0,.95,123456,DARGS)
+          assert d2==r2,(d2,r2)
+          assert reuse==len(a)+len(d1),(reuse,len(a)+len(d1))
+          assert m2 and m2[0]>0,m2
+          p.stdin.write('QUIT\n'); p.stdin.flush(); p.wait(timeout=10)
+          assert p.returncode==0,p.returncode
+
+          print('native Windows exact + warm worker + sampled Q4 draft parity: PASS')
+          print('greedy:',w1,w2,w3)
+          print('sampled:',w4)
+          print('draft:',d1,d2,m1,m2)
+          PY

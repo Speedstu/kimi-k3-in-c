@@ -663,8 +663,10 @@ hour in. Shorten the request, or drop `--incremental`, which carries no KV cache
 **Is the whole 1.56 TB needed?** For generation, yes. For development, no: `make test`
 needs nothing at all, and `--layers N` runs against partial shard sets.
 
-**macOS, Windows, WSL?** The engine targets Linux. The tokenizer and config reader are
-portable C99 and are built portably in CI.
+**macOS, Windows, WSL?** Linux remains the reference and macOS is CI-gated. Native
+Windows x64 now builds and runs through MSYS2 UCRT64/GCC, including `bin/k3-worker` and
+tiny exact/Q4 speculative parity. The current Windows storage path is a correctness
+baseline, not yet a claim of Linux-`O_DIRECT` performance; see [docs/WINDOWS.md](docs/WINDOWS.md).
 
 ---
 

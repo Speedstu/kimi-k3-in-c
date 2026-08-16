@@ -237,7 +237,19 @@ int main(int argc, char **argv)
 {
     /* stdout is the machine protocol. Configure it BEFORE any loader can print: a pipe
      * is fully buffered by default, which can otherwise hold @K3READY indefinitely. */
+#if defined(_WIN32)
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
+#if defined(_WIN32)
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
+#if defined(_WIN32)
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
     setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
+#endif
+#endif
     if (argc < 2) { worker_usage(stderr); return 2; }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
