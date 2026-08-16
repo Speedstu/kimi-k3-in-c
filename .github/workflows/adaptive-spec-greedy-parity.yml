@@ -3,31 +3,30 @@ name: Greedy adaptive speculation parity
 on:
   workflow_dispatch:
   push:
-    branches: [speedboost/adaptive-spec-greedy]
     paths:
       - 'src/cli/k3_run.c'
-      - 'tools/patch_spec_auto.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - '.github/workflows/adaptive-spec-greedy-parity.yml'
+  pull_request:
+    paths:
+      - 'src/cli/k3_run.c'
       - 'tools/make_tiny_checkpoint.py'
       - 'tools/pack_trunk.py'
       - '.github/workflows/adaptive-spec-greedy-parity.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   exactness:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.ref_name }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-
-      - name: Apply adaptive speculation transform once
-        run: python tools/patch_spec_auto.py
 
       - name: Strict AVX2 build and full oracle
         run: |
@@ -36,7 +35,7 @@ jobs:
           make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
           make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
 
-      - name: Build exact tiny streamed trunk
+      - name: Build exact-draft grow fixture
         run: |
           set -euo pipefail
           python -m pip install --quiet numpy
@@ -52,14 +51,11 @@ jobs:
           )
           python tools/pack_trunk.py /tmp/k3auto /tmp/k3auto-trunk "$NLAYERS"
 
-      - name: Fixed and adaptive speculation emit exact serial greedy sequence
+      - name: Fixed and growing adaptive speculation emit exact serial greedy sequence
         run: |
           set -euo pipefail
           D=/tmp/k3auto-out
           BASE='/tmp/k3auto --trunk /tmp/k3auto-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 18 --incremental --threads 1 --temperature 0'
-          # The tiny fixture has checkpoint top-k=2. Using the exact same top-k and
-          # exact trunk as the draft forces 100% acceptance and guarantees that the
-          # adaptive horizon is actually exercised rather than only parsed.
           DRAFT='--draft-trunk /tmp/k3auto-trunk --draft-trunk-gb 0.05 --draft-topk 2'
 
           ./bin/k3 $BASE --out "$D/serial.json" >"$D/serial.log" 2>&1
@@ -84,11 +80,49 @@ jobs:
           assert auto['spec_auto_accepted'] == auto['spec_auto_proposed'], auto
           assert cap['spec_auto_final'] <= 5, cap
           print('serial/fixed/auto exact generated + full IDs: PASS')
-          print('adaptive path exercised: rounds=%d grows=%d final=%d/%d' % (
-              auto['spec_auto_rounds'], auto['spec_auto_grows'],
+          print('grow path: rounds=%d accepted=%d/%d grows=%d final=%d/%d' % (
+              auto['spec_auto_rounds'], auto['spec_auto_accepted'],
+              auto['spec_auto_proposed'], auto['spec_auto_grows'],
               auto['spec_auto_final'], auto['spec_auto_limit']))
-          print('fixed4 %.4f s/token, auto8 %.4f s/token (tiny pinned fixture; timing is directional only)' % (
-              fixed['seconds_per_token'], auto['seconds_per_token']))
+          PY
+
+      - name: Build reduced-topk shrink fixture
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/k3shrink /tmp/k3shrink-trunk /tmp/k3shrink-out
+          mkdir -p /tmp/k3shrink-out
+          python tools/make_tiny_checkpoint.py /tmp/k3shrink --seed 2041 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3shrink/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3shrink /tmp/k3shrink-trunk "$NLAYERS"
+
+      - name: Poor draft triggers shrink while exact K3 sequence stays authoritative
+        run: |
+          set -euo pipefail
+          D=/tmp/k3shrink-out
+          BASE='/tmp/k3shrink --trunk /tmp/k3shrink-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18 --gen 32 --incremental --threads 1 --temperature 0'
+          ./bin/k3 $BASE --out "$D/serial.json" >"$D/serial.log" 2>&1
+          ./bin/k3 $BASE --draft-trunk /tmp/k3shrink-trunk --draft-trunk-gb 0.05 \
+            --draft-topk 1 --spec-auto --spec 8 --out "$D/auto.json" >"$D/auto.log" 2>&1
+          python3 - <<'PY'
+          import json
+          d='/tmp/k3shrink-out'
+          serial=json.load(open(d+'/serial.json'))
+          auto=json.load(open(d+'/auto.json'))
+          assert auto['generated_ids'] == serial['generated_ids']
+          assert auto['full_ids'] == serial['full_ids']
+          assert auto['spec_auto_rounds'] > 0
+          assert auto['spec_auto_shrinks'] > 0, auto
+          print('shrink path exact sequence: PASS')
+          print('shrink path: rounds=%d accepted=%d/%d grows=%d shrinks=%d final=%d/%d' % (
+              auto['spec_auto_rounds'], auto['spec_auto_accepted'],
+              auto['spec_auto_proposed'], auto['spec_auto_grows'],
+              auto['spec_auto_shrinks'], auto['spec_auto_final'],
+              auto['spec_auto_limit']))
           PY
 
       - name: Sampling refuses adaptive width to preserve seeded RNG parity
@@ -104,18 +138,3 @@ jobs:
           test "$rc" -eq 2
           grep -q 'supports greedy decode only' /tmp/k3auto-out/sample-auto.log
           echo 'sampled --spec-auto rejection: PASS'
-
-      - name: Persist validated source
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- src/cli/k3_run.c; then
-            echo 'source already committed'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/cli/k3_run.c
-          git commit -m 'perf: add exact greedy adaptive speculation horizon'
-          git fetch origin "${{ github.ref_name }}"
-          git rebase "origin/${{ github.ref_name }}"
-          git push origin HEAD:${{ github.ref_name }}
