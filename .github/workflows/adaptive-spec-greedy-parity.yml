@@ -1,3 +1,4 @@
+# Permanent exactness gate for the cleaned adaptive-spec branch.
 name: Greedy adaptive speculation parity
 
 on:
