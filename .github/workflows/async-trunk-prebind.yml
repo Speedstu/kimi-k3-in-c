@@ -1,0 +1,102 @@
+name: Async trunk prebind parity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [speedboost/async-trunk-prebind]
+    paths:
+      - 'src/io/k3_trunk.c'
+      - 'src/io/k3_trunk.h'
+      - 'tools/patch_trunk_prebind.py'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - '.github/workflows/async-trunk-prebind.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Apply async prebind transform
+        run: python tools/patch_trunk_prebind.py
+
+      - name: Strict AVX2 build and full oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build tiny exact checkpoint and streamed trunk
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3prebind /tmp/k3prebind-trunk /tmp/k3prebind-out
+          mkdir -p /tmp/k3prebind-out
+          python tools/make_tiny_checkpoint.py /tmp/k3prebind --seed 2060 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3prebind/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3prebind /tmp/k3prebind-trunk "$NLAYERS"
+
+      - name: Streamed prebind emits exact serial sequence and exercises async + pinned reuse
+        run: |
+          set -euo pipefail
+          D=/tmp/k3prebind-out
+          IDS='3,7,11,5,9,2,4,6,8,10,12,14'
+          ./bin/k3 /tmp/k3prebind --ids "$IDS" --gen 10 --incremental --threads 1 \
+            --temperature 0 --out "$D/resident.json" >"$D/resident.log" 2>&1
+          ./bin/k3 /tmp/k3prebind --trunk /tmp/k3prebind-trunk --trunk-gb 0.001 \
+            --cache-gb 0.001 --ids "$IDS" --gen 10 --incremental --threads 1 \
+            --temperature 0 --out "$D/streamed.json" >"$D/streamed.log" 2>&1
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          d=Path('/tmp/k3prebind-out')
+          a=json.load(open(d/'resident.json')); b=json.load(open(d/'streamed.json'))
+          assert b['generated_ids'] == a['generated_ids'], (a['generated_ids'], b['generated_ids'])
+          assert b['full_ids'] == a['full_ids']
+          log=(d/'streamed.log').read_text()
+          ring=re.search(r'(\d+)/(\d+) layers PINNED, ring (\d+) x', log)
+          assert ring, log[-4000:]
+          npin,total,nslot=map(int, ring.groups())
+          assert 0 < npin < total, (npin,total,nslot)
+          assert nslot >= 2, (npin,total,nslot)
+          prep=re.search(r'prepared binds (\d+) built, (\d+) copied \((\d+) prepared on reader\)', log)
+          assert prep, log[-4000:]
+          built,copied,async_built=map(int, prep.groups())
+          assert built > 0 and copied > 0 and async_built > 0, prep.groups()
+          assert copied > built, (built,copied,async_built)  # pinned binds reused across tokens
+          print('EXACT STREAMED PREBIND PARITY PASS')
+          print({'pinned':npin,'layers':total,'ring':nslot,
+                 'prepared_builds':built,'prepared_copies':copied,'async_builds':async_built})
+          PY
+
+      - name: Persist validated trunk source
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/io/k3_trunk.c; then
+            echo 'source already committed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/io/k3_trunk.c
+          git commit -m 'perf: prepare streamed trunk binds off the compute path'
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
