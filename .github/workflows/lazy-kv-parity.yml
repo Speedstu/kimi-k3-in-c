@@ -1,0 +1,111 @@
+name: Lazy KV resident parity
+
+on:
+  push:
+    branches: [main, 'feature/**']
+    paths:
+      - 'src/cli/k3_worker.c'
+      - '.github/workflows/lazy-kv-parity.yml'
+  pull_request:
+    paths:
+      - 'src/cli/k3_worker.c'
+      - '.github/workflows/lazy-kv-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  long-tiny-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Dependencies and build
+        run: |
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+      - name: Generate tiny K3, exact trunk, and approximate draft
+        run: |
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11 >/dev/null
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3tiny-trunk "$NLAYERS" >/dev/null
+          python tools/qdq_trunk.py /tmp/k3tiny-trunk /tmp/k3tiny-draft --bits 4 --group 0 >/dev/null
+      - name: More-than-64-token chunked prefill equals one-shot and reset cannot expose stale KV
+        run: |
+          python - <<'PY'
+          import json, subprocess, tempfile
+
+          MODEL='/tmp/k3tiny'; TRUNK='/tmp/k3tiny-trunk'; DRAFT='/tmp/k3tiny-draft'
+          BASE=[MODEL,'--trunk',TRUNK,'--trunk-gb','.05','--cache-gb','.05']
+          DARGS=['--draft-trunk',DRAFT,'--draft-trunk-gb','.05','--draft-topk','1','--spec','2']
+          long_ids=([3,7,11,5,9]*26)[:130]   # crosses 64 and 128 chunk boundaries
+          short_ids=[3,7,11,5,9]
+
+          def oneshot(ids, gen, temp=0, top_p=1, seed=1, draft=False):
+              with tempfile.NamedTemporaryFile(suffix='.json') as f:
+                  cmd=['./bin/k3',*BASE]
+                  if draft: cmd += DARGS
+                  cmd += ['--ids',','.join(map(str,ids)),'--gen',str(gen),'--incremental',
+                          '--temperature',str(temp),'--top-p',str(top_p),'--seed',str(seed),
+                          '--out',f.name]
+                  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL)
+                  return json.load(open(f.name))['generated_ids']
+
+          p=subprocess.Popen(['./bin/k3-worker',*BASE,'--context','192',*DARGS],
+              stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+              text=True,bufsize=1)
+          assert p.stdin and p.stdout
+          for line in p.stdout:
+              if line.startswith('@K3READY '): break
+          else: raise AssertionError('worker exited before READY')
+          rid=[0]
+          def req(ids, gen, temp=0, top_p=1, seed=1):
+              rid[0]+=1; r=rid[0]
+              p.stdin.write(f'REQ {r} {len(ids)} {gen} {temp} {top_p} {seed} -1\n')
+              p.stdin.write(' '.join(map(str,ids))+'\n'); p.stdin.flush()
+              out=[]; reuse=None
+              for line in p.stdout:
+                  if line.startswith(f'@K3TOKEN {r} '): out.append(int(line.split()[2]))
+                  elif line.startswith(f'@K3ERROR {r} '): raise AssertionError(line)
+                  elif line.startswith(f'@K3DONE {r} '):
+                      reuse=int(line.split()[4]); break
+              return out,reuse
+
+          # Exact target first token/prefill must match one-shot despite 3 chunks (64/64/2).
+          a,reuse=req(long_ids,3,0,1,1)
+          ref=oneshot(long_ids,3)
+          assert a==ref,(a,ref); assert reuse==0
+
+          # RESET no longer zeroes KV bytes. A much shorter prompt must nevertheless see
+          # exactly a clean cache: cached=0 makes all old rows unreachable and new rows
+          # overwrite every position they use.
+          p.stdin.write('RESET\n'); p.stdin.flush()
+          for line in p.stdout:
+              if line.startswith('@K3RESET'): break
+          b,reuse=req(short_ids,3,0,1,1)
+          refb=oneshot(short_ids,3)
+          assert b==refb,(b,refb); assert reuse==0
+
+          # Draft prefill uses the same bounded helper. Gate temperature=1 and fixed seed
+          # against the already-validated one-shot p/q decoder on a >64-token prompt.
+          p.stdin.write('RESET\n'); p.stdin.flush()
+          for line in p.stdout:
+              if line.startswith('@K3RESET'): break
+          c,reuse=req(long_ids,6,1,.95,987654)
+          refc=oneshot(long_ids,6,1,.95,987654,True)
+          assert c==refc,(c,refc); assert reuse==0
+
+          p.stdin.write('QUIT\n'); p.stdin.flush(); p.wait(timeout=10)
+          assert p.returncode==0
+          print('lazy KV + 64-token bounded prefill parity: PASS',a,b,c)
+          PY
