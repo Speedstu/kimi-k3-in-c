@@ -1,4 +1,4 @@
-name: Stage typed BF16 router
+name: Stage adaptive router storage
 
 on:
   push:
@@ -10,40 +10,32 @@ permissions:
 
 jobs:
   apply:
-    if: github.event.head_commit.message == 'stage typed bf16 router final'
+    if: github.event.head_commit.message == 'stage adaptive router storage'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Remove VLA warning from parity test
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('tests/unit/test_ops.c')
-          s = p.read_text()
-          old = 'const int PE = 17, PH = 257, PK = 4, PR = 5;'
-          assert s.count(old) == 1
-          p.write_text(s.replace(old, 'enum { PE = 17, PH = 257, PK = 4, PR = 5 };'))
-          PY
+      - name: Apply adaptive storage patch
+        run: python3 tools/apply_router_adaptive_stage.py .
       - name: Strict build
         run: |
           make clean
           make portable CFLAGS="-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -fopenmp -pthread -ffp-contract=off" -j2
       - name: Full tests
         run: make test -j2
-      - name: Benchmark actual released-size router
+      - name: Benchmark released-size streamed versus resident router
         env:
           OMP_NUM_THREADS: '2'
         run: |
           cc -O3 -std=gnu99 -mavx2 -mfma -fopenmp -pthread -ffp-contract=off \
              -Iinclude -Iinclude/k3 benchmarks/bench_router_storage.c build/src/core/k3_ops.o \
              -o /tmp/bench_router -lm -fopenmp -pthread
-          /tmp/bench_router 8
-      - name: Commit test cleanup
+          /tmp/bench_router 10
+      - name: Commit validated adaptive source
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add tests/unit/test_ops.c
-          git commit -m "test: gate BF16 router parity without VLA"
+          git add include/k3/k3.h src/core/k3_ops.c src/model/k3_bind.c
+          git commit -m "perf: adapt MoE router storage to resident vs streamed trunks"
           git push origin HEAD:speedboost/bf16-router
