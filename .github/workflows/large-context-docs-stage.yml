@@ -1,0 +1,39 @@
+name: Stage large-context docs
+
+on:
+  push:
+    branches: ['feature/large-context-resident']
+    paths:
+      - 'tools/apply_large_context_docs_stage.py'
+      - '.github/workflows/large-context-docs-stage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/large-context-resident
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply guarded docs/help patch
+        run: python3 tools/apply_large_context_docs_stage.py
+      - name: Syntax lint and docs contract
+        run: |
+          python -m pip install --quiet ruff
+          python -m py_compile local/k3_local.py
+          ruff check local/k3_local.py
+          grep -q -- '--worker-context 1048576' local/README.md
+          grep -q 'maximum VIRTUAL capacity' local/README.md
+          grep -q 'MADV_DONTNEED' local/README.md
+      - name: Commit validated docs/help
+        run: |
+          git config user.name Speedstu
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add local/k3_local.py local/README.md
+          git diff --cached --quiet || git commit -m 'docs: expose safe 1M resident context capacity'
+          git push origin HEAD:feature/large-context-resident
