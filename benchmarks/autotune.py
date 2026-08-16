@@ -100,6 +100,19 @@ def best_candidate(runs: list[Run], *, phase: str, vary: str) -> int:
 
 
 def main() -> int:
+    # argparse.REMAINDER would swallow tuner options placed after MODEL_DIR. Split the
+    # command explicitly instead: everything before the first bare `--` belongs to this
+    # tuner, everything after it is passed verbatim to K3. This works the same in Bash,
+    # PowerShell and cmd.exe.
+    argv = sys.argv[1:]
+    if "--" in argv:
+        sep = argv.index("--")
+        tuner_argv = argv[:sep]
+        k3_args = argv[sep + 1 :]
+    else:
+        tuner_argv = argv
+        k3_args: list[str] = []
+
     p = argparse.ArgumentParser(
         description="Autotune K3 compute + async expert-I/O threads using a real exact request.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -123,17 +136,13 @@ def main() -> int:
     p.add_argument("--out", default="k3-autotune.json", help="summary JSON path")
     p.add_argument("--keep-run-files", action="store_true", help="keep each K3 JSON/log beside the summary")
     p.add_argument("--timeout", type=float, default=None, help="optional timeout in seconds for each K3 run")
-    p.add_argument("k3_args", nargs=argparse.REMAINDER, help="normal K3 arguments after --")
-    ns = p.parse_args()
+    ns = p.parse_args(tuner_argv)
 
     if ns.repeats < 1:
         p.error("--repeats must be >= 1")
     if ns.io_seed < 1 or ns.io_seed > 64:
         p.error("--io-seed must be in 1..64")
 
-    k3_args = list(ns.k3_args)
-    if k3_args and k3_args[0] == "--":
-        k3_args = k3_args[1:]
     if candidate_arg_present(k3_args, "--threads"):
         p.error("do not pass --threads after --; autotune controls it")
     if candidate_arg_present(k3_args, "--out"):
