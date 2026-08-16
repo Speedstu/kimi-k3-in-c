@@ -60,6 +60,7 @@
 #include "k3_trunk.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
+#include "k3_sample.h" /* benchmark-parity temperature/top-p sampling */
 
 static double now_s(void)
 {
@@ -321,6 +322,8 @@ static void usage(FILE *f)
 "  --prompt-file PATH    read the prompt from a file; use this for non-ASCII, since\n"
 "                        argv is re-encoded by the shell\n"
 "  --ids 1,2,3           raw token ids; the reproducible channel used by the tests\n"
+"  --ids-file PATH       raw token ids from a comma/space/newline separated file;\n"
+"                        avoids argv limits for long official XTML prompts\n"
 "\n"
 "memory:\n"
 "  --preset NAME         auto | laptop | desktop | workstation | server | max\n"
@@ -333,6 +336,10 @@ static void usage(FILE *f)
 "\n"
 "generation / compute:\n"
 "  --gen N               tokens to generate (default 8)\n"
+"  --temperature X       sampling temperature; 0 = legacy greedy (default 0)\n"
+"  --top-p X             nucleus cutoff in (0,1], default 1.0\n"
+"  --seed N              deterministic sampler seed (default 1)\n"
+"  --stop-id N           stop after emitting this token id (default disabled)\n"
 "  --threads N           OpenMP compute threads for this run. Exact output is unchanged;\n"
 "                        use benchmarks/thread-sweep.sh to MEASURE the best N\n"
 "  --incremental         carry KV cache and recurrent state between tokens\n"
@@ -623,7 +630,7 @@ int main(int argc, char **argv)
         usage(stderr);
         return 2;
     }
-    const char *ids_s = NULL, *outp = "k3_run.json", *trunk_dir = NULL;
+    const char *ids_s = NULL, *ids_file = NULL, *outp = "k3_run.json", *trunk_dir = NULL;
     /* Expert-cache diagnostics are opt-in. They are only meaningful for cache research,
      * and writing them unconditionally drops two undeclared files into whatever
      * directory the user happened to run from. */
@@ -633,6 +640,9 @@ int main(int argc, char **argv)
     const char *cfg_path = NULL;
     int gen = 8, want_layers = -1;
     int threads = 0;              /* 0 = OpenMP/runtime default */
+    double temperature = 0.0, top_p = 1.0;
+    unsigned long long sample_seed = 1;
+    int stop_id = -1;
     double cache_gb = 64.0, trunk_gb = 16.0;
     int budget_auto = 0;
     int spec_n = 0;
@@ -646,11 +656,16 @@ int main(int argc, char **argv)
     int incremental = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
+        else if (!strcmp(argv[i], "--ids-file") && i + 1 < argc) ids_file = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
         else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--temperature") && i + 1 < argc) temperature = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) sample_seed = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--stop-id") && i + 1 < argc) stop_id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
@@ -701,17 +716,36 @@ int main(int argc, char **argv)
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
     {
-        int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
+        int nsrc = (ids_s != NULL) + (ids_file != NULL) +
+                   (prompt_text != NULL) + (prompt_file != NULL);
         if (nsrc == 0) {
-            fprintf(stderr, "one of --ids, --prompt or --prompt-file is required\n");
+            fprintf(stderr, "one of --ids, --ids-file, --prompt or --prompt-file is required\n");
             return 2;
         }
         if (nsrc > 1) {
             /* Refuse rather than pick: silently preferring one source would make a
              * mistyped invocation run the WRONG prompt for tens of minutes. */
-            fprintf(stderr, "--ids, --prompt and --prompt-file are mutually exclusive\n");
+            fprintf(stderr, "--ids, --ids-file, --prompt and --prompt-file are mutually exclusive\n");
             return 2;
         }
+    }
+
+    if (!isfinite(temperature) || temperature < 0.0) {
+        fprintf(stderr, "--temperature must be finite and >= 0\n");
+        return 2;
+    }
+    if (!isfinite(top_p) || top_p <= 0.0 || top_p > 1.0) {
+        fprintf(stderr, "--top-p must be finite and in (0,1]\n");
+        return 2;
+    }
+    if (stop_id < -1) {
+        fprintf(stderr, "--stop-id must be >= -1\n");
+        return 2;
+    }
+    if (temperature > 0.0 && (spec_n > 0 || draft_dir != NULL)) {
+        fprintf(stderr, "sampled speculative decoding is not implemented yet; remove --spec/--draft-trunk\n"
+                        "rather than silently changing the requested sampling distribution.\n");
+        return 2;
     }
 
     if (threads < 0 || threads > 4096) {
@@ -804,6 +838,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "ABORTED: the model config could not be read with confidence.\n");
         return 2;
     }
+    if (stop_id >= c.vocab) {
+        fprintf(stderr, "--stop-id %d is outside vocabulary [0,%d)\n", stop_id, c.vocab);
+        return 2;
+    }
+    K3Sampler sampler;
+    k3_sampler_init(&sampler, temperature, top_p, (uint64_t)sample_seed);
+
     if (draft_dir && (draft_topk < 1 || draft_topk > c.topk)) {
         fprintf(stderr, "--draft-topk must be in [1,%d], got %d\n", c.topk, draft_topk);
         return 2;
@@ -850,10 +891,36 @@ int main(int argc, char **argv)
         free(ptext);
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
-        for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
-            prompt[np++] = (int)strtol(p, (char **)&p, 10);
-            while (*p == ',' || *p == ' ') p++;
+        char *owned_ids = NULL;
+        const char *src_ids = ids_s;
+        if (ids_file) {
+            FILE *idf = fopen(ids_file, "rb");
+            if (!idf) { perror(ids_file); return 2; }
+            if (fseek(idf, 0, SEEK_END) != 0) { fclose(idf); return 2; }
+            long idlen = ftell(idf);
+            if (idlen < 0 || fseek(idf, 0, SEEK_SET) != 0) { fclose(idf); return 2; }
+            owned_ids = (char *)malloc((size_t)idlen + 1);
+            if (!owned_ids) { fclose(idf); fprintf(stderr, "out of memory reading --ids-file\n"); return 1; }
+            if (fread(owned_ids, 1, (size_t)idlen, idf) != (size_t)idlen) {
+                fclose(idf); free(owned_ids); fprintf(stderr, "%s is truncated while reading\n", ids_file); return 2;
+            }
+            fclose(idf);
+            owned_ids[idlen] = 0;
+            src_ids = owned_ids;
         }
+        for (const char *q = src_ids; *q && np < K3_MAX_PROMPT; ) {
+            char *end = NULL;
+            long id = strtol(q, &end, 10);
+            if (end == q) {
+                fprintf(stderr, "invalid token id near: %.32s\n", q);
+                free(owned_ids);
+                return 2;
+            }
+            prompt[np++] = (int)id;
+            q = end;
+            while (*q == ',' || *q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
+        }
+        free(owned_ids);
     }
     if (np == 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
     for (int i = 0; i < np; i++)
@@ -910,6 +977,9 @@ int main(int argc, char **argv)
     printf("Kimi K3, pure C, released checkpoint\n");
     printf("  threads  : %d compute%s\n", compute_threads,
            threads > 0 ? " (explicit --threads)" : " (OpenMP/runtime default)");
+    if (temperature <= 0.0) printf("  sampling : greedy\n");
+    else printf("  sampling : temperature %.6g, top-p %.6g, seed %llu\n",
+                temperature, top_p, sample_seed);
     /* The directory, not a shard count: the index has not been built yet at this point.
      * The count is printed by the "indexed N tensors from M shards" line below, once
      * k3_st_open has actually counted them. */
@@ -1296,7 +1366,7 @@ int main(int argc, char **argv)
             const int base = w.cached;
             const int nT0 = T - base;
             frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL);
-            if (frc == 0) { w.cached = base + nT0; emit[emitn++] = argmax_(lg, c.vocab); }
+            if (frc == 0) { w.cached = base + nT0; emit[emitn++] = k3_sample_token(&sampler, lg, c.vocab); }
             /* The draft model must absorb the same context, or its first proposals
              * come from a shorter one; one draft sweep, paid once. Saved state does
              * not include the draft's, so a resumed run replays the WHOLE sequence
@@ -1385,7 +1455,7 @@ int main(int argc, char **argv)
                 }
             } else {
                 frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL);
-                if (frc == 0) { w.cached = base + 1; emit[emitn++] = argmax_(lg, c.vocab); }
+                if (frc == 0) { w.cached = base + 1; emit[emitn++] = k3_sample_token(&sampler, lg, c.vocab); }
                 /* keep the draft in lockstep through non-drafted steps */
                 if (dw.trunk && frc == 0) {
                     if (forward(&dw, &c, &cache, seq + base, 1, lg, sc, h, br,
@@ -1395,9 +1465,10 @@ int main(int argc, char **argv)
             }
         } else {
             frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL);
-            if (frc == 0) emit[emitn++] = argmax_(lg, c.vocab);
+            if (frc == 0) emit[emitn++] = k3_sample_token(&sampler, lg, c.vocab);
         }
-        /* Abort the run rather than argmax a buffer the forward never wrote. */
+        for (int i = 0; i < emitn; i++) if (emit[i] < 0) frc = -1;
+        /* Abort the run rather than consume a buffer the forward/sampler never wrote. */
         if (frc != 0 || emitn == 0) {
             fprintf(stderr, "forward pass failed at generation step %d; aborting.\n", g);
             return 1;
@@ -1432,11 +1503,13 @@ int main(int argc, char **argv)
         expert_gb_total    += (double)cache.bytes_read / 1e9;
         expert_reqs_total  += cache.hits + cache.misses;
         expert_evict_total += cache.evictions;
+        int stop_hit = 0;
         for (int i = 0; i < emitn && nout < gen && T < Tmax; i++) {
             seq[T++] = emit[i];
             outtok[nout++] = emit[i];
+            if (stop_id >= 0 && emit[i] == stop_id) { stop_hit = 1; break; }
         }
-        if (T >= Tmax) break;
+        if (stop_hit || T >= Tmax) break;
     }
     if (save_state) {
         if (!incremental) {
@@ -1498,8 +1571,10 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
-        fprintf(f, "],\"layers\":%d,\"threads\":%d,\"seconds_per_token\":%.4f}\n",
-                NL, compute_threads, t_total / nout);
+        fprintf(f, "],\"layers\":%d,\"threads\":%d,\"temperature\":%.9g,"
+                   "\"top_p\":%.9g,\"seed\":%llu,\"stop_id\":%d,"
+                   "\"seconds_per_token\":%.4f}\n",
+                NL, compute_threads, temperature, top_p, sample_seed, stop_id, t_total / nout);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }

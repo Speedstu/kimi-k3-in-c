@@ -90,14 +90,7 @@ def parse_xtml(text: str) -> dict[str, Any]:
         if tc >= 0:
             tool_body = tool_body[:tc]
 
-        call_re = re.compile(
-            re.escape(O) + r"call(?P<attrs>[^" + re.escape(S[0]) + r"]*)" + re.escape(S)
-            + r"(?P<body>.*?)" + re.escape(C + "call" + S),
-            re.DOTALL,
-        )
-        # The generic regex above is deliberately permissive about attributes, but the
-        # special-token delimiter itself is easier and safer to parse with finditer on a
-        # second expression that cannot cross a call close marker.
+        # Calls and arguments are delimited by K3's control-token separators.
         call_re = re.compile(
             re.escape(O) + r"call(?P<attrs>.*?)" + re.escape(S)
             + r"(?P<body>.*?)" + re.escape(C + "call" + S),
