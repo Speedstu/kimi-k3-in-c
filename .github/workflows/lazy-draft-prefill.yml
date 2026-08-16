@@ -1,0 +1,161 @@
+name: Lazy draft prefill parity
+
+on:
+  push:
+    branches: [speedboost/lazy-draft-prefill]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply lazy prefill transform
+        run: python tools/patch_lazy_draft_prefill.py
+      - name: Strict AVX2 build and full oracle
+        run: |
+          set -euo pipefail
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+      - name: Build repetitive exact fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3prefill /tmp/k3prefill-trunk /tmp/k3prefill-out
+          mkdir -p /tmp/k3prefill-out
+          python tools/make_tiny_checkpoint.py /tmp/k3prefill --seed 2090 \
+            --prompt-ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3prefill/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3prefill /tmp/k3prefill-trunk "$NLAYERS"
+      - name: Lazy prefill preserves exact output and removes net draft input work
+        run: |
+          set -euo pipefail
+          D=/tmp/k3prefill-out
+          BASE='/tmp/k3prefill --trunk /tmp/k3prefill-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7 --gen 20 --incremental --threads 1 --temperature 0'
+          DRAFT='--draft-trunk /tmp/k3prefill-trunk --draft-trunk-gb 0.05 --draft-topk 2 --spec-auto --spec 8'
+          K3_DRAFT_EAGER_PREFILL=1 ./bin/k3 $BASE $DRAFT --out "$D/eager.json" >"$D/eager.log" 2>&1
+          ./bin/k3 $BASE $DRAFT --out "$D/lazy.json" >"$D/lazy.log" 2>&1
+          python - <<'PY'
+          import json
+          e=json.load(open('/tmp/k3prefill-out/eager.json'))
+          l=json.load(open('/tmp/k3prefill-out/lazy.json'))
+          assert l['generated_ids'] == e['generated_ids'], (e['generated_ids'],l['generated_ids'])
+          assert l['full_ids'] == e['full_ids']
+          assert e['draft_prefill_deferred'] == 0 and e['draft_prefill_tokens'] > 0, e
+          assert l['draft_prefill_deferred'] == 1 and l['draft_prefill_tokens'] == 0, l
+          assert l['draft_ngram_rounds'] == e['draft_ngram_rounds'] > 1
+          assert l['draft_ngram_proposed'] == e['draft_ngram_proposed']
+          assert l['draft_ngram_accepted'] == e['draft_ngram_accepted']
+          assert l['draft_ngram_disabled'] == e['draft_ngram_disabled'] == 0
+          assert l['draft_model_steps'] == e['draft_model_steps']
+          eager_input=e['draft_prefill_tokens']+e['draft_sync_tokens']+e['draft_model_steps']
+          lazy_input=l['draft_prefill_tokens']+l['draft_sync_tokens']+l['draft_model_steps']
+          assert lazy_input < eager_input, (lazy_input,eager_input,e,l)
+          print('LAZY DRAFT PREFILL EXACT PARITY PASS')
+          print({'eager_prefill':e['draft_prefill_tokens'],'lazy_prefill':l['draft_prefill_tokens'],
+                 'eager_draft_input':eager_input,'lazy_draft_input':lazy_input,
+                 'saved_draft_input_tokens':eager_input-lazy_input})
+          PY
+      - name: Sampling and explicit eager modes keep draft prefill
+        run: |
+          set -euo pipefail
+          ./bin/k3 /tmp/k3prefill --trunk /tmp/k3prefill-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --ids 3,7,11,3,7,11,3,7 --gen 4 --incremental --threads 1 --temperature 1 \
+            --seed 12345 --draft-trunk /tmp/k3prefill-trunk --draft-trunk-gb 0.05 --draft-topk 2 \
+            --spec 4 --out /tmp/k3prefill-out/sample.json >/tmp/k3prefill-out/sample.log 2>&1
+          K3_DRAFT_NO_NGRAM=1 ./bin/k3 /tmp/k3prefill --trunk /tmp/k3prefill-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --ids 3,7,11,3,7,11,3,7 --gen 4 --incremental --threads 1 --temperature 0 \
+            --draft-trunk /tmp/k3prefill-trunk --draft-trunk-gb 0.05 --draft-topk 2 \
+            --spec 4 --out /tmp/k3prefill-out/no-ngram.json >/tmp/k3prefill-out/no-ngram.log 2>&1
+          python - <<'PY'
+          import json
+          s=json.load(open('/tmp/k3prefill-out/sample.json'))
+          n=json.load(open('/tmp/k3prefill-out/no-ngram.json'))
+          assert s['draft_prefill_deferred']==0 and s['draft_prefill_tokens']>0
+          assert n['draft_prefill_deferred']==0 and n['draft_prefill_tokens']>0
+          print('SAMPLED/NO-NGRAM PREFILL COMPATIBILITY PASS')
+          PY
+      - name: Persist validated source and make gate permanent
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/cli/k3_run.c
+          git commit -m 'perf: defer hybrid draft prompt prefill' || true
+          rm -f tools/patch_lazy_draft_prefill.py
+          cat > .github/workflows/lazy-draft-prefill.yml <<'YAML'
+          name: Lazy draft prefill parity
+          on:
+            workflow_dispatch:
+            pull_request:
+              paths:
+                - 'src/cli/k3_run.c'
+                - '.github/workflows/lazy-draft-prefill.yml'
+          permissions:
+            contents: read
+          jobs:
+            exactness:
+              runs-on: ubuntu-latest
+              timeout-minutes: 35
+              steps:
+                - uses: actions/checkout@v7
+                - uses: actions/setup-python@v7
+                  with:
+                    python-version: '3.12'
+                - name: Strict AVX2 build and full oracle
+                  run: |
+                    set -euo pipefail
+                    make clean
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+                - name: Lazy prompt prefill is exact and removes net draft input
+                  run: |
+                    set -euo pipefail
+                    python -m pip install --quiet numpy
+                    python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+                    rm -rf /tmp/k3prefill /tmp/k3prefill-trunk /tmp/k3prefill-out
+                    mkdir -p /tmp/k3prefill-out
+                    python tools/make_tiny_checkpoint.py /tmp/k3prefill --seed 2090 --prompt-ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7
+                    NLAYERS=$(python - <<'PY'
+                    import json
+                    print(json.load(open('/tmp/k3prefill/config.json'))['num_hidden_layers'])
+                    PY
+                    )
+                    python tools/pack_trunk.py /tmp/k3prefill /tmp/k3prefill-trunk "$NLAYERS"
+                    BASE='/tmp/k3prefill --trunk /tmp/k3prefill-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,3,7,11,3,7,11,3,7,11,3,7 --gen 20 --incremental --threads 1 --temperature 0'
+                    DRAFT='--draft-trunk /tmp/k3prefill-trunk --draft-trunk-gb 0.05 --draft-topk 2 --spec-auto --spec 8'
+                    K3_DRAFT_EAGER_PREFILL=1 ./bin/k3 $BASE $DRAFT --out /tmp/k3prefill-out/eager.json >/tmp/k3prefill-out/eager.log 2>&1
+                    ./bin/k3 $BASE $DRAFT --out /tmp/k3prefill-out/lazy.json >/tmp/k3prefill-out/lazy.log 2>&1
+                    python - <<'PY'
+                    import json
+                    e=json.load(open('/tmp/k3prefill-out/eager.json')); l=json.load(open('/tmp/k3prefill-out/lazy.json'))
+                    assert e['generated_ids']==l['generated_ids'] and e['full_ids']==l['full_ids']
+                    assert e['draft_prefill_tokens']>0 and l['draft_prefill_tokens']==0
+                    assert l['draft_prefill_deferred']==1
+                    assert l['draft_ngram_rounds']==e['draft_ngram_rounds']>1
+                    a=e['draft_prefill_tokens']+e['draft_sync_tokens']+e['draft_model_steps']
+                    b=l['draft_prefill_tokens']+l['draft_sync_tokens']+l['draft_model_steps']
+                    assert b<a,(a,b)
+                    print('LAZY DRAFT PREFILL PARITY PASS')
+                    PY
+          YAML
+          git add -A
+          git commit -m 'ci: make lazy draft prefill gate permanent' || true
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
