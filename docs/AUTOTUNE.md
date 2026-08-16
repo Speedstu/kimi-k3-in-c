@@ -19,6 +19,13 @@ Draft top-k tuning requires `--draft-trunk` in the K3 command. It never changes 
 K3 routing: the exact model still verifies every emitted token. The tuner does **not**
 change weights, precision, cache size, prompt, sampling options, or the exact model.
 
+`--draft-topk-candidates auto` is the recommended form. It reads the same K3 config used
+by the run (`MODEL_DIR/config.json`, or the explicit `--config` passed after the bare
+`--`), reads `num_experts_per_token` from either the released nested `text_config` shape
+or the flat oracle/CI shape, and generates powers of two up to that exact top-k while
+always including the exact value itself. For example, exact top-6 yields `1,2,4,6`.
+Missing or malformed config data is an error; the tuner never guesses a model top-k.
+
 ## Quick run
 
 Use a short deterministic request so each candidate is affordable. Two generated tokens
@@ -34,11 +41,11 @@ python3 benchmarks/autotune.py ~/k3model --repeats 2 -- \
   --ids 1008,10484,318,15383,387 --gen 2 --temperature 0
 ```
 
-Linux / WSL, including draft top-k:
+Linux / WSL, including model-aware draft top-k:
 
 ```bash
 python3 benchmarks/autotune.py ~/k3model --repeats 2 \
-  --draft-topk-candidates 1,2,4 -- \
+  --draft-topk-candidates auto -- \
   --trunk ~/k3trunk-lossless --preset laptop --incremental \
   --draft-trunk ~/k3draft --draft-trunk-gb 6 --spec-auto --spec 8 \
   --ids 1008,10484,318,15383,387 --gen 12 --temperature 0
@@ -48,15 +55,28 @@ Native Windows, when using the native `k3.exe` build:
 
 ```powershell
 python benchmarks/autotune.py C:\k3model --k3-bin .\bin\k3.exe --repeats 2 `
-  --draft-topk-candidates 1,2,4 -- `
+  --draft-topk-candidates auto -- `
   --trunk C:\k3trunk --preset laptop --incremental `
   --draft-trunk C:\k3draft --draft-trunk-gb 6 --spec-auto --spec 8 `
+  --ids 1008,10484,318,15383,387 --gen 12 --temperature 0
+```
+
+If K3 uses a non-default config, pass it exactly as you would to K3; `auto` follows it:
+
+```bash
+python3 benchmarks/autotune.py ~/k3model --draft-topk-candidates auto -- \
+  --config ~/configs/k3-custom.json \
+  --trunk ~/k3trunk-lossless --incremental \
+  --draft-trunk ~/k3draft --spec-auto --spec 8 \
   --ids 1008,10484,318,15383,387 --gen 12 --temperature 0
 ```
 
 The bare `--` is required: options before it belong to the tuner; options after it are
 passed to K3. When draft top-k tuning is enabled, do not pass a manual `--draft-topk`
 after the separator; the tuner owns that option and will refuse an ambiguous command.
+An explicit list such as `--draft-topk-candidates 1,2,4` is still available for controlled
+experiments, but `auto` avoids invalid guesses about the checkpoint's exact routing
+width.
 
 A successful three-knob run ends with a recommendation similar to:
 
@@ -73,6 +93,20 @@ CI or another computer are not transferable recommendations. The tiny CI result 
 a functional test of the tuner and must never be copied as a real-K3 hardware
 recommendation.
 
+The JSON report records how automatic candidates were derived:
+
+```json
+{
+  "draft_topk_candidates": [1, 2, 4, 8],
+  "draft_topk_source_config": "/absolute/path/to/config.json",
+  "draft_topk_exact_limit": 8
+}
+```
+
+For an explicit candidate list, the source-config and exact-limit fields are `null`. The
+legacy `recommended.samples_at_final_pair` field remains present for existing report
+consumers; `samples_at_final_configuration` is the clearer three-dimensional alias.
+
 ## Correctness guard
 
 Every candidate executes a normal K3 request and writes its ordinary JSON result. The
@@ -85,8 +119,10 @@ change proposals and acceptance, but it is not allowed to change the exact model
 committed token stream. Exact K3 remains the verifier for every candidate.
 
 The permanent CI gate exercises both modes against a streamed tiny K3 checkpoint:
-thread/I/O tuning preserves the known greedy token stream, and draft-topk tuning sweeps
-multiple draft routing counts while requiring the same exact output.
+thread/I/O tuning preserves the known greedy token stream, and automatic draft-topk
+tuning reads a custom config path, derives the valid top-1/top-2 candidate set, sweeps
+both values, and requires the same exact output. A synthetic helper check also proves
+that a non-power-of-two exact top-6 produces `1,2,4,6`.
 
 ## Search strategy
 
@@ -100,7 +136,8 @@ Without draft top-k tuning it keeps the original search:
 3. sweep compute again at the best I/O count;
 4. if that changes the compute winner, confirm I/O one more time.
 
-With `--draft-topk-candidates`, the tuner uses a three-dimensional coordinate search:
+With `--draft-topk-candidates auto` or an explicit list, the tuner uses a
+three-dimensional coordinate search:
 
 1. choose the candidate nearest `--draft-topk-seed` (default 4);
 2. sweep compute threads and I/O threads at that seed top-k;
@@ -118,7 +155,7 @@ enabled that means `compute × I/O × draft-topk`:
 ```bash
 python3 benchmarks/autotune.py ~/k3model --strategy grid --repeats 3 \
   --compute-candidates 4,8 --io-candidates 2,4 \
-  --draft-topk-candidates 1,2,4 -- \
+  --draft-topk-candidates auto -- \
   --trunk ~/k3trunk-lossless --preset laptop --incremental \
   --draft-trunk ~/k3draft --spec-auto --spec 8 \
   --ids 1008,10484,318,15383,387 --gen 12 --temperature 0
@@ -129,6 +166,7 @@ Useful tuner options:
 ```text
 --compute-candidates 1,2,4,8,16
 --io-candidates 1,2,4,8
+--draft-topk-candidates auto
 --draft-topk-candidates 1,2,4
 --draft-topk-seed 4
 --repeats 3
