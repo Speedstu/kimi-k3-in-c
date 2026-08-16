@@ -1,0 +1,111 @@
+name: Stage exact thread autotune
+
+on:
+  push:
+    branches:
+      - speedboost/thread-autotune
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'stage exact thread autotune'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Make sweep compatible with older Bash and executable
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('benchmarks/thread-sweep.sh')
+          s = p.read_text()
+          old = '''mapfile -t candidates < <(
+            printf '%s\\n' "${candidates[@]}" |
+              awk -v max="$cpu_count" '/^[0-9]+$/ && $1 >= 1 && $1 <= max { print $1 }' |
+              sort -nu
+          )
+          '''
+          new = '''sorted_candidates=()
+          while IFS= read -r v; do
+            sorted_candidates[${#sorted_candidates[@]}]=$v
+          done < <(
+            printf '%s\\n' "${candidates[@]}" |
+              awk -v max="$cpu_count" '/^[0-9]+$/ && $1 >= 1 && $1 <= max { print $1 }' |
+              sort -nu
+          )
+          candidates=("${sorted_candidates[@]}")
+          '''
+          assert old in s
+          p.write_text(s.replace(old, new))
+          PY
+          chmod +x benchmarks/thread-sweep.sh
+
+      - name: Apply CLI thread control
+        run: python3 tools/apply_thread_control_stage.py .
+
+      - name: Build and normal tests
+        run: |
+          make -j2
+          make test -j2
+
+      - name: Shellcheck sweep
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck -S warning benchmarks/thread-sweep.sh
+
+      - name: Strict warnings build
+        run: |
+          make clean
+          make portable CFLAGS="-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -fopenmp -pthread -ffp-contract=off" -j2
+
+      - name: Install tiny-checkpoint deps
+        run: |
+          python3 -m pip install --quiet numpy
+          python3 -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Exact logits across thread counts
+        run: |
+          make -j2
+          rm -rf /tmp/k3tiny
+          python3 tools/make_tiny_checkpoint.py /tmp/k3tiny --prompt-ids 3,7,11,5,9
+          for n in 1 2 4; do
+            ./bin/k3 /tmp/k3tiny --ids 3,7,11,5,9 --gen 3 --incremental \
+              --cache-gb 0.02 --threads "$n" \
+              --dump-logits "/tmp/t${n}.bin" --out "/tmp/t${n}.json" > "/tmp/t${n}.log"
+          done
+          cmp /tmp/t1.bin /tmp/t2.bin
+          cmp /tmp/t1.bin /tmp/t4.bin
+          python3 - <<'PY'
+          import json
+          xs = [json.load(open(f'/tmp/t{n}.json')) for n in (1,2,4)]
+          assert [x['threads'] for x in xs] == [1,2,4]
+          assert xs[0]['generated_ids'] == xs[1]['generated_ids'] == xs[2]['generated_ids']
+          assert xs[0]['generated_ids'] == [92,168,13], xs[0]['generated_ids']
+          print('THREAD COUNT EXACTNESS: BYTE-IDENTICAL PASS')
+          PY
+
+      - name: Exercise real sweep script
+        env:
+          K3_BIN: ./bin/k3
+          K3_SWEEP_THREADS: '1 2'
+          K3_SWEEP_REPEATS: '1'
+          K3_SWEEP_OUT: /tmp/thread-sweep.tsv
+        run: |
+          benchmarks/thread-sweep.sh /tmp/k3tiny \
+            --cache-gb 0.02 --incremental --ids 3,7,11,5,9 --gen 2
+          cat /tmp/thread-sweep.tsv
+          grep -q '^1' /tmp/thread-sweep.tsv
+          grep -q '^2' /tmp/thread-sweep.tsv
+
+      - name: Commit validated changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/cli/k3_run.c benchmarks/thread-sweep.sh
+          git commit -m "perf: add exact OpenMP thread sweep and control"
+          git push origin HEAD:speedboost/thread-autotune
