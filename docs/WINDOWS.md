@@ -25,6 +25,11 @@ MSYS2 UCRT64 toolchain and requires all of the following:
 - a resident Q4 speculative draft on two turns, still token-identical to the exact
   one-shot verifier.
 
+A second `Windows lazy KV parity` gate starts both the exact worker and resident Q4 draft
+with `--context 1048576`, verifies that the huge MLA address ranges are reserve-only at
+startup, executes a sampled turn, decommits on `RESET`, recommits, and requires the same
+exact output again.
+
 The CI host is Windows Server 2025. The runtime uses ordinary Win32/UCRT APIs available on
 modern x64 Windows, but Windows 10/11 client editions are not separate CI targets yet.
 
@@ -98,6 +103,37 @@ That is a positioned-I/O microbenchmark, not a 1.526x end-to-end token-speed cla
 Every model descriptor is binary. This matters on Windows because model weights are
 arbitrary bytes, not text.
 
+### Resident KV virtual memory
+
+The worker does not commit its full configured context on Windows. It reserves the MLA KV
+and rope address ranges with `VirtualAlloc(..., MEM_RESERVE, PAGE_NOACCESS)` and commits
+only the rows `[cached, cached + T)` immediately before a model `forward()` can touch
+them. Exact and resident-draft models have independent reservations.
+
+All worker inference paths go through one `worker_forward()` choke point: prefill, replay,
+speculative proposal, exact verification, draft lockstep and the non-speculative fallback.
+This keeps the memory policy separate from model math and prevents a path from touching a
+reserved-but-uncommitted row.
+
+On reset or conversation divergence, the worker decommits the rows it reached with
+`MEM_DECOMMIT` while retaining the address reservation. A later turn recommits the rows as
+needed.
+
+The Windows 1M-capacity CI gate measured the following on the tiny K3 fixture while both
+an exact model and Q4 resident draft were enabled:
+
+```text
+startup private context64  : 108.7 MiB
+startup private context1M  : 148.4 MiB
+startup private delta      : 39.7 MiB
+virtual reservation/model  : 2.62 GiB
+private after real request : 149.3 MiB
+private after RESET        : 149.2 MiB
+```
+
+The gate then reran the same sampled request after reset/decommit/recommit and required
+exact parity with the one-shot verifier. See `docs/data/windows-lazy-kv-2026-08.md`.
+
 ### Worker stdout
 
 The worker protocol uses unbuffered stdout on Windows. `READY`, `TOKEN`, `DRAFT`, `DONE`
@@ -123,22 +159,21 @@ must first validate the volume's physical-sector alignment plus buffer, offset a
 alignment on every read. It should only become a default if a full-checkpoint benchmark
 wins.
 
-### Very large worker context is not yet lightweight on Windows
+### One-million capacity does not mean one-million used tokens fit in RAM
 
-The POSIX worker can reserve a huge KV address range lazily. The first Windows mmap
-compatibility layer currently asks `VirtualAlloc` to reserve **and commit** the requested
-range. Physical pages are still demand-paged by Windows, but the commit charge is for the
-whole reservation.
+`--context 1048576` is now cheap as an **address-space capacity** on Windows: untouched KV
+rows carry no whole-reservation commit charge. It does not change the cost of rows that
+are actually used.
 
-So do **not** treat `--context 1048576` as a cheap native-Windows setting yet. Use a context
-capacity that fits the machine. A separate Windows VM change should reserve first and
-commit/decommit only the KV regions actually reached; that change needs its own RSS and
-parity gate.
+On the released K3 architecture, MLA KV is still roughly **2.37 MiB per used position per
+model**. A resident exact model plus a resident draft can therefore consume roughly twice
+the KV memory if both advance through the same long conversation. Long contexts must still
+fit the machine's real RAM/pagefile budget; the 1M setting only removes the artificial
+startup cost of reserving capacity that may never be touched.
 
 ## What Windows support means here
 
 Native Windows support means the engine and resident worker execute on Windows and pass
-model-output parity gates. The Windows reader now supports concurrent same-file positioned
-I/O, but it has not yet been tuned or measured to match Linux `O_DIRECT` on the full
-checkpoint. None of these platform changes alter the model: the exact K3 verifier remains
-authoritative.
+model-output parity gates. The Windows reader supports concurrent same-file positioned
+I/O, and huge worker KV capacity is reserve-only until positions are reached. None of
+these platform changes alter the model: the exact K3 verifier remains authoritative.
