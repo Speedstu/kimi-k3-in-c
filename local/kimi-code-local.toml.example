@@ -1,0 +1,46 @@
+# Kimi Code -> fully local K3 C runtime.
+# Copy to ~/.kimi-code/config.toml (or set KIMI_CODE_HOME to another directory).
+# There is no Moonshot/Kimi API endpoint anywhere in this file.
+
+default_model = "k3-local"
+default_permission_mode = "manual"
+default_plan_mode = false
+merge_all_available_skills = true
+telemetry = false
+
+[providers.local-k3]
+type = "kimi"
+base_url = "http://127.0.0.1:8000/v1"
+# Kimi Code requires a non-empty provider credential. The localhost bridge does not
+# authenticate this dummy value and never forwards it anywhere.
+api_key = "local-only"
+
+[models.k3-local]
+provider = "local-k3"
+model = "kimi-k3-local"
+# 32k is a conservative declaration for the current expanded-fp32 MLA cache. The C
+# engine is the final authority and refuses a request before allocation when the chosen
+# machine cannot fit its KV cache. Increase this only after measuring your RAM budget.
+max_context_size = 32768
+# The released K3 preserved-thinking example also uses max_tokens=4096. Pinning this here
+# prevents a client from deriving an output budget from the much larger context window.
+max_output_size = 4096
+capabilities = ["thinking", "always_thinking", "tool_use"]
+display_name = "K3 Local (C)"
+support_efforts = ["max"]
+default_effort = "max"
+
+[thinking]
+enabled = true
+effort = "max"
+keep = "all"
+
+[loop_control]
+max_attempts_per_step = 10
+reserved_context_size = 4096
+
+[background]
+# One 2.78T local inference at a time. The localhost server also serializes model runs,
+# so this avoids filling Kimi Code's queue with parallel subagent requests on a laptop.
+max_running_tasks = 1
+keep_alive_on_exit = false

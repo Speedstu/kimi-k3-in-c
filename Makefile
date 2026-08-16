@@ -92,7 +92,7 @@ INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
             -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer
 
 # ----------------------------------------------------------------------------- files --
-ENGINE_SRC := src/core/k3_ops.c \
+ENGINE_SRC := src/core/k3_ops.c src/core/k3_sample.c \
               src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
               src/cache/k3_cache.c \
               src/model/k3_bind.c
@@ -102,7 +102,7 @@ CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok test_trunk_codec scale_test k3_model
+UNIT_TESTS := test_ops test_sample test_cache test_st test_cfg test_tok test_trunk_codec scale_test k3_model
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -134,6 +134,9 @@ $(BIN):
 
 # Each test links only what it needs, so a failure points at one subsystem.
 $(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_sample: tests/unit/test_sample.c $(BUILD)/src/core/k3_sample.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
@@ -169,6 +172,7 @@ $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(
 ## test: everything that needs no model weights
 test: $(TEST_BINS)
 	@echo "== op kernels ==";        ./$(BIN)/test_ops $(FIXTURES)/ops
+	@echo "== sampler ==";           ./$(BIN)/test_sample
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32

@@ -1,0 +1,157 @@
+name: Local K3 parity
+
+on:
+  push:
+    branches: [main, feature/local-k3-max-parity]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'local/**'
+      - 'tests/python/**'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - 'Makefile'
+      - 'CMakeLists.txt'
+      - '.github/workflows/local-parity.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'local/**'
+      - 'tests/python/**'
+      - 'tools/make_tiny_checkpoint.py'
+      - 'tools/pack_trunk.py'
+      - 'Makefile'
+      - 'CMakeLists.txt'
+      - '.github/workflows/local-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-and-sampler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Python lint and local bridge tests
+        run: |
+          python -m pip install --quiet ruff
+          ruff check local/ tests/python/ --output-format=github
+          python -m compileall -q local/ tests/python/
+          python -m unittest discover -s tests/python -p 'test_*.py' -v
+      - name: Parse shipped Kimi Code profiles
+        run: |
+          python - <<'PY'
+          import tomllib
+          for path in ['local/kimi-code-local.toml.example', 'local/kimi-code-benchmark.toml.example']:
+              with open(path, 'rb') as f:
+                  cfg = tomllib.load(f)
+              provider = cfg['providers']['local-k3']
+              assert provider['base_url'] == 'http://127.0.0.1:8000/v1'
+              assert cfg['thinking']['enabled'] is True
+              assert cfg['thinking']['effort'] == 'max'
+              assert cfg['thinking']['keep'] == 'all'
+              assert cfg['models'][cfg['default_model']]['max_output_size'] == 4096
+              print(path, 'PASS')
+          PY
+      - name: Build and sampler unit test
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' bin/test_sample -j"$(nproc)"
+          ./bin/test_sample
+
+  tiny-end-to-end:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Tiny-checkpoint dependencies
+        run: |
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+      - name: Build engine and generate tiny K3
+        run: |
+          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+          python tools/make_tiny_checkpoint.py /tmp/k3tiny --seed 1234 --prompt-ids 3,7,11,5,9
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3tiny/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3tiny /tmp/k3tiny-trunk "$NLAYERS"
+      - name: ids-file is byte-for-byte equivalent to argv ids in greedy mode
+        run: |
+          printf '3,7,11\n5 9\n' >/tmp/prompt.ids
+          ./bin/k3 /tmp/k3tiny --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+            --ids 3,7,11,5,9 --gen 4 --incremental --temperature 0 --out /tmp/argv.json
+          ./bin/k3 /tmp/k3tiny --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+            --ids-file /tmp/prompt.ids --gen 4 --incremental --temperature 0 --out /tmp/file.json
+          python - <<'PY'
+          import json
+          a=json.load(open('/tmp/argv.json')); b=json.load(open('/tmp/file.json'))
+          assert a['generated_ids']==b['generated_ids']
+          assert a['full_ids']==b['full_ids']
+          print('ids-file greedy parity: PASS', a['generated_ids'])
+          PY
+      - name: temperature/top-p sampling is seed-reproducible
+        run: |
+          for R in a b; do
+            ./bin/k3 /tmp/k3tiny --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+              --ids 3,7,11,5,9 --gen 6 --incremental \
+              --temperature 1 --top-p 0.95 --seed 424242 --out "/tmp/sample-$R.json"
+          done
+          python - <<'PY'
+          import json
+          a=json.load(open('/tmp/sample-a.json')); b=json.load(open('/tmp/sample-b.json'))
+          assert a['generated_ids']==b['generated_ids']
+          assert a['temperature']==1 and abs(a['top_p']-.95)<1e-9 and a['seed']==424242
+          print('seeded sampling parity: PASS', a['generated_ids'])
+          PY
+      - name: save/resume equals full recompute for the exact same conversation prefix
+        run: |
+          ./bin/k3 /tmp/k3tiny --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+            --ids 3,7,11 --gen 2 --incremental --temperature 0 \
+            --save-state /tmp/prefix.k3state --out /tmp/prefix.json
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/prefix.json'))
+          full=x['full_ids']+[5,9]
+          open('/tmp/full.ids','w').write(','.join(map(str,full)))
+          print('full recompute ids:',full)
+          PY
+          ./bin/k3 /tmp/k3tiny --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+            --ids 5,9 --gen 3 --incremental --temperature 0 \
+            --load-state /tmp/prefix.k3state --out /tmp/resumed.json
+          ./bin/k3 /tmp/k3tiny --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+            --ids-file /tmp/full.ids --gen 3 --incremental --temperature 0 --out /tmp/recomputed.json
+          python - <<'PY'
+          import json
+          r=json.load(open('/tmp/resumed.json')); f=json.load(open('/tmp/recomputed.json'))
+          assert r['generated_ids']==f['generated_ids'], (r['generated_ids'],f['generated_ids'])
+          assert r['full_ids']==f['full_ids'], (r['full_ids'],f['full_ids'])
+          print('save/resume exact parity: PASS', r['generated_ids'])
+          PY
+      - name: stop-id stops on the emitted token
+        run: |
+          STOP=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/argv.json'))['generated_ids'][0])
+          PY
+          )
+          ./bin/k3 /tmp/k3tiny --trunk /tmp/k3tiny-trunk --trunk-gb 0.05 --cache-gb 0.05 \
+            --ids 3,7,11,5,9 --gen 8 --incremental --temperature 0 --stop-id "$STOP" --out /tmp/stop.json
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/stop.json'))
+          assert len(x['generated_ids'])==1
+          assert x['generated_ids'][0]==x['stop_id']
+          print('stop-id: PASS',x['generated_ids'])
+          PY
