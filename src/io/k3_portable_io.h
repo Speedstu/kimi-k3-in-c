@@ -52,7 +52,9 @@ static inline int posix_fadvise(int fd, int64_t off, int64_t len, int advice)
 
 /* Keep the fd-shaped interface used by the rest of K3, but create the underlying native
  * handle ourselves so it is FILE_FLAG_OVERLAPPED. _open_osfhandle transfers HANDLE
- * ownership to the CRT descriptor; the existing close(fd) teardown remains correct. */
+ * ownership to the CRT descriptor; the existing close(fd) teardown remains correct.
+ * Every fd passed to k3_pread on Windows is created here; ordinary CRT descriptors are
+ * intentionally not mixed into the overlapped model-reader path. */
 static inline int k3_open_read(const char *path, int want_direct, int *direct_active)
 {
     (void)want_direct; /* no unbuffered Windows path until its alignment gate lands */
