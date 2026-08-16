@@ -1,0 +1,51 @@
+name: Stage lossless trunk runtime
+
+on:
+  push:
+    branches:
+      - speedboost/lossless-trunk-codec
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'stage lossless trunk runtime'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Fix one staging-helper duplicate replacement
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tools/apply_lossless_runtime_stage.py')
+          s = p.read_text()
+          old = '''s = one(s, 'if (load_run(tr, L, tr->arena + (size_t)slot * tr->slot_bytes) != 0) return -1;',
+                  'if (load_run(tr, L, tr->arena + (size_t)slot * tr->slot_bytes, slot) != 0) return -1;',
+                  "sync load call")
+          '''
+          assert old in s
+          p.write_text(s.replace(old, ''))
+          PY
+      - name: Apply runtime integration
+        run: python3 tools/apply_lossless_runtime_stage.py .
+      - name: Python syntax and lint
+        run: |
+          pip install --quiet ruff
+          ruff check tools/lossless_trunk.py --output-format=github
+          python3 -m py_compile tools/lossless_trunk.py
+      - name: Build
+        run: make -j2
+      - name: Full weightless tests
+        run: make test
+      - name: Strict codec test under scalar portable C
+        run: cc -O2 -std=c99 -Wall -Wextra -Werror -Iinclude -Iinclude/k3 -Isrc/io tests/unit/test_trunk_codec.c -o /tmp/test_codec && /tmp/test_codec
+      - name: Commit validated runtime
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Makefile src/io/k3_trunk.h src/io/k3_trunk.c
+          git commit -m "feat: stream byte-exact lossless compressed trunks"
+          git push origin HEAD:speedboost/lossless-trunk-codec
