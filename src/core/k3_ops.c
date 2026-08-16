@@ -1196,6 +1196,81 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
     }
 }
 
+/* Groupwise signed-int4 matmul for the speculative draft trunk. Layout per row:
+ * repeated groups of [f32 scale][ceil(n/2) packed bytes], group size 128. Nibbles are
+ * two's-complement signed values (-8..7), low nibble = even element. The packer uses
+ * symmetric absmax/7, so -8 is representable but normally unused.
+ *
+ * This kernel has intentionally NO exact-model determinism contract: Q4G is proposal
+ * only and exact bf16 K3 verifies every emitted token. That lets the AVX2 path use float
+ * FMA and a natural reduction. The goal is bandwidth: 0.53125 bytes/weight at full
+ * groups versus 1.0 for I8R and 2.0 for bf16. */
+void k3_matmul_q4g(float *y, const float *x, const void *W, int in, int out)
+{
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t rowb = k3_q4_row_bytes(in);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++) {
+        const unsigned char *bp = base + (size_t)o * rowb;
+        float acc = 0.0f;
+        for (int g = 0, off = 0; off < in; g++, off += K3_Q4_GROUP) {
+            int n = in - off;
+            if (n > K3_Q4_GROUP) n = K3_Q4_GROUP;
+            float scale;
+            memcpy(&scale, bp, 4);
+            const unsigned char *pk = bp + 4;
+            const float *xg = x + off;
+            float sub = 0.0f;
+            int i = 0;
+#if defined(__AVX2__)
+            __m256 v0 = _mm256_setzero_ps(), v1 = _mm256_setzero_ps();
+            __m256 v2 = _mm256_setzero_ps(), v3 = _mm256_setzero_ps();
+            const __m128i mask = _mm_set1_epi8(0x0f);
+            const __m128i sign = _mm_set1_epi8(0x08);
+            for (; i + 31 < n; i += 32) {
+                const __m128i b = _mm_loadu_si128((const __m128i *)(pk + (i >> 1)));
+                __m128i lo = _mm_and_si128(b, mask);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), mask);
+                lo = _mm_sub_epi8(_mm_xor_si128(lo, sign), sign);
+                hi = _mm_sub_epi8(_mm_xor_si128(hi, sign), sign);
+                const __m128i q0 = _mm_unpacklo_epi8(lo, hi);
+                const __m128i q1 = _mm_unpackhi_epi8(lo, hi);
+                v0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q0)),
+                                     _mm256_loadu_ps(xg + i), v0);
+                v1 = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q0, 8))),
+                    _mm256_loadu_ps(xg + i + 8), v1);
+                v2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q1)),
+                                     _mm256_loadu_ps(xg + i + 16), v2);
+                v3 = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q1, 8))),
+                    _mm256_loadu_ps(xg + i + 24), v3);
+            }
+            {
+                const __m256 vs = _mm256_add_ps(_mm256_add_ps(v0, v1),
+                                                 _mm256_add_ps(v2, v3));
+                __m128 z = _mm_add_ps(_mm256_castps256_ps128(vs),
+                                      _mm256_extractf128_ps(vs, 1));
+                z = _mm_add_ps(z, _mm_movehl_ps(z, z));
+                z = _mm_add_ss(z, _mm_shuffle_ps(z, z, 1));
+                sub = _mm_cvtss_f32(z);
+            }
+#endif
+            for (; i < n; i++) {
+                const unsigned char b = pk[i >> 1];
+                const int nib = (i & 1) ? (b >> 4) : (b & 0x0f);
+                const int q = nib < 8 ? nib : nib - 16;
+                sub += (float)q * xg[i];
+            }
+            acc += sub * scale;
+            bp += 4u + (size_t)(n + 1) / 2u;
+        }
+        y[o] = acc;
+    }
+}
+
 /* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
  * of masking, shifting and two separate lookups. 2 KB, built once, shared by all
  * threads after initialisation. */

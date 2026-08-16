@@ -847,6 +847,50 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* Draft-only Q4G kernel format check. This validates nibble order, sign extension,
+ * group scale placement and row stride against an independent scalar decode. */
+static void t_matmul_q4g(void)
+{
+    const int in = 256, out = 17, G = K3_Q4_GROUP;
+    const size_t rowb = k3_q4_row_bytes(in);
+    unsigned char *W = (unsigned char *)calloc((size_t)out, rowb);
+    float *x = (float *)malloc((size_t)in * sizeof(float));
+    float *got = (float *)malloc((size_t)out * sizeof(float));
+    float *want = (float *)malloc((size_t)out * sizeof(float));
+    if (!W || !x || !got || !want) { printf("  FAIL  matmul_q4g (alloc)\n"); g_fail++; return; }
+    for (int i = 0; i < in; i++) x[i] = ((i * 37) % 101 - 50) * 0.007f;
+    for (int o = 0; o < out; o++) {
+        unsigned char *bp = W + (size_t)o * rowb;
+        float ref = 0.0f;
+        for (int g = 0; g < in / G; g++) {
+            const float scale = 0.003f * (float)(1 + ((o + g) % 7));
+            memcpy(bp, &scale, 4);
+            unsigned char *pk = bp + 4;
+            float sub = 0.0f;
+            for (int j = 0; j < G; j += 2) {
+                const int q0 = ((o * 11 + g * 5 + j) % 15) - 7;
+                const int q1 = ((o * 13 + g * 3 + j + 1) % 15) - 7;
+                pk[j >> 1] = (unsigned char)((q0 & 15) | ((q1 & 15) << 4));
+                sub += (float)q0 * x[g * G + j];
+                sub += (float)q1 * x[g * G + j + 1];
+            }
+            ref += sub * scale;
+            bp += 4 + G / 2;
+        }
+        want[o] = ref;
+    }
+    k3_matmul_q4g(got, x, W, in, out);
+    double worst = 0.0;
+    for (int o = 0; o < out; o++) {
+        const double d = fabs((double)got[o] - want[o]);
+        const double tol = 2e-5 + 2e-5 * fabs((double)want[o]);
+        if (d / tol > worst) worst = d / tol;
+    }
+    if (worst <= 1.0) { printf("  PASS  matmul_q4g    n=%d    worst=%.2fx tol\n", out, worst); g_pass++; }
+    else              { printf("  FAIL  matmul_q4g    worst=%.2fx tol\n", worst); g_fail++; }
+    free(W); free(x); free(got); free(want);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -884,6 +928,7 @@ int main(int argc, char **argv)
     t_moe(dir);
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_matmul_q4g();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");
