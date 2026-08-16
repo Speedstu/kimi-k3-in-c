@@ -40,8 +40,19 @@ static uint32_t rng32(void)
     return x;
 }
 
-/* Decode the fixed-layout payload. dict[15] are literal high bytes. `esc` contains
- * literal high bytes for code 15, in code-stream order. Returns escapes consumed. */
+static inline int pop_lsb(unsigned *m)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    const int bit = __builtin_ctz(*m);
+#else
+    int bit = 0; unsigned v = *m; while (!(v & 1u)) { v >>= 1; bit++; }
+#endif
+    *m &= *m - 1u;
+    return bit;
+}
+
+/* Decode the fixed-layout payload. Escapes are patched in the SIMD loop itself using
+ * a 16-bit movemask, so there is NO second scalar pass over the entire code stream. */
 static size_t decode_dict15(unsigned char *dst, size_t n,
                             const unsigned char *low,
                             const unsigned char *code,
@@ -50,16 +61,18 @@ static size_t decode_dict15(unsigned char *dst, size_t n,
 {
     unsigned char d16[16] = {0};
     memcpy(d16, dict, 15);
+    size_t ne = 0;
+    size_t i = 0;
 #if defined(__AVX2__)
     const __m128i vd = _mm_loadu_si128((const __m128i *)d16);
     const __m128i mask = _mm_set1_epi8(0x0f);
-    size_t i = 0;
+    const __m128i vesc = _mm_set1_epi8(15);
     for (; i + 31 < n; i += 32) {
         const __m128i c = _mm_loadu_si128((const __m128i *)(code + (i >> 1)));
         const __m128i loq = _mm_and_si128(c, mask);
         const __m128i hiq = _mm_and_si128(_mm_srli_epi16(c, 4), mask);
-        const __m128i q0 = _mm_unpacklo_epi8(loq, hiq);  /* codes i..i+15 */
-        const __m128i q1 = _mm_unpackhi_epi8(loq, hiq);  /* codes i+16..i+31 */
+        const __m128i q0 = _mm_unpacklo_epi8(loq, hiq);
+        const __m128i q1 = _mm_unpackhi_epi8(loq, hiq);
         const __m128i h0 = _mm_shuffle_epi8(vd, q0);
         const __m128i h1 = _mm_shuffle_epi8(vd, q1);
         const __m128i l0 = _mm_loadu_si128((const __m128i *)(low + i));
@@ -68,29 +81,24 @@ static size_t decode_dict15(unsigned char *dst, size_t n,
         _mm_storeu_si128((__m128i *)(dst + 2 * i + 16), _mm_unpackhi_epi8(l0, h0));
         _mm_storeu_si128((__m128i *)(dst + 2 * i + 32), _mm_unpacklo_epi8(l1, h1));
         _mm_storeu_si128((__m128i *)(dst + 2 * i + 48), _mm_unpackhi_epi8(l1, h1));
+
+        unsigned m0 = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(q0, vesc));
+        unsigned m1 = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(q1, vesc));
+        while (m0) {
+            const int p = pop_lsb(&m0);
+            dst[2 * (i + (size_t)p) + 1] = esc[ne++];
+        }
+        while (m1) {
+            const int p = pop_lsb(&m1);
+            dst[2 * (i + 16u + (size_t)p) + 1] = esc[ne++];
+        }
     }
+#endif
     for (; i < n; i++) {
         const unsigned char b = code[i >> 1];
         const unsigned char q = (i & 1) ? (b >> 4) : (b & 15);
         dst[2 * i] = low[i];
-        dst[2 * i + 1] = q < 15 ? dict[q] : 0;
-    }
-#else
-    for (size_t i = 0; i < n; i++) {
-        const unsigned char b = code[i >> 1];
-        const unsigned char q = (i & 1) ? (b >> 4) : (b & 15);
-        dst[2 * i] = low[i];
-        dst[2 * i + 1] = q < 15 ? dict[q] : 0;
-    }
-#endif
-
-    /* Escapes are deliberately rare. A second linear scan is simpler than introducing
-     * variable-length state into the SIMD loop and costs only half a byte read per word. */
-    size_t ne = 0;
-    for (size_t i = 0; i < n; i++) {
-        const unsigned char b = code[i >> 1];
-        const unsigned char q = (i & 1) ? (b >> 4) : (b & 15);
-        if (q == 15) dst[2 * i + 1] = esc[ne++];
+        dst[2 * i + 1] = q < 15 ? dict[q] : esc[ne++];
     }
     return ne;
 }
@@ -104,9 +112,6 @@ int main(int argc, char **argv)
     const size_t raw_bytes = raw_mb << 20;
     const size_t n = raw_bytes / 2;
     const size_t code_bytes = (n + 1) / 2;
-
-    /* Representative K3-ish BF16 high bytes; exact values do not affect decoder speed,
-     * only dictionary-hit/escape rate does. */
     const unsigned char dict[15] = {
         0x3c,0xbc,0x3d,0xbd,0x3b,0xbb,0x3e,0xbe,0x3a,0xba,0x39,0xb9,0x3f,0xbf,0x00
     };
@@ -125,9 +130,7 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < n; i++) {
         const uint32_t r = rng32();
         const unsigned char lb = (unsigned char)r;
-        unsigned char q;
-        unsigned char hb;
-        /* Exactly about 0.1% escapes. */
+        unsigned char q, hb;
         if ((r % 1000u) == 0u) {
             q = 15;
             hb = (unsigned char)(0x70u + ((r >> 16) & 15u));
@@ -172,7 +175,6 @@ int main(int argc, char **argv)
            (double)raw_bytes / 1e9 / best,
            (double)raw_bytes / 1e9 / (sum / reps),
            (unsigned long long)checksum);
-
     free(raw); free(out); free(low); free(code); free(esc);
     return 0;
 }
