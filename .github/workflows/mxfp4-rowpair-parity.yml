@@ -2,7 +2,9 @@ name: MXFP4 row-pair parity
 
 on:
   push:
-    branches: [speedboost/mxfp4-rowpair]
+    branches:
+      - speedboost/mxfp4-rowpair
+      - speedboost/disable-rowpair-regression
     paths:
       - 'src/core/k3_ops.c'
       - 'benchmarks/bench_mxfp4_rowpair_exact.c'
@@ -69,20 +71,20 @@ jobs:
           )
           python tools/pack_trunk.py /tmp/k3tiny /tmp/k3trunk "$NLAYERS"
 
-      - name: Same-binary streamed A/B exactness
+      - name: Fast default vs opt-in row-pair are exact
         run: |
           set -euo pipefail
           D=/tmp/rowpair-tiny
           COMMON='/tmp/k3tiny --trunk /tmp/k3trunk --trunk-gb 0.05 --cache-gb 0.001 --ids 3,7,11,5,9 --gen 8 --incremental --threads 1 --temperature 0'
-          K3_NO_MX_ROWPAIR=1 ./bin/k3 $COMMON --dump-logits "$D/off.logits" --out "$D/off.json" >"$D/off.log" 2>&1
-          ./bin/k3 $COMMON --dump-logits "$D/on.logits" --out "$D/on.json" >"$D/on.log" 2>&1
-          cmp "$D/off.logits" "$D/on.logits"
+          ./bin/k3 $COMMON --dump-logits "$D/default.logits" --out "$D/default.json" >"$D/default.log" 2>&1
+          K3_FORCE_MX_ROWPAIR=1 ./bin/k3 $COMMON --dump-logits "$D/forced.logits" --out "$D/forced.json" >"$D/forced.log" 2>&1
+          cmp "$D/default.logits" "$D/forced.logits"
           python3 - <<'PY'
           import json
           d='/tmp/rowpair-tiny'
-          a=json.load(open(d+'/off.json')); b=json.load(open(d+'/on.json'))
+          a=json.load(open(d+'/default.json')); b=json.load(open(d+'/forced.json'))
           assert a['generated_ids']==b['generated_ids'], (a['generated_ids'], b['generated_ids'])
           assert a['full_ids']==b['full_ids']
           print('rowpair exact ids:',a['generated_ids'])
           PY
-          echo 'rowpair logits + 8-token parity: PASS'
+          echo 'fast default + opt-in rowpair logits/8-token parity: PASS'
