@@ -101,7 +101,7 @@ jobs:
           D=/tmp/k3cost-out
           TOPK=$(python - <<'PY'
           import json
-          print(json.load(open('/tmp/k3cost/config.json'))['num_experts_per_tok'])
+          print(json.load(open('/tmp/k3cost/config.json'))['num_experts_per_token'])
           PY
           )
           BASE='/tmp/k3cost --trunk /tmp/k3cost-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 36 --incremental --threads 1 --temperature 0'
