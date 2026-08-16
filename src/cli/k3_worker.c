@@ -59,6 +59,10 @@ static void worker_reset_state(Weights *w, float *ks, size_t kper, int nl,
 
 int main(int argc, char **argv)
 {
+    /* stdout is the machine protocol. Configure it BEFORE any helper can print: when
+     * connected to Python it is a pipe, and the default full buffering can otherwise
+     * hold @K3READY forever while the client waits for exactly that line. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 2) { worker_usage(stderr); return 2; }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -178,7 +182,6 @@ int main(int argc, char **argv)
     w.cached = 0;
     int history_len = 0;
 
-    setvbuf(stdout, NULL, _IOLBF, 0);
     printf("@K3READY %d %d\n", context, c.vocab);
 
     char op[16];
