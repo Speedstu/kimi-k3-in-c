@@ -1,0 +1,56 @@
+name: Router allocation probe
+
+on:
+  push:
+    branches: [speedboost/router-workspace-probe]
+    paths:
+      - '.github/workflows/router-alloc-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Measure allocator ceiling and real router
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/alloc_probe.c <<'C'
+          #define _POSIX_C_SOURCE 200809L
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <time.h>
+          static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
+          static volatile uintptr_t sink;
+          int main(void){
+            enum { N=2000000, BYTES=896*4 };
+            double t=now_s();
+            for(int i=0;i<N;i++){
+              void *a=malloc(BYTES), *b=malloc(BYTES);
+              if(!a||!b) return 2;
+              ((volatile unsigned char*)a)[0]=(unsigned char)i;
+              ((volatile unsigned char*)b)[0]=(unsigned char)(i>>8);
+              sink ^= (uintptr_t)a ^ (uintptr_t)b;
+              free(a); free(b);
+            }
+            double dt=now_s()-t;
+            double us=dt*1e6/N;
+            printf("two malloc + two free: %.4f us/router-equivalent\n",us);
+            printf("92 routed layers: %.4f ms/token allocator ceiling\n",92.0*us/1000.0);
+            printf("184 alloc + 184 free calls/token; sink=%llu\n",(unsigned long long)sink);
+            return 0;
+          }
+          C
+          cc -O3 -std=c99 /tmp/alloc_probe.c -o /tmp/alloc_probe
+          /tmp/alloc_probe
+
+          make -j2
+          cc -O3 -std=gnu99 -march=native -fopenmp -pthread -ffp-contract=off \
+             -Iinclude -Iinclude/k3 benchmarks/bench_router_storage.c build/src/core/k3_ops.o \
+             -o /tmp/bench_router -lm -fopenmp -pthread
+          OMP_NUM_THREADS=2 /tmp/bench_router 12
