@@ -1,0 +1,30 @@
+name: Prefill fixture options staging
+
+on:
+  push:
+    branches: [speedboost/prefill-expert-waves]
+    paths:
+      - 'tools/_stage_prefill_fixture_opts.py'
+      - '.github/workflows/prefill-fixture-opts-stage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: speedboost/prefill-expert-waves
+          fetch-depth: 0
+      - name: Apply fixture patch and self-remove
+        run: |
+          set -euo pipefail
+          python tools/_stage_prefill_fixture_opts.py
+          rm tools/_stage_prefill_fixture_opts.py .github/workflows/prefill-fixture-opts-stage.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tools/make_tiny_checkpoint.py tools/_stage_prefill_fixture_opts.py .github/workflows/prefill-fixture-opts-stage.yml
+          git commit -m 'test: make tiny expert count and top-k configurable'
+          git push origin HEAD:speedboost/prefill-expert-waves
