@@ -527,6 +527,14 @@ size_t k3_mla_scratch(const K3Cfg *c, int T)
     return k3_mla_scratch_cached(c, T, T, 0);
 }
 
+#if defined(__AVX2__)
+/* Exact-K3 streamed-expert helper: x is already widened from float to double once by
+ * the MoE caller, so thousands of output rows do not repeat the same cvtps2pd work. */
+static void k3_matmul_mxfp4_xd(float *y, const double *x,
+                               const unsigned char *packed,
+                               const unsigned char *scales, int in, int rows, int group);
+#endif
+
 /* ------------------------------------------------------- Stable LatentMoE ---- */
 /* Verified against modeling_kimi_linear.py:815-838. The ORDER is load bearing:
  *   1. route on the FULL hidden width, before any projection      :818
@@ -562,6 +570,15 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
     float *sgu  = edn  + L;             /* [2*SI] shared gate|up            */
     float *sact = sgu  + 2 * SI;        /* [SI]   shared after SiTU         */
     float *sdn  = sact + SI;            /* [E]    shared down-projection    */
+#if defined(__AVX2__)
+    /* Align the private double workspace inside the caller-owned float scratch. The
+     * scratch contract reserves one extra float for worst-case 8-byte alignment. */
+    uintptr_t xdp = ((uintptr_t)(sdn + E) + 7u) & ~(uintptr_t)7u;
+    double *zxd   = (double *)xdp;       /* [L] shared by w1+w3 across ALL routed experts */
+    double *actxd = zxd + L;             /* [I] refreshed once per expert for w2           */
+    static int no_mx_xdouble = -1;
+    if (no_mx_xdouble < 0) no_mx_xdouble = getenv("K3_NO_MX_XDOUBLE") ? 1 : 0;
+#endif
 
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
@@ -600,6 +617,11 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         /* 2. down-project into the latent space. This is independent of expert bytes
          * and therefore overlaps the background reads when async_prefetch is active. */
         k3_mmw(z, xt, w->down, w->wdt, E, L);
+#if defined(__AVX2__)
+        const int use_mx_xdouble = w->src && !no_mx_xdouble;
+        if (use_mx_xdouble)
+            for (int i = 0; i < L; i++) zxd[i] = (double)z[i];
+#endif
 
         /* The shared expert is also independent of the routed experts. Compute it early
          * ONLY on the async path, into its normal disjoint scratch, then still add it at
@@ -646,10 +668,25 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                                     "this token is CORRUPT\n", w->layer, idx[j]);
                     continue;
                 }
-                k3_matmul_mxfp4(gu,     z, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
-                k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
-                k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+#if defined(__AVX2__)
+                if (use_mx_xdouble) {
+                    /* z is identical for every selected expert in this token. Widen it
+                     * once above and reuse it for both gate/up matrices across top-k. */
+                    k3_matmul_mxfp4_xd(gu,     zxd, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
+                    k3_matmul_mxfp4_xd(gu + I, zxd, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
+                    k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
+                    /* act changes per expert, but widening it ONCE still replaces one
+                     * conversion per output row in w2. */
+                    for (int i = 0; i < I; i++) actxd[i] = (double)act[i];
+                    k3_matmul_mxfp4_xd(edn, actxd, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+                } else
+#endif
+                {
+                    k3_matmul_mxfp4(gu,     z, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
+                    k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
+                    k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
+                    k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+                }
             } else {
                 const float *e1 = w->w1 + (size_t)idx[j] * I * L;   /* gate */
                 const float *e3 = w->w3 + (size_t)idx[j] * I * L;   /* up   */
@@ -684,11 +721,16 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
 size_t k3_moe_scratch(const K3Cfg *c)
 {
     const int SI = c->moe_inter * c->n_shared;
-    return (size_t)2 * c->latent          /* z, accL            */
-         + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I) */
-         + (size_t)c->latent              /* edn                */
-         + (size_t)3 * SI                 /* sgu (2*SI) + sact  */
-         + (size_t)c->hidden;             /* sdn                */
+    size_t n = (size_t)2 * c->latent     /* z, accL            */
+             + (size_t)3 * c->moe_inter   /* gu (2*I) + act (I) */
+             + (size_t)c->latent          /* edn                */
+             + (size_t)3 * SI             /* sgu (2*SI) + sact  */
+             + (size_t)c->hidden;         /* sdn                */
+#if defined(__AVX2__)
+    /* double z + double act, expressed in float units, plus one float for alignment. */
+    n += (size_t)2 * (c->latent + c->moe_inter) + 1u;
+#endif
+    return n;
 }
 
 /* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
@@ -1367,6 +1409,76 @@ static void k3_e8m0_init(void)
  * 1e-6 against dequantise-then-matmul on real checkpoint weights, gated by
  * tests/unit/test_expert.c. The margin is nine orders of magnitude.
  */
+#if defined(__AVX2__)
+static void k3_matmul_mxfp4_xd(float *y, const double *x,
+                               const unsigned char *packed,
+                               const unsigned char *scales, int in, int rows, int group)
+{
+    if (group != 32 || (in & 31)) {
+        /* No production K3 expert takes this branch. Keep a defensive exact fallback by
+         * converting back to float once; callers only use xd after an exact float->double
+         * widening, so this round-trip is lossless. */
+        float *xf = (float *)malloc((size_t)in * sizeof(float));
+        if (!xf) k3_fatal_oom("MXFP4 xd fallback", (size_t)in * sizeof(float));
+        for (int i = 0; i < in; i++) xf[i] = (float)x[i];
+        k3_matmul_mxfp4(y, xf, packed, scales, in, rows, group);
+        free(xf);
+        return;
+    }
+
+    const int pcols = in / 2, ngrp = in / 32;
+    if (!k3_e8m0_ready) k3_e8m0_init();
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    const __m128i half_units = _mm_setr_epi8(
+         0,  1,  2,  3,  4,  6,  8, 12,
+         0, -1, -2, -3, -4, -6, -8,-12);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows > 64)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const unsigned char *pr = packed + (size_t)r * pcols;
+        const unsigned char *sr = scales + (size_t)r * ngrp;
+        double acc = 0.0;
+        for (int g = 0; g < ngrp; g++) {
+            const unsigned char sb = sr[g];
+            if (sb == 255) continue;
+            const unsigned char *pb = pr + (size_t)g * 16;
+            const double *xg = x + (size_t)g * 32;
+            const __m128i b = _mm_loadu_si128((const __m128i *)pb);
+            const __m128i lo = _mm_shuffle_epi8(half_units, _mm_and_si128(b, mask));
+            const __m128i hi = _mm_shuffle_epi8(
+                half_units, _mm_and_si128(_mm_srli_epi16(b, 4), mask));
+            const __m128i q0 = _mm_unpacklo_epi8(lo, hi);
+            const __m128i q1 = _mm_unpackhi_epi8(lo, hi);
+            const __m256i i0 = _mm256_cvtepi8_epi32(q0);
+            const __m256i i1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q0, 8));
+            const __m256i i2 = _mm256_cvtepi8_epi32(q1);
+            const __m256i i3 = _mm256_cvtepi8_epi32(_mm_srli_si128(q1, 8));
+            __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+#define K3_XD_F4(V, I128, O) do {                                              \
+                (V) = _mm256_fmadd_pd(_mm256_cvtepi32_pd((I128)),              \
+                                      _mm256_loadu_pd(xg + (O)), (V));          \
+            } while (0)
+            K3_XD_F4(v0, _mm256_castsi256_si128(i0),       0);
+            K3_XD_F4(v1, _mm256_extracti128_si256(i0, 1),  4);
+            K3_XD_F4(v0, _mm256_castsi256_si128(i1),       8);
+            K3_XD_F4(v1, _mm256_extracti128_si256(i1, 1), 12);
+            K3_XD_F4(v0, _mm256_castsi256_si128(i2),      16);
+            K3_XD_F4(v1, _mm256_extracti128_si256(i2, 1), 20);
+            K3_XD_F4(v0, _mm256_castsi256_si128(i3),      24);
+            K3_XD_F4(v1, _mm256_extracti128_si256(i3, 1), 28);
+#undef K3_XD_F4
+            double a[4];
+            _mm256_storeu_pd(a, _mm256_add_pd(v0, v1));
+            const double sub2 = (a[0] + a[1]) + (a[2] + a[3]);
+            acc += sub2 * ((double)K3_E8M0[sb] * 0.5);
+        }
+        y[r] = (float)acc;
+    }
+}
+#endif
+
 void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                      const unsigned char *scales, int in, int rows, int group)
 {
