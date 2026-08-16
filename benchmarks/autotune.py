@@ -410,6 +410,9 @@ def main() -> int:
             "threads": best_c,
             "async_io_threads": best_io,
             "median_seconds_per_token": final_median,
+            # Backward-compatible two-dimensional field name retained for existing
+            # report consumers. In 3D mode it means the same final exact configuration.
+            "samples_at_final_pair": len(final_samples),
             "samples_at_final_configuration": len(final_samples),
         }
         if best_topk is not None:
