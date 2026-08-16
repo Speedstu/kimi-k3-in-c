@@ -4,6 +4,10 @@ from pathlib import Path
 p = Path("src/cli/k3_run.c")
 s = p.read_text()
 
+if '#include "k3_spec_auto.h"' in s:
+    print("cost-aware speculative horizon already applied")
+    raise SystemExit(0)
+
 
 def one(old: str, new: str) -> None:
     global s
@@ -82,9 +86,9 @@ one(
     '                        spec_auto_proposed += nd;\n'
     '                        spec_auto_accepted += m;\n'
     '                        if (dw.trunk && spec_round_t0 > 0.0) {\n'
-    '                            /* Measure the whole speculative transaction: proposal, exact\\n'
-    '                             * verify/replay, and draft resync.  This is the wall-clock cost\\n'
-    '                             * the user actually pays for the m accepted drafts plus the\\n'
+    '                            /* Measure the whole speculative transaction: proposal, exact\n'
+    '                             * verify/replay, and draft resync.  This is the wall-clock cost\n'
+    '                             * the user actually pays for the m accepted drafts plus the\n'
     '                             * exact correction token. */\n'
     '                            const double round_s = now_s() - spec_round_t0;\n'
     '                            k3_spec_auto_cost_observe(&spec_cost, spec_now, round_s, m + 1);\n'
