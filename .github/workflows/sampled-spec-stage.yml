@@ -1,0 +1,45 @@
+name: Stage exact sampled speculation
+
+on:
+  push:
+    branches: [feature/exact-sampled-speculation]
+    paths:
+      - tools/apply_sampled_spec_stage.py
+      - .github/workflows/sampled-spec-stage.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/exact-sampled-speculation
+      - name: Apply guarded decoder patch
+        run: python3 tools/apply_sampled_spec_stage.py
+      - name: Build, tests, sampler theorem
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' -j"$(nproc)"
+          make ARCH='-mavx2 -mfma' test -j"$(nproc)"
+          ./bin/test_sample
+      - name: Strict warnings
+        run: |
+          make clean
+          make portable CFLAGS="-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -fopenmp -ffp-contract=off" -j"$(nproc)"
+      - name: CMake parity
+        run: |
+          cmake -S . -B /tmp/k3-cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/k3-cmake -j"$(nproc)"
+          ctest --test-dir /tmp/k3-cmake --output-on-failure
+      - name: Commit validated source
+        run: |
+          git config user.name Speedstu
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add src/cli/k3_run.c
+          git diff --cached --check
+          git commit -m 'feat: probability-correct sampled speculative decode [stage-applied]'
+          git push origin HEAD:feature/exact-sampled-speculation
