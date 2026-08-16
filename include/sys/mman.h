@@ -42,11 +42,10 @@
 #define MADV_HUGEPAGE 14
 #endif
 
-/* K3 only mmaps anonymous read/write worker KV. MEM_COMMIT reserves pagefile charge but
- * Windows still allocates physical pages on first access, so ordinary contexts remain
- * demand-paged. The worker has its own large-context guard and will get a clean failure
- * if Windows cannot commit the requested reservation rather than falling into a giant
- * calloc. */
+/* Generic mmap compatibility remains reserve+commit so callers that expect immediately
+ * writable anonymous memory keep POSIX-like semantics. The resident worker uses the
+ * explicit k3_vm_* helpers below when it wants a huge address-space reservation whose
+ * commit charge must grow only with rows actually reached. */
 static inline void *mmap(void *addr, size_t length, int prot, int flags, int fd,
                          int64_t offset)
 {
@@ -64,10 +63,67 @@ static inline int munmap(void *addr, size_t length)
     return VirtualFree(addr, 0, MEM_RELEASE) ? 0 : -1;
 }
 
-/* MADV_HUGEPAGE is a Linux performance hint and has no correctness effect here.
- * MADV_DONTNEED is used only for stale worker KV after cached=0 made it unreachable.
- * MEM_RESET tells Windows those committed pages are discardable without walking and
- * zeroing the old KV in userspace; their future contents are deliberately unspecified. */
+/* Reserve virtual address space with zero commit charge. PAGE_NOACCESS is intentional:
+ * touching a row before k3_vm_commit_span() is a hard bug instead of silently consuming
+ * multi-terabyte commit. */
+static inline void *k3_vm_reserve(size_t length)
+{
+    if (length == 0) return NULL;
+    return VirtualAlloc(NULL, length, MEM_RESERVE, PAGE_NOACCESS);
+}
+
+static inline size_t k3_vm_page_size(void)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (size_t)si.dwPageSize;
+}
+
+/* Commit only a subrange of an existing reservation. Clamp the page-rounded span to the
+ * reservation itself so a final unaligned row can never spill into a neighbouring VA
+ * region. Re-committing an already committed page is valid and keeps this helper
+ * idempotent across speculative replay. */
+static inline int k3_vm_commit_span(void *base, size_t total,
+                                    void *addr, size_t length)
+{
+    if (!base || total == 0 || !addr || length == 0) return 0;
+    const size_t ps = k3_vm_page_size();
+    const uintptr_t b0 = (uintptr_t)base;
+    const uintptr_t b1 = b0 + total;
+    uintptr_t a0 = (uintptr_t)addr;
+    if (a0 < b0 || a0 >= b1 || length > (size_t)(b1 - a0)) return -1;
+    uintptr_t a1 = a0 + length;
+    a0 = (a0 / ps) * ps;
+    a1 = ((a1 + ps - 1) / ps) * ps;
+    if (a0 < b0) a0 = b0;
+    if (a1 > b1) a1 = b1;
+    if (a1 <= a0) return 0;
+    return VirtualAlloc((void *)a0, (size_t)(a1 - a0),
+                        MEM_COMMIT, PAGE_READWRITE) ? 0 : -1;
+}
+
+/* Drop commit charge for a subrange while keeping the enclosing address reservation.
+ * Future use must call k3_vm_commit_span() again before access. */
+static inline int k3_vm_decommit_span(void *base, size_t total,
+                                      void *addr, size_t length)
+{
+    if (!base || total == 0 || !addr || length == 0) return 0;
+    const size_t ps = k3_vm_page_size();
+    const uintptr_t b0 = (uintptr_t)base;
+    const uintptr_t b1 = b0 + total;
+    uintptr_t a0 = (uintptr_t)addr;
+    if (a0 < b0 || a0 >= b1 || length > (size_t)(b1 - a0)) return -1;
+    uintptr_t a1 = a0 + length;
+    a0 = (a0 / ps) * ps;
+    a1 = ((a1 + ps - 1) / ps) * ps;
+    if (a0 < b0) a0 = b0;
+    if (a1 > b1) a1 = b1;
+    if (a1 <= a0) return 0;
+    return VirtualFree((void *)a0, (size_t)(a1 - a0), MEM_DECOMMIT) ? 0 : -1;
+}
+
+/* Generic MADV_DONTNEED retains immediately-accessible semantics via MEM_RESET. The
+ * worker uses k3_vm_decommit_span() explicitly when it wants commit charge returned. */
 static inline int madvise(void *addr, size_t length, int advice)
 {
     if (!addr || length == 0) return 0;
