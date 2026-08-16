@@ -451,6 +451,12 @@ static double peak_rss_bytes(void)
  * MemFree. Returns 0 if it cannot be read. */
 static double mem_available_bytes(void)
 {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    memset(&ms, 0, sizeof ms);
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (double)ms.ullAvailPhys : 0.0;
+#else
     FILE *f = fopen("/proc/meminfo", "r");
     if (!f) return 0.0;
     char line[256];
@@ -459,6 +465,7 @@ static double mem_available_bytes(void)
         if (!strncmp(line, "MemAvailable:", 13)) { kb = atof(line + 13); break; }
     fclose(f);
     return kb * 1024.0;
+#endif
 }
 
 typedef struct {
