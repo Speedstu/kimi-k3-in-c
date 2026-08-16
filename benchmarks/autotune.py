@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Tune real K3 compute and async expert-I/O threads on the current machine.
+"""Tune real K3 compute, expert-I/O threads and optional draft top-k.
 
-The tuner runs the SAME exact K3 request repeatedly, changing only:
+The tuner runs the SAME exact K3 request repeatedly, changing only performance knobs:
   * --threads N                  main OpenMP compute team
   * K3_ASYNC_IO_THREADS=N       background expert-read team
+  * --draft-topk K              optional cheap-draft routed expert count
 
-It refuses to recommend anything if generated_ids or full_ids change between runs.
-No model weights, routing settings, precision, cache size, prompt or sampling options
-are changed by this script.
+Draft top-k tuning is opt-in and requires a --draft-trunk in the K3 arguments. The exact
+K3 model still verifies every emitted token; this script refuses to recommend anything
+if generated_ids or full_ids change between any candidate runs.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -28,6 +29,7 @@ class Run:
     phase: str
     compute_threads: int
     io_threads: int
+    draft_topk: int | None
     repeat: int
     seconds_per_token: float
     generated_ids: list[int]
@@ -44,7 +46,7 @@ def parse_candidates(text: str, *, max_value: int | None = None) -> list[int]:
         except ValueError as exc:
             raise argparse.ArgumentTypeError(f"invalid integer candidate: {raw!r}") from exc
         if v < 1:
-            raise argparse.ArgumentTypeError("thread candidates must be >= 1")
+            raise argparse.ArgumentTypeError("candidates must be >= 1")
         if max_value is not None and v > max_value:
             continue
         if v not in vals:
@@ -71,29 +73,48 @@ def candidate_arg_present(args: Iterable[str], name: str) -> bool:
     return any(a == name or a.startswith(prefix) for a in args)
 
 
-def median_for(runs: list[Run], compute: int, io: int, phase: str | None = None) -> float:
+def median_for(
+    runs: list[Run],
+    compute: int,
+    io: int,
+    draft_topk: int | None,
+    phase: str | None = None,
+) -> float:
     vals = [
         r.seconds_per_token
         for r in runs
-        if r.compute_threads == compute and r.io_threads == io and (phase is None or r.phase == phase)
+        if r.compute_threads == compute
+        and r.io_threads == io
+        and r.draft_topk == draft_topk
+        and (phase is None or r.phase == phase)
     ]
     if not vals:
-        raise RuntimeError(f"no timings for compute={compute}, io={io}, phase={phase}")
+        raise RuntimeError(
+            f"no timings for compute={compute}, io={io}, draft_topk={draft_topk}, phase={phase}"
+        )
     return statistics.median(vals)
+
+
+def candidate_value(run: Run, vary: str) -> int:
+    if vary == "compute":
+        return run.compute_threads
+    if vary == "io":
+        return run.io_threads
+    if vary == "draft_topk":
+        if run.draft_topk is None:
+            raise RuntimeError("draft-topk candidate requested for a run without draft-topk tuning")
+        return run.draft_topk
+    raise RuntimeError(f"unknown tuning dimension {vary!r}")
 
 
 def best_candidate(runs: list[Run], *, phase: str, vary: str) -> int:
     subset = [r for r in runs if r.phase == phase]
     if not subset:
         raise RuntimeError(f"phase {phase!r} has no runs")
-    values = sorted({r.compute_threads if vary == "compute" else r.io_threads for r in subset})
+    values = sorted({candidate_value(r, vary) for r in subset})
     scored: list[tuple[float, int]] = []
     for v in values:
-        samples = [
-            r.seconds_per_token
-            for r in subset
-            if (r.compute_threads if vary == "compute" else r.io_threads) == v
-        ]
+        samples = [r.seconds_per_token for r in subset if candidate_value(r, vary) == v]
         scored.append((statistics.median(samples), v))
     scored.sort()
     return scored[0][1]
@@ -114,25 +135,63 @@ def main() -> int:
         k3_args: list[str] = []
 
     p = argparse.ArgumentParser(
-        description="Autotune K3 compute + async expert-I/O threads using a real exact request.",
+        description=(
+            "Autotune K3 compute + async expert-I/O threads, optionally including draft top-k, "
+            "using a real exact request."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
             "  python benchmarks/autotune.py ~/k3model --repeats 2 -- \\\n"
             "    --trunk ~/k3trunk-lossless --preset laptop --incremental \\\n"
             "    --ids 1008,10484,318,15383,387 --gen 2 --temperature 0\n\n"
-            "For a quick first pass, use a short deterministic request (for example --gen 2).\n"
-            "After tuning, run your normal longer prompt with the recommended settings."
+            "With an exact-verified draft trunk, add for example:\n"
+            "  --draft-topk-candidates 1,2,4 before the bare --, and pass \\\n"
+            "  --draft-trunk PATH --spec-auto after it.\n\n"
+            "For a quick first pass, use a short deterministic request. After tuning, run your "
+            "normal longer prompt with the recommended settings."
         ),
     )
     p.add_argument("model_dir")
-    p.add_argument("--k3-bin", default=None, help="K3 executable (default ./bin/k3 or .\\bin\\k3.exe on Windows)")
+    p.add_argument(
+        "--k3-bin",
+        default=None,
+        help="K3 executable (default ./bin/k3 or .\\bin\\k3.exe on Windows)",
+    )
     p.add_argument("--repeats", type=int, default=2, help="runs per candidate (default 2)")
-    p.add_argument("--compute-candidates", default=None, help="comma/space list; default powers of two plus logical CPU count")
-    p.add_argument("--io-candidates", default="1,2,4,8,16", help="async I/O thread candidates (default 1,2,4,8,16)")
-    p.add_argument("--strategy", choices=("coordinate", "grid"), default="coordinate",
-                   help="coordinate is much cheaper; grid exhaustively tests every pair")
-    p.add_argument("--io-seed", type=int, default=4, help="I/O threads used for the first compute sweep (default 4)")
+    p.add_argument(
+        "--compute-candidates",
+        default=None,
+        help="comma/space list; default powers of two plus logical CPU count",
+    )
+    p.add_argument(
+        "--io-candidates",
+        default="1,2,4,8,16",
+        help="async I/O thread candidates (default 1,2,4,8,16)",
+    )
+    p.add_argument(
+        "--draft-topk-candidates",
+        default=None,
+        help=(
+            "optional comma/space draft routed-expert counts; requires --draft-trunk after --. "
+            "When set, autotune controls --draft-topk and includes it in the exactness-guarded search"
+        ),
+    )
+    p.add_argument(
+        "--draft-topk-seed",
+        type=int,
+        default=4,
+        help="candidate nearest this value is used for the initial thread sweeps (default 4)",
+    )
+    p.add_argument(
+        "--strategy",
+        choices=("coordinate", "grid"),
+        default="coordinate",
+        help="coordinate is much cheaper; grid exhaustively tests every enabled dimension",
+    )
+    p.add_argument(
+        "--io-seed", type=int, default=4, help="I/O threads used for the first compute sweep (default 4)"
+    )
     p.add_argument("--out", default="k3-autotune.json", help="summary JSON path")
     p.add_argument("--keep-run-files", action="store_true", help="keep each K3 JSON/log beside the summary")
     p.add_argument("--timeout", type=float, default=None, help="optional timeout in seconds for each K3 run")
@@ -142,11 +201,23 @@ def main() -> int:
         p.error("--repeats must be >= 1")
     if ns.io_seed < 1 or ns.io_seed > 64:
         p.error("--io-seed must be in 1..64")
+    if ns.draft_topk_seed < 1:
+        p.error("--draft-topk-seed must be >= 1")
 
     if candidate_arg_present(k3_args, "--threads"):
         p.error("do not pass --threads after --; autotune controls it")
     if candidate_arg_present(k3_args, "--out"):
         p.error("do not pass --out after --; autotune needs a private JSON result per run")
+
+    draft_topk: list[int] | None = None
+    draft_topk_seed: int | None = None
+    if ns.draft_topk_candidates:
+        if not candidate_arg_present(k3_args, "--draft-trunk"):
+            p.error("--draft-topk-candidates requires --draft-trunk after the bare --")
+        if candidate_arg_present(k3_args, "--draft-topk"):
+            p.error("do not pass --draft-topk after -- when --draft-topk-candidates is set")
+        draft_topk = parse_candidates(ns.draft_topk_candidates)
+        draft_topk_seed = min(draft_topk, key=lambda x: (abs(x - ns.draft_topk_seed), x))
 
     for disabled in ("K3_NOASYNC_PREFETCH", "K3_NOPREFETCH"):
         if os.environ.get(disabled):
@@ -185,16 +256,27 @@ def main() -> int:
     reference_generated: list[int] | None = None
     reference_full: list[int] | None = None
 
-    def run_one(phase: str, cthreads: int, iothreads: int, repeat: int) -> Run:
+    def run_one(
+        phase: str,
+        cthreads: int,
+        iothreads: int,
+        dtopk: int | None,
+        repeat: int,
+    ) -> Run:
         nonlocal reference_generated, reference_full
         safe_phase = phase.replace("/", "_")
-        stem = f"{safe_phase}-c{cthreads}-io{iothreads}-r{repeat}"
+        ktag = f"-k{dtopk}" if dtopk is not None else ""
+        stem = f"{safe_phase}-c{cthreads}-io{iothreads}{ktag}-r{repeat}"
         json_path = run_dir / f"{stem}.json"
         log_path = run_dir / f"{stem}.log"
         env = os.environ.copy()
         env["K3_ASYNC_IO_THREADS"] = str(iothreads)
-        cmd = [str(k3_bin), ns.model_dir, *k3_args, "--threads", str(cthreads), "--out", str(json_path)]
-        print(f"  c={cthreads:>3} io={iothreads:>2} r={repeat}: ", end="", flush=True)
+        controlled = ["--threads", str(cthreads)]
+        if dtopk is not None:
+            controlled += ["--draft-topk", str(dtopk)]
+        cmd = [str(k3_bin), ns.model_dir, *k3_args, *controlled, "--out", str(json_path)]
+        ktxt = f" k={dtopk:>2}" if dtopk is not None else ""
+        print(f"  c={cthreads:>3} io={iothreads:>2}{ktxt} r={repeat}: ", end="", flush=True)
         with log_path.open("w", encoding="utf-8", errors="replace") as log:
             proc = subprocess.run(
                 cmd,
@@ -227,10 +309,10 @@ def main() -> int:
             reference_full = full
         elif generated != reference_generated or full != reference_full:
             raise RuntimeError(
-                "REFUSING RESULT: token stream changed while tuning threads\n"
+                "REFUSING RESULT: token stream changed while tuning performance knobs\n"
                 f"reference generated_ids={reference_generated}\n"
                 f"got       generated_ids={generated}\n"
-                f"candidate compute={cthreads}, io={iothreads}, repeat={repeat}\n"
+                f"candidate compute={cthreads}, io={iothreads}, draft_topk={dtopk}, repeat={repeat}\n"
                 "No recommendation was produced."
             )
         print(f"{sec:.6f} s/token")
@@ -238,6 +320,7 @@ def main() -> int:
             phase=phase,
             compute_threads=cthreads,
             io_threads=iothreads,
+            draft_topk=dtopk,
             repeat=repeat,
             seconds_per_token=sec,
             generated_ids=generated,
@@ -248,51 +331,93 @@ def main() -> int:
         runs.append(r)
         return r
 
-    def sweep(phase: str, pairs: list[tuple[int, int]]) -> None:
-        print(f"\n[{phase}] {len(pairs)} candidate pair(s), {ns.repeats} repeat(s) each")
+    def sweep(phase: str, configs: list[tuple[int, int, int | None]]) -> None:
+        print(f"\n[{phase}] {len(configs)} candidate configuration(s), {ns.repeats} repeat(s) each")
         # Alternate candidate order between repeats to reduce simple thermal/order bias.
         for rep in range(1, ns.repeats + 1):
-            ordered = pairs if rep % 2 else list(reversed(pairs))
-            for cthreads, iothreads in ordered:
-                run_one(phase, cthreads, iothreads, rep)
+            ordered = configs if rep % 2 else list(reversed(configs))
+            for cthreads, iothreads, dtopk in ordered:
+                run_one(phase, cthreads, iothreads, dtopk, rep)
 
     print("K3 real-hardware autotune")
     print(f"  logical CPUs       : {cpu_count}")
     print(f"  compute candidates : {compute}")
     print(f"  I/O candidates     : {io}")
+    if draft_topk is not None:
+        print(f"  draft top-k        : {draft_topk} (initial seed {draft_topk_seed})")
+    else:
+        print("  draft top-k        : unchanged")
     print(f"  repeats            : {ns.repeats}")
     print(f"  strategy           : {ns.strategy}")
     print("  exactness guard    : generated_ids + full_ids must match on every run")
 
     try:
+        best_topk: int | None = None
         if ns.strategy == "grid":
-            pairs = [(c, i) for c in compute for i in io]
-            sweep("grid", pairs)
-            pair_medians = {
-                (c, i): median_for(runs, c, i, "grid")
-                for c, i in pairs
+            topks: list[int | None] = draft_topk if draft_topk is not None else [None]
+            configs = [(c, i, k) for c in compute for i in io for k in topks]
+            sweep("grid", configs)
+            config_medians = {
+                (c, i, k): median_for(runs, c, i, k, "grid") for c, i, k in configs
             }
-            best_c, best_io = min(pair_medians, key=pair_medians.get)
-        else:
-            sweep("compute-1", [(c, io_seed) for c in compute])
+            best_c, best_io, best_topk = min(config_medians, key=config_medians.get)
+        elif draft_topk is None:
+            sweep("compute-1", [(c, io_seed, None) for c in compute])
             best_c1 = best_candidate(runs, phase="compute-1", vary="compute")
-            sweep("io", [(best_c1, i) for i in io])
+            sweep("io", [(best_c1, i, None) for i in io])
             best_io = best_candidate(runs, phase="io", vary="io")
-            sweep("compute-2", [(c, best_io) for c in compute])
+            sweep("compute-2", [(c, best_io, None) for c in compute])
             best_c = best_candidate(runs, phase="compute-2", vary="compute")
             # If the second compute pass moved, confirm I/O at the final compute count.
             if best_c != best_c1:
-                sweep("io-confirm", [(best_c, i) for i in io])
+                sweep("io-confirm", [(best_c, i, None) for i in io])
                 best_io = best_candidate(runs, phase="io-confirm", vary="io")
+        else:
+            assert draft_topk_seed is not None
+            # Cheap three-dimensional coordinate search. Tune compute/I/O around a sane
+            # draft seed first, then let top-k change the workload and reconfirm both
+            # thread dimensions once. If those move, reconfirm top-k at the final pair.
+            sweep("compute-1", [(c, io_seed, draft_topk_seed) for c in compute])
+            best_c1 = best_candidate(runs, phase="compute-1", vary="compute")
+            sweep("io-1", [(best_c1, i, draft_topk_seed) for i in io])
+            best_io1 = best_candidate(runs, phase="io-1", vary="io")
+            sweep("draft-topk-1", [(best_c1, best_io1, k) for k in draft_topk])
+            best_topk = best_candidate(runs, phase="draft-topk-1", vary="draft_topk")
 
-        # Use every measurement at the final pair when available; otherwise the phase that
-        # selected it has at least `repeats` samples.
+            sweep("compute-2", [(c, best_io1, best_topk) for c in compute])
+            best_c = best_candidate(runs, phase="compute-2", vary="compute")
+            sweep("io-2", [(best_c, i, best_topk) for i in io])
+            best_io = best_candidate(runs, phase="io-2", vary="io")
+
+            if best_c != best_c1 or best_io != best_io1:
+                sweep("draft-topk-2", [(best_c, best_io, k) for k in draft_topk])
+                best_topk = best_candidate(runs, phase="draft-topk-2", vary="draft_topk")
+
+        # Use every measurement at the final configuration when available; otherwise the
+        # phase that selected it has at least `repeats` samples. Do not mix measurements
+        # from a different draft top-k: that would bias the reported final median.
         final_samples = [
             r.seconds_per_token
             for r in runs
-            if r.compute_threads == best_c and r.io_threads == best_io
+            if r.compute_threads == best_c
+            and r.io_threads == best_io
+            and r.draft_topk == best_topk
         ]
+        if not final_samples:
+            raise RuntimeError("internal error: final configuration has no timing samples")
         final_median = statistics.median(final_samples)
+        recommended: dict[str, int | float] = {
+            "threads": best_c,
+            "async_io_threads": best_io,
+            "median_seconds_per_token": final_median,
+            # Backward-compatible two-dimensional field name retained for existing
+            # report consumers. In 3D mode it means the same final exact configuration.
+            "samples_at_final_pair": len(final_samples),
+            "samples_at_final_configuration": len(final_samples),
+        }
+        if best_topk is not None:
+            recommended["draft_topk"] = best_topk
+
         summary = {
             "model_dir": ns.model_dir,
             "k3_bin": str(k3_bin),
@@ -302,12 +427,8 @@ def main() -> int:
             "repeats": ns.repeats,
             "compute_candidates": compute,
             "io_candidates": io,
-            "recommended": {
-                "threads": best_c,
-                "async_io_threads": best_io,
-                "median_seconds_per_token": final_median,
-                "samples_at_final_pair": len(final_samples),
-            },
+            "draft_topk_candidates": draft_topk,
+            "recommended": recommended,
             "reference_generated_ids": reference_generated,
             "reference_full_ids": reference_full,
             "runs": [asdict(r) for r in runs],
@@ -315,15 +436,17 @@ def main() -> int:
         out_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print("\nRECOMMENDED")
         print(f"  --threads {best_c}")
+        if best_topk is not None:
+            print(f"  --draft-topk {best_topk}")
         if os.name == "nt":
             print(f"  PowerShell: $env:K3_ASYNC_IO_THREADS='{best_io}'")
             print(f"  cmd.exe   : set K3_ASYNC_IO_THREADS={best_io}")
         else:
             print(f"  K3_ASYNC_IO_THREADS={best_io}")
-        print(f"  observed median at final pair: {final_median:.6f} s/token")
+        print(f"  observed median at final configuration: {final_median:.6f} s/token")
         print(f"  summary: {out_path}")
-        print("\nThe recommendation applies to this machine, storage path, cache/preset and request shape.")
-        print("Re-run after changing SSD, cache size, preset, or other major hardware/runtime conditions.")
+        print("\nThe recommendation applies to this machine, storage path, cache/preset, draft and request shape.")
+        print("Re-run after changing SSD, cache size, preset, draft trunk, or other major hardware/runtime conditions.")
         return 0
     finally:
         if temp_ctx is not None:

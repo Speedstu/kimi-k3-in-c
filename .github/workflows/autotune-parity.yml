@@ -39,7 +39,7 @@ jobs:
           PY
           )
           python tools/pack_trunk.py /tmp/k3tiny /tmp/k3trunk "$NLAYERS"
-      - name: Coordinate autotune preserves exact token stream
+      - name: Coordinate thread autotune preserves exact token stream
         run: |
           python benchmarks/autotune.py /tmp/k3tiny \
             --k3-bin ./bin/k3 \
@@ -57,10 +57,66 @@ jobs:
           x=json.load(open(p))
           assert x['recommended']['threads'] in (1,2)
           assert x['recommended']['async_io_threads'] in (1,2)
+          assert 'draft_topk' not in x['recommended']
+          assert x['draft_topk_candidates'] is None
           assert x['reference_generated_ids'] == [92,168,13], x['reference_generated_ids']
           assert len(x['runs']) >= 6, len(x['runs'])
-          print('AUTOTUNE PARITY PASS', x['recommended'])
+          assert all(r['draft_topk'] is None for r in x['runs'])
+          print('THREAD AUTOTUNE PARITY PASS', x['recommended'])
           PY
+      - name: Draft top-k autotune stays exact across draft quality changes
+        run: |
+          python benchmarks/autotune.py /tmp/k3tiny \
+            --k3-bin ./bin/k3 \
+            --repeats 1 \
+            --compute-candidates 1,2 \
+            --io-candidates 1,2 \
+            --io-seed 1 \
+            --draft-topk-candidates 1,2 \
+            --draft-topk-seed 2 \
+            --out /tmp/autotune-draft.json \
+            -- \
+            --trunk /tmp/k3trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --draft-trunk /tmp/k3trunk --draft-trunk-gb 0.05 \
+            --spec-auto --spec 8 \
+            --ids 3,7,11,5,9 --gen 12 --incremental --temperature 0
+          python - <<'PY'
+          import json
+          p='/tmp/autotune-draft.json'
+          x=json.load(open(p))
+          assert x['recommended']['threads'] in (1,2)
+          assert x['recommended']['async_io_threads'] in (1,2)
+          assert x['recommended']['draft_topk'] in (1,2)
+          assert x['draft_topk_candidates'] == [1,2]
+          assert x['reference_generated_ids'][:3] == [92,168,13], x['reference_generated_ids']
+          seen={r['draft_topk'] for r in x['runs']}
+          assert seen == {1,2}, seen
+          assert len(x['runs']) >= 10, len(x['runs'])
+          assert all(r['generated_ids'] == x['reference_generated_ids'] for r in x['runs'])
+          assert all(r['full_ids'] == x['reference_full_ids'] for r in x['runs'])
+          print('DRAFT TOP-K AUTOTUNE PARITY PASS', x['recommended'])
+          PY
+      - name: Draft top-k tuner refuses ambiguous or missing draft commands
+        run: |
+          set -euo pipefail
+          set +e
+          python benchmarks/autotune.py /tmp/k3tiny --k3-bin ./bin/k3 \
+            --draft-topk-candidates 1,2 -- \
+            --trunk /tmp/k3trunk --ids 3,7,11,5,9 --gen 1 --incremental \
+            >/tmp/no-draft.log 2>&1
+          rc1=$?
+          python benchmarks/autotune.py /tmp/k3tiny --k3-bin ./bin/k3 \
+            --draft-topk-candidates 1,2 -- \
+            --trunk /tmp/k3trunk --draft-trunk /tmp/k3trunk --draft-topk 1 \
+            --ids 3,7,11,5,9 --gen 1 --incremental \
+            >/tmp/ambiguous.log 2>&1
+          rc2=$?
+          set -e
+          test "$rc1" -eq 2
+          test "$rc2" -eq 2
+          grep -q 'requires --draft-trunk' /tmp/no-draft.log
+          grep -q 'do not pass --draft-topk' /tmp/ambiguous.log
+          echo 'draft top-k CLI guards: PASS'
 
   windows-python-cli:
     runs-on: windows-latest
