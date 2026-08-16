@@ -49,3 +49,5 @@ jobs:
           git add Makefile src/io/k3_trunk.h src/io/k3_trunk.c
           git commit -m "feat: stream byte-exact lossless compressed trunks"
           git push origin HEAD:speedboost/lossless-trunk-codec
+
+# Branch-local validation harness; removed before PR merge.
