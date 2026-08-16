@@ -1,0 +1,42 @@
+name: Split ring cleanup
+
+on:
+  push:
+    branches: [speedboost/laptop-split-ring]
+    paths:
+      - '.github/workflows/split-ring-cleanup.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: speedboost/laptop-split-ring
+      - name: Remove duplicated staging hunks
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/io/k3_trunk.c')
+          s=p.read_text()
+          blocks=[
+          '''    if (split_first)\n        printf("              split-first arena: layer 0 uses %.2f GB whole, then layers 1..%d "\n               "reuse it as 2 x %.2f GB slots (no extra trunk RAM)\\n",\n               (double)arena_bytes / 1e9, tr->n_layers - 1, (double)ring_slot / 1e9);\n''',
+          '''    /* forward() asks for L+1 immediately after binding L. In split-first mode layer 0\n     * still occupies the WHOLE shared arena at that point, so L1 deliberately loads\n     * synchronously only after layer0 compute returns. From L1 onward two slots exist. */\n    if (tr->split_first && L == 1) return;\n''']
+          for b in blocks:
+              n=s.count(b)
+              if n != 2:
+                  raise SystemExit(f'expected exactly two copies, got {n}')
+              first=s.find(b)
+              second=s.find(b, first+len(b))
+              s=s[:second]+s[second+len(b):]
+          p.write_text(s)
+          PY
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/io/k3_trunk.c
+          git commit -m 'fix: remove duplicated split-ring staging hunks'
+          git push origin HEAD:speedboost/laptop-split-ring
