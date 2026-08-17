@@ -21,6 +21,9 @@
 #define K3_DICT15_SIZE 15
 #define K3_DICT15_ESCAPE 15
 
+#define K3_DICT7_SIZE 7
+#define K3_DICT7_ESCAPE 7
+
 static inline int k3_codec_pop_lsb(unsigned *m)
 {
 #if defined(__GNUC__) || defined(__clang__)
@@ -103,6 +106,98 @@ static inline size_t k3_dict15_decode(unsigned char *dst, size_t raw_nbytes,
         if (q < K3_DICT15_SIZE) {
             dst[2u * i + 1u] = dict[q];
         } else {
+            if (ne >= esc_cap) return SIZE_MAX;
+            dst[2u * i + 1u] = esc[ne++];
+        }
+    }
+    return ne;
+}
+
+
+/* Fixed-3-bit companion to dict15.
+ *
+ * src layout for raw_nbytes = 2*N:
+ *   low[N] | codes[ceil(3*N/8)] | escape_literals[...]
+ *
+ * Codes 0..6 index the block dictionary and code 7 is a literal high-byte escape.
+ * Eight codes occupy exactly three bytes.  The 4096-entry 4-code table is rebuilt once
+ * per block from its seven-byte dictionary, then the hot loop expands eight high bytes
+ * from two table lookups.  On AVX2 builds the eight low/high bytes are interleaved with
+ * one SSE-width unpack; the model still receives the original BF16 byte stream.
+ */
+static inline size_t k3_dict7_decode(unsigned char *dst, size_t raw_nbytes,
+                                     const unsigned char *src, size_t encoded_nbytes,
+                                     const unsigned char dict[K3_DICT7_SIZE])
+{
+    if (!dst || !src || !dict || (raw_nbytes & 1u)) return SIZE_MAX;
+    const size_t n = raw_nbytes / 2u;
+    const size_t cb = (3u * n + 7u) / 8u;
+    if (encoded_nbytes < n + cb) return SIZE_MAX;
+    const unsigned char *low = src;
+    const unsigned char *code = src + n;
+    const unsigned char *esc = code + cb;
+    const size_t esc_cap = encoded_nbytes - n - cb;
+
+    uint32_t high4[4096];
+    unsigned char emask4[4096];
+    for (unsigned v = 0; v < 4096u; v++) {
+        uint32_t hv = 0;
+        unsigned char em = 0;
+        for (unsigned j = 0; j < 4u; j++) {
+            const unsigned q = (v >> (3u * j)) & 7u;
+            if (q < K3_DICT7_SIZE)
+                hv |= (uint32_t)dict[q] << (8u * j);
+            else
+                em |= (unsigned char)(1u << j);
+        }
+        high4[v] = hv;
+        emask4[v] = em;
+    }
+
+    size_t ne = 0, i = 0, ci = 0;
+    for (; i + 8u <= n; i += 8u, ci += 3u) {
+        const uint32_t bits = (uint32_t)code[ci]
+                            | ((uint32_t)code[ci + 1u] << 8)
+                            | ((uint32_t)code[ci + 2u] << 16);
+        const unsigned a = bits & 0xfffu;
+        const unsigned b = (bits >> 12) & 0xfffu;
+        const uint64_t hp = (uint64_t)high4[a] | ((uint64_t)high4[b] << 32);
+#if defined(__AVX2__)
+        const __m128i vl = _mm_loadl_epi64((const __m128i *)(low + i));
+        const __m128i vh = _mm_cvtsi64_si128((long long)hp);
+        _mm_storeu_si128((__m128i *)(dst + 2u * i), _mm_unpacklo_epi8(vl, vh));
+#else
+        for (unsigned j = 0; j < 8u; j++) {
+            dst[2u * (i + j)] = low[i + j];
+            dst[2u * (i + j) + 1u] = (unsigned char)(hp >> (8u * j));
+        }
+#endif
+        unsigned m = (unsigned)emask4[a] | ((unsigned)emask4[b] << 4);
+#if defined(__GNUC__) || defined(__clang__)
+        if ((size_t)__builtin_popcount(m) > esc_cap - ne) return SIZE_MAX;
+#else
+        unsigned mc = m, pc = 0; while (mc) { pc += mc & 1u; mc >>= 1; }
+        if ((size_t)pc > esc_cap - ne) return SIZE_MAX;
+#endif
+        while (m) {
+            const int bit = k3_codec_pop_lsb(&m);
+            dst[2u * (i + (size_t)bit) + 1u] = esc[ne++];
+        }
+    }
+
+    /* Generic tail. Packed trunks are 4096-byte aligned, hence N is divisible by 8;
+     * this path exists for unit tests and defensive format handling. */
+    for (; i < n; i++) {
+        const size_t bit = 3u * i;
+        const size_t bo = bit >> 3;
+        const unsigned sh = (unsigned)(bit & 7u);
+        uint32_t w = code[bo];
+        if (bo + 1u < cb) w |= (uint32_t)code[bo + 1u] << 8;
+        if (bo + 2u < cb) w |= (uint32_t)code[bo + 2u] << 16;
+        const unsigned q = (w >> sh) & 7u;
+        dst[2u * i] = low[i];
+        if (q < K3_DICT7_SIZE) dst[2u * i + 1u] = dict[q];
+        else {
             if (ne >= esc_cap) return SIZE_MAX;
             dst[2u * i + 1u] = esc[ne++];
         }

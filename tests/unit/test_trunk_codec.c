@@ -66,8 +66,45 @@ int main(void)
         fprintf(stderr, "FAIL dict15 accepted truncated escape payload\n");
         return 1;
     }
-    printf("LOSSLESS TRUNK CODEC PASSED: %zu bytes, %zu escapes, byte-identical\n",
-           raw_n, ne);
+    /* dict7 uses an independent 3-bit packing and must survive a non-multiple-of-eight
+     * tail plus frequent escapes. */
+    const unsigned char d7[7] = {0x3c,0xbc,0x3d,0xbd,0x3b,0xbb,0x3e};
+    const size_t cb7 = (3u * n + 7u) / 8u;
+    unsigned char *c7 = (unsigned char *)calloc(cb7, 1);
+    unsigned char *e7 = (unsigned char *)malloc(n);
+    unsigned char *r7 = (unsigned char *)malloc(raw_n);
+    unsigned char *o7 = (unsigned char *)malloc(raw_n);
+    if (!c7 || !e7 || !r7 || !o7) return 2;
+    size_t ne7 = 0;
+    rs = 0x51f15e11u;
+    for (size_t j = 0; j < n; j++) {
+        const uint32_t r = rnd();
+        unsigned char q, hi;
+        if ((r % 29u) == 0u) { q = 7; hi = (unsigned char)(0x70u + ((r >> 16) & 31u)); e7[ne7++] = hi; }
+        else { q = (unsigned char)((r >> 8) % 7u); hi = d7[q]; }
+        r7[2u*j] = low[j]; r7[2u*j+1u] = hi;
+        const size_t bit = 3u*j, bo = bit >> 3;
+        const unsigned sh = (unsigned)(bit & 7u);
+        c7[bo] |= (unsigned char)(q << sh);
+        if (sh > 5u && bo + 1u < cb7) c7[bo+1u] |= (unsigned char)(q >> (8u-sh));
+    }
+    const size_t enc7 = n + cb7 + ne7;
+    unsigned char *s7 = (unsigned char *)malloc(enc7);
+    if (!s7) return 2;
+    memcpy(s7, low, n); memcpy(s7+n, c7, cb7); memcpy(s7+n+cb7, e7, ne7);
+    const size_t used7 = k3_dict7_decode(o7, raw_n, s7, enc7, d7);
+    if (used7 != ne7 || memcmp(o7, r7, raw_n) != 0) {
+        fprintf(stderr, "FAIL dict7 roundtrip: escapes %zu/%zu, bytes_equal=%d\n",
+                used7, ne7, memcmp(o7, r7, raw_n) == 0);
+        return 1;
+    }
+    if (ne7 && k3_dict7_decode(o7, raw_n, s7, enc7 - 1u, d7) != SIZE_MAX) {
+        fprintf(stderr, "FAIL dict7 accepted truncated escape payload\n");
+        return 1;
+    }
+    printf("LOSSLESS TRUNK CODECS PASSED: dict15 %zu escapes, dict7 %zu escapes, byte-identical\n",
+           ne, ne7);
     free(raw); free(low); free(code); free(esc); free(out); free(src);
+    free(c7); free(e7); free(r7); free(o7); free(s7);
     return 0;
 }

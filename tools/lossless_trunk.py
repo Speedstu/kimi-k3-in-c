@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Convert a normal packed trunk into a byte-exact dict15-compressed trunk.
+"""Convert a normal packed trunk into a byte-exact adaptive compressed trunk.
 
 The input is the output of tools/pack_trunk.py. Every layer is split into independent
-128 MiB RAW blocks. A block is encoded as:
-
-    low-byte plane | packed 4-bit high-byte dictionary codes | escape high bytes
-
-The 15 most common high bytes are chosen independently per block. Code 15 is an escape.
-If a block does not shrink, it is stored raw. Every stored block starts and ends on a
+128 MiB RAW blocks. Each block is evaluated as raw, dict15, and dict7. dict15 uses a
+4-bit code with 15 dictionary entries; dict7 uses a 3-bit code with seven entries. The
+last code in either format is an escape followed by the literal high byte. The encoder
+chooses the representation with the fewest physical 4096-aligned O_DIRECT bytes (raw
+wins ties, then dict15). Every stored block starts and ends on a
 4096-byte boundary so the runtime can keep using O_DIRECT.
 
 This is lossless storage compression. Decompression reconstructs the original trunk run
@@ -33,7 +32,7 @@ def align_up(n: int, a: int = ALIGN) -> int:
     return (n + a - 1) & ~(a - 1)
 
 
-def encode_block(raw: bytes):
+def encode_block_dict15(raw: bytes):
     if len(raw) & 1:
         raise ValueError("dict15 blocks must contain an even number of bytes")
     a = np.frombuffer(raw, dtype=np.uint8)
@@ -54,6 +53,47 @@ def encode_block(raw: bytes):
     return payload, dictionary.tolist(), len(escapes)
 
 
+def encode_block_dict7(raw: bytes):
+    if len(raw) & 1:
+        raise ValueError("dict7 blocks must contain an even number of bytes")
+    a = np.frombuffer(raw, dtype=np.uint8)
+    low = a[0::2]
+    high = a[1::2]
+    hist = np.bincount(high, minlength=256)
+    dictionary = np.argsort(-hist, kind="stable")[:7].astype(np.uint8)
+    lut = np.full(256, 7, dtype=np.uint8)
+    lut[dictionary] = np.arange(7, dtype=np.uint8)
+    q = lut[high]
+    codes = np.zeros((3 * len(q) + 7) // 8, dtype=np.uint8)
+    groups = len(q) // 8
+    if groups:
+        x = q[: groups * 8].reshape(groups, 8)
+        codes[0 : 3 * groups : 3] = x[:, 0] | (x[:, 1] << 3) | ((x[:, 2] & 3) << 6)
+        codes[1 : 3 * groups : 3] = (x[:, 2] >> 2) | (x[:, 3] << 1) | (x[:, 4] << 4) | ((x[:, 5] & 1) << 7)
+        codes[2 : 3 * groups : 3] = (x[:, 5] >> 1) | (x[:, 6] << 2) | (x[:, 7] << 5)
+    for i in range(groups * 8, len(q)):
+        bit = 3 * i
+        v = int(q[i])
+        codes[bit >> 3] |= np.uint8((v << (bit & 7)) & 0xff)
+        if (bit & 7) > 5 and (bit >> 3) + 1 < len(codes):
+            codes[(bit >> 3) + 1] |= np.uint8(v >> (8 - (bit & 7)))
+    escapes = high[q == 7]
+    payload = low.tobytes() + codes.tobytes() + escapes.tobytes()
+    return payload, dictionary.tolist(), len(escapes)
+
+
+def choose_block_codec(raw: bytes):
+    p15, d15, e15 = encode_block_dict15(raw)
+    p7, d7, e7 = encode_block_dict7(raw)
+    candidates = [
+        ("raw", raw, None, 0),
+        ("dict15", p15, d15, e15),
+        ("dict7", p7, d7, e7),
+    ]
+    priority = {"raw": 0, "dict15": 1, "dict7": 2}
+    return min(candidates, key=lambda x: (align_up(len(x[1])), priority[x[0]]))
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         print("usage: lossless_trunk.py <raw_packed_trunk> <output_dir>")
@@ -68,14 +108,14 @@ def main() -> int:
 
     os.makedirs(outdir, exist_ok=True)
     outman = copy.deepcopy(srcman)
-    outman["storage_codec"] = "dict15-block-v1"
+    outman["storage_codec"] = "adaptive-dict15-dict7-block-v2"
     outman["raw_block_bytes"] = RAW_BLOCK
     outman["layers"] = []
 
     src = open(os.path.join(srcdir, "trunk.bin"), "rb")
     dst = open(os.path.join(outdir, "trunk.bin"), "wb")
     total_raw = total_stored = total_encoded = 0
-    compressed_blocks = raw_blocks = 0
+    dict15_blocks = dict7_blocks = raw_blocks = 0
 
     for li, layer in enumerate(srcman["layers"]):
         raw_total = int(layer["nbytes"])
@@ -93,9 +133,7 @@ def main() -> int:
             if len(raw) != raw_n:
                 raise OSError(f"short read on layer {li} at raw offset {raw_off}")
 
-            payload, dictionary, nesc = encode_block(raw)
-            use_codec = len(payload) < raw_n
-            blob = payload if use_codec else raw
+            codec, blob, dictionary, nesc = choose_block_codec(raw)
             pad = (-dst.tell()) % ALIGN
             if pad:
                 dst.write(b"\0" * pad)
@@ -108,17 +146,20 @@ def main() -> int:
                 dst.write(b"\0" * (stored - len(blob)))
 
             block = {
-                "codec": "dict15" if use_codec else "raw",
+                "codec": codec,
                 "file_off": file_off,
                 "stored_nbytes": stored,
                 "encoded_nbytes": len(blob),
                 "raw_off": raw_off,
                 "raw_nbytes": raw_n,
             }
-            if use_codec:
+            if codec != "raw":
                 block["dict"] = dictionary
                 block["escapes"] = nesc
-                compressed_blocks += 1
+                if codec == "dict7":
+                    dict7_blocks += 1
+                else:
+                    dict15_blocks += 1
             else:
                 raw_blocks += 1
             layer_out["blocks"].append(block)
@@ -149,7 +190,7 @@ def main() -> int:
         f"ratio {total_stored / total_raw:.4f}; saved "
         f"{100.0 * (1.0 - total_stored / total_raw):.1f}%"
     )
-    print(f"blocks: {compressed_blocks} dict15, {raw_blocks} raw fallback")
+    print(f"blocks: {dict7_blocks} dict7, {dict15_blocks} dict15, {raw_blocks} raw fallback")
     return 0
 
 
