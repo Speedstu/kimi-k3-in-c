@@ -62,11 +62,19 @@ jobs:
           python tools/pack_trunk.py /tmp/k3d7 /tmp/k3d7-raw "$NLAYERS"
           python tools/lossless_trunk.py /tmp/k3d7-raw /tmp/k3d7-lossless | tee /tmp/k3d7-out/pack.log
           python - <<'PY'
-          import json
+          import json, os
           x=json.load(open('/tmp/k3d7-lossless/trunk.json'))
           codecs=[b['codec'] for L in x['layers'] for b in L['blocks']]
-          assert 'dict7' in codecs, codecs
-          print('TINY ADAPTIVE CODECS', {k:codecs.count(k) for k in sorted(set(codecs))})
+          # Tiny layers are only a few 4K pages. If dict7 and dict15 round to the same
+          # physical O_DIRECT bytes, the encoder deliberately keeps faster dict15. The
+          # direct Python/C codec tests above exercise dict7 itself; this integration
+          # gate proves the adaptive container never inflates physical storage.
+          stored=sum(int(b['stored_nbytes']) for L in x['layers'] for b in L['blocks'])
+          raw=os.path.getsize('/tmp/k3d7-raw/trunk.bin')
+          assert stored <= raw, (stored, raw, codecs)
+          assert set(codecs) <= {'raw','dict15','dict7'}
+          print('TINY ADAPTIVE CODECS', {k:codecs.count(k) for k in sorted(set(codecs))},
+                'stored/raw', stored, raw)
           PY
           BASE='/tmp/k3d7 --cache-gb 0.01 --trunk-gb 0.05 --ids 3,7,11,13,17,19,23,29,31,37,41,43 --gen 12 --incremental --threads 1 --temperature 0'
           ./bin/k3 $BASE --trunk /tmp/k3d7-raw --out /tmp/k3d7-out/raw.json >/tmp/k3d7-out/raw.log 2>&1
