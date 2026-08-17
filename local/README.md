@@ -38,18 +38,27 @@ Example paths used below:
 ./bin/k3-worker        resident C inference worker (default localhost backend)
 ```
 
-The Python bridge needs `transformers` only for K3's **official local chat tokenizer / XTML
-template**. Put it in a venv rather than modifying the system interpreter:
+Text/chat mode needs `transformers` only for K3's **official local tokenizer / XTML
+template**. Put it in a venv rather than modifying the system interpreter. The released K3
+config declares Transformers 4.56.2:
 
 ```bash
 python3 -m venv .venv-k3
 . .venv-k3/bin/activate
-pip install 'transformers>=4.56' tiktoken
+pip install 'transformers==4.56.2' tiktoken
 ```
 
-At runtime the bridge sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` and also passes
-`local_files_only=True`. A missing tokenizer file therefore fails instead of silently
-fetching one from the network.
+Image input is optional and does **not** make PyTorch a dependency of text inference. Install
+a PyTorch build appropriate for the target CPU/CUDA machine first, then:
+
+```bash
+pip install -r local/requirements-vision.txt
+```
+
+At runtime the bridge sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` and passes
+`local_files_only=True`. A missing tokenizer, processor, custom-code or vision-weight file
+therefore fails instead of silently fetching a different component from the network. See
+[`local/VISION.md`](VISION.md) for the image path.
 
 ## 2. Find the fastest thread count on this machine
 
@@ -110,6 +119,17 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 The response exposes both `reasoning_content` and ordinary `content`, plus OpenAI-style
 `tool_calls` when K3 emits XTML tool calls.
+
+### Image input
+
+The resident path also accepts K3 `image` / `image_url` message parts. The bridge lazy-loads
+only the released MoonViT vision tower + multimodal projector, expands the image placeholder
+to the projected 7168-dimensional rows, and sends those rows to the exact C language model
+through `REQMM`. Text requests never initialize that frontend. Use `--vision-device auto`
+and `--vision-attention auto` for the normal laptop path; full setup and a request example
+are in [`local/VISION.md`](VISION.md).
+
+Video/audio remain fail-closed until their released processing path is independently gated.
 
 ## 4. Use the official Kimi Code agent harness against localhost
 
@@ -322,8 +342,10 @@ streaming is part of the correctness gate rather than a UI-only feature.
 
 ## Current gaps, stated explicitly
 
-- **Text/coding first:** image/video/audio message parts are rejected instead of discarded.
-  K3's vision path still needs to be integrated locally.
+- **Vision scores are measured separately:** image input now uses the released K3
+  MoonViT/projector boundary and exact C language model; hosted CI gates the boundary, while
+  the actual full-checkpoint vision scores still require the self-hosted benchmark suites.
+  Video/audio remain explicitly unsupported rather than being silently discarded.
 - **Draft quality is hardware/workload dependent:** Q4/I8 proposal inference is now
   resident and probability-correct, but a low acceptance rate can still make speculation
   slower than serial exact decode. Use the emitted draft metrics / sweep instead of
