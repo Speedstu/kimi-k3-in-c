@@ -85,9 +85,9 @@ class LocalBridgeTests(unittest.TestCase):
                 }
             )
 
-    def test_media_is_rejected_not_silently_dropped(self):
+    def test_media_requires_resident_worker_not_silent_drop(self):
         k3 = self.make_k3()
-        with self.assertRaisesRegex(ValueError, "text/coding input only"):
+        with self.assertRaisesRegex(ValueError, "requires the default resident C worker"):
             k3.complete(
                 {
                     "messages": [
@@ -167,7 +167,6 @@ class LocalBridgeTests(unittest.TestCase):
         self.assertEqual(
             call["function"]["arguments"], '{"command":"git status","timeout":15}'
         )
-
 
     def test_safe_stream_delta_holds_unstable_unicode(self):
         delta, previous = LocalK3._safe_delta("abc", "abc\ufffd")

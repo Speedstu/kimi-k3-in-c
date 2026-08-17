@@ -5,5 +5,9 @@
   "resident_output_over_4096": "validated",
   "public_k3_max_profile": "pinned",
   "full_checkpoint_scores": "requires_self_hosted_full_checkpoint_run",
-  "vision": "not_implemented_fail_closed"
+  "vision_input_runtime": "image_boundary_exactness_validated",
+  "vision_official_frontend": "implemented_selective_moonvit_projector",
+  "vision_full_checkpoint_smoke": "requires_self_hosted_full_checkpoint_run",
+  "vision_scores": "requires_self_hosted_full_checkpoint_benchmark_run",
+  "video_audio": "unsupported_fail_closed"
 }

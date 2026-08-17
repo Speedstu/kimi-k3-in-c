@@ -1,0 +1,31 @@
+name: K3 vision bridge parity
+
+on:
+  push:
+    branches: [speedboost/k3-vision-input]
+  pull_request:
+    paths:
+      - 'local/k3_local.py'
+      - 'local/k3_vision.py'
+      - 'tests/python/test_local_bridge.py'
+      - 'tests/python/test_k3_vision.py'
+      - '.github/workflows/k3-vision-bridge.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Unit gates
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m compileall -q local/ tests/python/
+          python -m unittest discover -s tests/python -p 'test_*.py' -v

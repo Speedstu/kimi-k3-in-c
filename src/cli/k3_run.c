@@ -488,6 +488,10 @@ typedef struct {
     int          n_mla, kv_cap, cached;
     int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
     int          draft_topk;   /* 0 exact; >0 proposal-only reduced expert top-k */
+    /* Optional already-embedded rows for the NEXT forward only.  The resident multimodal
+     * prefill sets this to a chunk of the official merged text/image embedding sequence;
+     * every text-only call leaves it NULL and follows the historical embedding lookup. */
+    const float *input_embeds;
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -510,8 +514,13 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     const int P = c->kda_heads * c->kda_head_dim;
     const size_t kper = (size_t)P * c->kda_head_dim + (size_t)3 * P * (c->conv_k - 1);
 
-    for (int t = 0; t < T; t++)
-        k3_embed_row(h + (size_t)t * E, w->mb.embed, w->mb.wdt, ids[t], E);
+    if (w->input_embeds) {
+        memcpy(h, w->input_embeds, (size_t)T * E * sizeof(float));
+    } else {
+        if (!ids) return -1;
+        for (int t = 0; t < T; t++)
+            k3_embed_row(h + (size_t)t * E, w->mb.embed, w->mb.wdt, ids[t], E);
+    }
 
     memset(br, 0, (size_t)T * maxb * E * sizeof(float));
     /* Incremental decode carries the KDA recurrent matrix and ShortConv history across
