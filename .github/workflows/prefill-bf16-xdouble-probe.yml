@@ -1,0 +1,52 @@
+name: Prefill BF16 batch xdouble probe
+
+on:
+  push:
+    branches: [speedboost/prefill-bf16-xdouble-probe]
+    paths:
+      - '.github/workflows/prefill-bf16-xdouble-probe.yml'
+      - '.github/patches/stage_bf16_batch_xdouble_probe.py'
+      - 'benchmarks/bench_prefill_bf16_xdouble.c'
+
+permissions:
+  contents: write
+
+jobs:
+  exactness-and-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Apply test-only helper
+        run: |
+          set -euo pipefail
+          python3 .github/patches/stage_bf16_batch_xdouble_probe.py
+      - name: Build production helper benchmark
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          cc -O3 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_bf16_xd.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off benchmarks/bench_prefill_bf16_xdouble.c /tmp/k3_ops_bf16_xd.o -o /tmp/bench_bf16_xd -lm -fopenmp -pthread
+      - name: Exactness and repeated medians
+        run: |
+          set -euo pipefail
+          : > /tmp/bf16-xdouble-results.txt
+          echo "head=${GITHUB_SHA}" | tee -a /tmp/bf16-xdouble-results.txt
+          for n in 1 4; do
+            echo "=== OMP_NUM_THREADS=$n ===" | tee -a /tmp/bf16-xdouble-results.txt
+            OMP_NUM_THREADS=$n /tmp/bench_bf16_xd | tee -a /tmp/bf16-xdouble-results.txt
+          done
+          test "$(grep -c 'PREFILL BF16 BATCH XDOUBLE EXACTNESS PASS' /tmp/bf16-xdouble-results.txt)" -eq 2
+      - name: Publish probe result
+        run: |
+          set -euo pipefail
+          cp /tmp/bf16-xdouble-results.txt benchmarks/PREFILL_BF16_XDOUBLE_PROBE.txt
+          git restore src/core/k3_ops.c
+          git config user.name 'Speedstu'
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add benchmarks/PREFILL_BF16_XDOUBLE_PROBE.txt
+          git commit -m 'probe: record BF16 batch xdouble medians'
+          git push origin HEAD:speedboost/prefill-bf16-xdouble-probe
