@@ -1,0 +1,32 @@
+name: Expert cache online tournament
+
+on:
+  push:
+    branches: [speedboost/expert-cache-100gb-hotset]
+    paths:
+      - 'tools/sim_cache_online.py'
+      - 'tests/fixtures/expert_trace.bin'
+      - '.github/workflows/expert-cache-online-tournament.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tournament:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Compile simulator
+        run: python -m py_compile tools/sim_cache_online.py
+      - name: Replay recorded real K3 expert trace
+        run: |
+          set -euo pipefail
+          python tools/sim_cache_online.py tests/fixtures/expert_trace.bin \
+            --caps-gb 8,16,32,64,100,128 \
+            | tee /tmp/expert-cache-tournament.txt
+          grep -q '^SUMMARY' /tmp/expert-cache-tournament.txt
