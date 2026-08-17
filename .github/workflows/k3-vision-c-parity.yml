@@ -46,9 +46,9 @@ jobs:
           python tools/pack_trunk.py /tmp/k3mm /tmp/k3mm-trunk "$NLAYERS"
           python - <<'PY'
           import struct
-          from safetensors.numpy import load_file
+          from safetensors.torch import load_file
           w=load_file('/tmp/k3mm/model.safetensors')['language_model.model.embed_tokens.weight']
-          rows=w[[11,6]].astype('<f4')
+          rows=w[[11,6]].float().contiguous().numpy().astype('<f4',copy=False)
           with open('/tmp/k3mm-out/media.bin','wb') as f:
               f.write(struct.pack('<8sIIII', b'K3MMF1\0',1,rows.shape[1],1,0))
               f.write(struct.pack('<I',rows.shape[0])); f.write(rows.tobytes())
