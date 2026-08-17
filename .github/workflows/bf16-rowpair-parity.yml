@@ -1,0 +1,90 @@
+name: Adaptive BF16 row-pair parity
+
+on:
+  push:
+    branches: [speedboost/prefill-bf16-rowpair]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_bf16_rowpair_exact.c'
+      - '.github/workflows/bf16-rowpair-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_bf16_rowpair_exact.c'
+      - '.github/workflows/bf16-rowpair-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Strict AVX2 build and full regression suite
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Reference vs row-pair helper are bit-identical
+        run: |
+          set -euo pipefail
+          cc -O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_rowpair.o
+          cc -O2 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off benchmarks/bench_bf16_rowpair_exact.c /tmp/k3_ops_rowpair.o -o /tmp/bf16_rowpair_exact -lm -fopenmp -pthread
+          OMP_NUM_THREADS=1 /tmp/bf16_rowpair_exact | tee /tmp/rowpair-helper-1.log
+          OMP_NUM_THREADS=2 /tmp/bf16_rowpair_exact | tee /tmp/rowpair-helper-2.log
+          grep -q 'BF16 ROWPAIR EXACTNESS PASS' /tmp/rowpair-helper-1.log
+          grep -q 'BF16 ROWPAIR EXACTNESS PASS' /tmp/rowpair-helper-2.log
+
+      - name: Generate streamed tiny K3 with 40-token prompt
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3-rowpair /tmp/k3-rowpair-trunk /tmp/k3-rowpair-out
+          mkdir -p /tmp/k3-rowpair-out
+          IDS=$(python - <<'PY'
+          print(','.join(str(i) for i in range(3,43)))
+          PY
+          )
+          python tools/make_tiny_checkpoint.py /tmp/k3-rowpair --seed 1234 --prompt-ids "$IDS"
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3-rowpair/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3-rowpair /tmp/k3-rowpair-trunk "$NLAYERS"
+
+      - name: End-to-end row-pair OFF vs ON are identical at 1 and 2 threads
+        run: |
+          set -euo pipefail
+          D=/tmp/k3-rowpair-out
+          IDS=$(python - <<'PY'
+          print(','.join(str(i) for i in range(3,43)))
+          PY
+          )
+          for N in 1 2; do
+            COMMON="/tmp/k3-rowpair --trunk /tmp/k3-rowpair-trunk --trunk-gb 0.05 --cache-gb 0.001 --ids $IDS --gen 1 --incremental --threads $N --temperature 0"
+            K3_NO_BF16_ROWPAIR=1 ./bin/k3 $COMMON --dump-logits "$D/off-$N.logits" --out "$D/off-$N.json" >"$D/off-$N.log" 2>&1
+            ./bin/k3 $COMMON --dump-logits "$D/on-$N.logits" --out "$D/on-$N.json" >"$D/on-$N.log" 2>&1
+            cmp "$D/off-$N.logits" "$D/on-$N.logits"
+            python3 - "$N" <<'PY'
+          import json,sys
+          n=sys.argv[1]; d='/tmp/k3-rowpair-out'
+          a=json.load(open(f'{d}/off-{n}.json'))
+          b=json.load(open(f'{d}/on-{n}.json'))
+          assert a['generated_ids']==b['generated_ids'], (n,a['generated_ids'],b['generated_ids'])
+          assert a['full_ids']==b['full_ids'], n
+          print(f'BF16 rowpair thread={n} exact ids:',a['generated_ids'])
+          PY
+          done
+          echo 'BF16 ROWPAIR END-TO-END PARITY PASS'
