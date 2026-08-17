@@ -24,10 +24,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Local API regression suite
+      - name: Local API and orchestrator regression suite
         run: |
           set -euo pipefail
-          python -m pip install --quiet numpy
+          python -m pip install --quiet numpy ruff
+          ruff check local/ tests/python/ benchmarks/k3_vendor_verifier.py --output-format=github
           python -m compileall -q local/ tests/python/ benchmarks/k3_vendor_verifier.py
           python -m unittest discover -s tests/python -p 'test_*.py' -v
       - name: Pinned Vendor Verifier contract is internally consistent
@@ -37,7 +38,7 @@ jobs:
           import json
           x=json.load(open('benchmarks/k3_vendor_verifier_contract.json'))
           assert x['schema']==1
-          assert len(x['upstream']['commit'])==40
+          assert x['upstream']['commit']=='3dad65a760a8867cda72f6dd8848d876a4e851b4'
           assert x['local_endpoint']['base_url']=='http://127.0.0.1:8000/v1'
           assert x['k3_max']=={
               'thinking':True,'keep':'all','reasoning_effort':'max',
