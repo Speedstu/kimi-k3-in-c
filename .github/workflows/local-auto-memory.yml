@@ -1,0 +1,113 @@
+name: Local K3 auto memory parity
+
+on:
+  push:
+    branches: [speedboost/local-auto-memory]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Stage machine-aware local memory policy
+        run: python tools/patch_local_auto_memory.py
+
+      - name: Python local bridge and deterministic budget gates
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m compileall -q local/ tests/python/
+          python -m unittest discover -s tests/python -p 'test_*.py' -v
+          python - <<'PY'
+          from local.k3_local import _auto_worker_budgets
+          for gb in (12,16,24,32,48,64,128,192):
+              try:
+                  t,c=_auto_worker_budgets(float(gb), worker_context=1024)
+              except RuntimeError as e:
+                  print(gb,'GB -> fail-closed',e)
+                  continue
+              assert t > 0 and c > 0 and t+c < gb
+              print(f'{gb:3d} GB available -> trunk {t:6.2f} / cache {c:5.2f}')
+          t32,c32=_auto_worker_budgets(32.0,worker_context=1024)
+          assert t32 >= 18.0 and c32 == 0.5
+          print('32 GB LAPTOP AUTO-MEMORY PASS',t32,c32)
+          PY
+
+      - name: Strict C build and exact model oracle unchanged
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Persist validated local auto-memory policy
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add local/k3_local.py tests/python/test_local_bridge.py
+          git commit -m 'perf: size resident local K3 from available machine memory'
+          rm tools/patch_local_auto_memory.py
+          cat > .github/workflows/local-auto-memory.yml <<'YAML'
+          name: Local K3 auto memory parity
+          on:
+            workflow_dispatch:
+            pull_request:
+              paths:
+                - 'local/k3_local.py'
+                - 'tests/python/test_local_bridge.py'
+                - '.github/workflows/local-auto-memory.yml'
+          permissions:
+            contents: read
+          jobs:
+            parity:
+              runs-on: ubuntu-latest
+              timeout-minutes: 35
+              steps:
+                - uses: actions/checkout@v7
+                - uses: actions/setup-python@v7
+                  with:
+                    python-version: '3.12'
+                - name: Local bridge and deterministic auto-memory gates
+                  run: |
+                    set -euo pipefail
+                    python -m pip install --quiet numpy
+                    python -m compileall -q local/ tests/python/
+                    python -m unittest discover -s tests/python -p 'test_*.py' -v
+                    python - <<'PY'
+                    from local.k3_local import _auto_worker_budgets
+                    t,c=_auto_worker_budgets(32.0,prefill_mb=256.0,worker_context=1024)
+                    assert t >= 18.0 and c == 0.5, (t,c)
+                    th,ch=_auto_worker_budgets(32.0,prefill_mb=256.0,worker_context=1048576)
+                    assert th > 14.0 and th < t and ch == 0.5, (th,ch)
+                    tf,cf=_auto_worker_budgets(192.0,prefill_mb=256.0,worker_context=1024)
+                    assert tf == 111.0 and cf > 0.5, (tf,cf)
+                    print('LOCAL AUTO MEMORY CONTRACT PASS', (t,c),(th,ch),(tf,cf))
+                    PY
+                - name: Exact C oracle unchanged
+                  run: |
+                    set -euo pipefail
+                    sudo apt-get update -qq
+                    sudo apt-get install -y --no-install-recommends libomp-dev
+                    make clean
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+          YAML
+          git add -A
+          git commit -m 'ci: keep local auto-memory parity gate permanent'
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
