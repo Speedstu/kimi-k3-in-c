@@ -855,8 +855,8 @@ class LocalK3:
             request.get("max_tokens", request.get("max_completion_tokens", 4096))
         )
         seed = int(request.get("seed", 1))
-        if not 1 <= max_tokens <= 4096:
-            raise ValueError("max_tokens must be in [1,4096] for the current C backend")
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
         if temperature < 0.0:
             raise ValueError("temperature must be >= 0")
         if not 0.0 < top_p <= 1.0:
@@ -877,6 +877,19 @@ class LocalK3:
             request.get("tool_choice"),
             request.get("response_format"),
         )
+        backend_context = getattr(self.backend, "context", None)
+        if backend_context is not None:
+            backend_context = int(backend_context)
+            if len(prompt_ids) + max_tokens > backend_context:
+                raise ValueError(
+                    f"prompt ({len(prompt_ids)}) + max_tokens ({max_tokens}) exceeds "
+                    f"resident worker context ({backend_context}); raise --worker-context"
+                )
+        elif max_tokens > 4096:
+            raise ValueError(
+                "non-resident one-shot compatibility mode supports at most 4096 output "
+                "tokens; use the default resident worker for K3 Max benchmark budgets"
+            )
         return {
             "prompt_ids": prompt_ids,
             "max_tokens": max_tokens,

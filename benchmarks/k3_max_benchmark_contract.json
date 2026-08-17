@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "result_format": {
+    "scores": "object keyed exactly like benchmarks/k3_max_reference.json"
+  },
+  "required_profile": {
+    "model": "moonshotai/Kimi-K3",
+    "reasoning_effort": "max",
+    "temperature": 1.0,
+    "single_step_top_p": 0.95,
+    "agentic_top_p": 1.0,
+    "preserve_thinking": true,
+    "context": 1048576,
+    "max_output_tokens_supported": 98304
+  },
+  "policy": {
+    "missing_score": "fail",
+    "score_below_reference": "fail",
+    "default_absolute_tolerance": 0.0,
+    "vision_requires_native_media_path": true
+  }
+}

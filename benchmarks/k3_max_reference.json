@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "model": "moonshotai/Kimi-K3",
+  "profile": "max",
+  "snapshot_date": "2026-08-17",
+  "official_source": "https://github.com/MoonshotAI/Kimi-K3/blob/main/README.md",
+  "sampling": {
+    "reasoning_effort": "max",
+    "temperature": 1.0,
+    "single_step_top_p": 0.95,
+    "agentic_top_p": 1.0,
+    "preserve_thinking": true
+  },
+  "model_context": 1048576,
+  "vendor_verifier_max_output_tokens": 98304,
+  "scores": {
+    "reasoning_knowledge": {
+      "GPQA Diamond": 93.5,
+      "CritPt": 23.4,
+      "AA-LCR": 74.7,
+      "HLE-Full": [43.5, 56.0]
+    },
+    "coding": {
+      "DeepSWE": 67.5,
+      "ProgramBench": 77.8,
+      "Terminal-Bench 2.1": 88.3,
+      "FrontierSWE": 81.2,
+      "SWE-Marathon": 42.0,
+      "PostTrainBench": 36.6,
+      "MLS-Bench-Lite": 48.3,
+      "SciCode": 58.7,
+      "Kimi Code Bench 2.0": 72.9
+    },
+    "agentic": {
+      "BrowseComp": 91.2,
+      "DeepSearchQA (F1)": 95.0,
+      "ResearchRubrics": 76.2,
+      "GDPval-AA v2 (Elo)": 1686,
+      "Toolathlon-Verified": 76.5,
+      "MCPMark-Verified": 94.5,
+      "MCP-Atlas": 84.2,
+      "AutomationBench": 30.8,
+      "JobBench": 54.3,
+      "AA-Briefcase (Elo)": 1548,
+      "Agents' Last Exam": 28.3,
+      "APEX-Agents": 41.0,
+      "OfficeQA Pro": 63.3,
+      "SpreadsheetBench 2": 34.8,
+      "OSWorld-Verified": 84.8,
+      "OSWorld 2.0": 58.3,
+      "SaaS-Bench": 60.1,
+      "tau3-Banking": 33.4,
+      "Harvey Lab-AA": 94.6,
+      "CorpFin v2": 71.6,
+      "Finance Agent v2": 54.4,
+      "Legal Research Bench": 44.2
+    },
+    "vision": {
+      "WorldVQA ForceAnswer": 51.0,
+      "OmniDocBench": 91.1,
+      "PerceptionBench": 58.5,
+      "Video-MME (w. sub)": 90.0,
+      "MMVU": 82.1,
+      "BabyVision w/ python": 85.7,
+      "MMMU-Pro": [81.6, 83.4],
+      "CharXiv (RQ)": [84.8, 91.3],
+      "MathVision": [94.3, 97.8],
+      "ZeroBench (pass@5)": [23.0, 41.0]
+    }
+  },
+  "notes": {
+    "paired_scores": "Official README order is without tools, with tools.",
+    "browsecomp": "Published 91.2 uses context compaction at 300K; official README reports 90.4 with raw 1M context and no context management.",
+    "vision_status_in_this_runtime": "Reference only until native MoonViT-V2/image input is implemented and parity-gated."
+  }
+}

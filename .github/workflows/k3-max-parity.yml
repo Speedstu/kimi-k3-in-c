@@ -1,0 +1,46 @@
+name: K3 Max parity gate
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/cli/k3_run.c'
+      - 'src/cli/k3_worker.c'
+      - 'local/**'
+      - 'benchmarks/k3_max_reference.json'
+      - 'benchmarks/k3_score_gate.py'
+      - 'tests/python/**'
+      - '.github/workflows/k3-max-parity.yml'
+permissions:
+  contents: read
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Bridge/profile/score gates
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet ruff
+          ruff check local/ tests/python/ benchmarks/k3_score_gate.py --output-format=github
+          python -m unittest discover -s tests/python -p 'test_*.py' -v
+          cp benchmarks/k3_max_reference.json /tmp/measured.json
+          python benchmarks/k3_score_gate.py /tmp/measured.json
+      - name: Strict model oracle
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+      - name: Static K3 Max parity invariants
+        run: |
+          set -euo pipefail
+          grep -q '#define K3_SPEC_SAMPLE_MAX 8' src/cli/k3_run.c
+          grep -q '#define K3_SPEC_MAX 32' src/cli/k3_run.c
+          grep -q 'request_spec_n = K3_SPEC_SAMPLE_MAX' src/cli/k3_worker.c
+          ! grep -q 'gen > K3_MAX_GEN) bad = 1' src/cli/k3_worker.c
+          grep -q 'max_output_size = 98304' local/kimi-code-benchmark.toml.example

@@ -579,7 +579,7 @@ int main(int argc, char **argv)
             break;
         }
         int bad = 0;
-        if (np <= 0 || gen <= 0 || np + gen > context || gen > K3_MAX_GEN) bad = 1;
+        if (np <= 0 || gen <= 0 || np + gen > context) bad = 1;
         if (!isfinite(temperature) || temperature < 0.0 ||
             !isfinite(top_p) || top_p <= 0.0 || top_p > 1.0) bad = 1;
         if (stop_id < -1 || stop_id >= c.vocab || np > context) bad = 1;
@@ -671,10 +671,13 @@ int main(int argc, char **argv)
              * marginal target distribution stays correct. Use the request-local horizon
              * here too; the worker's larger resident context is not generation budget. */
             const int request_tmax = np + gen + 1;
+            int request_spec_n = spec_n;
+            if (temperature > 0.0 && request_spec_n > K3_SPEC_SAMPLE_MAX)
+                request_spec_n = K3_SPEC_SAMPLE_MAX;
             const int can_full_spec = draft_dir &&
-                T + spec_n + 1 < request_tmax &&
-                base + spec_n + 1 <= w.kv_cap;
-            const int want_drafts = can_full_spec ? spec_n : 0;
+                T + request_spec_n + 1 < request_tmax &&
+                base + request_spec_n + 1 <= w.kv_cap;
+            const int want_drafts = can_full_spec ? request_spec_n : 0;
 
             if (want_drafts > 0) {
                 used_spec = 1;

@@ -18,12 +18,14 @@ api_key = "local-only"
 [models.k3-local]
 provider = "local-k3"
 model = "kimi-k3-local"
-# 32k is a conservative declaration for the current expanded-fp32 MLA cache. The C
-# engine is the final authority and refuses a request before allocation when the chosen
-# machine cannot fit its KV cache. Increase this only after measuring your RAM budget.
-max_context_size = 32768
-# The released K3 preserved-thinking example also uses max_tokens=4096. Pinning this here
-# prevents a client from deriving an output budget from the much larger context window.
+# Advertise the released K3 context contract to the harness. This does NOT force the
+# laptop to allocate/fill 1M positions: the resident C worker is the physical authority
+# and rejects prompt+output beyond its explicit --worker-context before expensive work.
+# Use a large worker context only when the workload needs it; virtual KV reservation is
+# lazy while physical RAM still grows with positions actually used.
+max_context_size = 1048576
+# Keep normal interactive turns bounded. The separate benchmark profile raises this to
+# 98,304 because that is required by the longest published K3 verifier profile.
 max_output_size = 4096
 capabilities = ["thinking", "always_thinking", "tool_use"]
 display_name = "K3 Local (C)"

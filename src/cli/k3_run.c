@@ -164,7 +164,8 @@ static void k3_state_fp(const K3Cfg *c, int32_t *fp)
     fp[9] = c->v_head;      fp[10] = c->n_experts; fp[11] = c->topk;
 }
 
-#define K3_SPEC_MAX 8
+#define K3_SPEC_SAMPLE_MAX 8
+#define K3_SPEC_MAX 32
 /* Longest-suffix n-gram drafting for --spec: if the last n ids (n=3, then 2) already
  * appeared earlier in the sequence, propose the ids that followed them there. Costs
  * nothing when it misses: no draft means the step runs exactly as without --spec. The
@@ -370,7 +371,7 @@ static void usage(FILE *f)
 "                        probe wider batches and back off measured regressions; poor\n"
 "                        acceptance still shrinks immediately. Without a draft trunk the\n"
 "                        acceptance controller is used. --spec N is the ceiling (8 max).\n"
-"                        Sampling keeps fixed --spec for seeded parity\n"
+"                        Sampling keeps fixed --spec capped at 8 for seeded parity\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "diagnostics:\n"
@@ -1291,10 +1292,13 @@ int main(int argc, char **argv)
     if (spec_auto && spec_n <= 0) spec_n = K3_SPEC_MAX;
     if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
     if (spec_n < 0) spec_n = 0;
+    if (temperature > 0.0 && spec_n > K3_SPEC_SAMPLE_MAX)
+        spec_n = K3_SPEC_SAMPLE_MAX;
     int spec_limit = spec_n;
     int spec_cur = spec_auto ? (spec_limit < 4 ? spec_limit : 4) : spec_limit;
     long spec_auto_rounds = 0, spec_auto_proposed = 0, spec_auto_accepted = 0;
     int spec_auto_grows = 0, spec_auto_shrinks = 0;
+    int spec_peak_width = 0;
     K3SpecAutoCost spec_cost;
     k3_spec_auto_cost_init(&spec_cost);
 
@@ -1513,6 +1517,7 @@ int main(int argc, char **argv)
                 }
             }
             if (nd > 0) {
+                if (nd > spec_peak_width) spec_peak_width = nd;
                 /* One sweep verifies the pending token plus nd drafts. arg[i] is the
                  * model's own next token after batch position i; the accepted prefix is
                  * exactly what serial decode would have emitted, and arg[m] after it is
@@ -1715,6 +1720,8 @@ int main(int argc, char **argv)
         }
     }
 
+    if (spec_peak_width > 0)
+        printf("\nspeculative peak proposed width: %d\n", spec_peak_width);
     if (spec_auto && spec_auto_rounds > 0) {
         printf("\nadaptive speculation: %ld verified rounds, %ld/%ld drafts accepted (%.1f%%), "
                "final horizon %d/%d, grows %d, shrinks %d\n",

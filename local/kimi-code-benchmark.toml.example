@@ -20,9 +20,9 @@ model = "kimi-k3-local"
 # contract; the current C backend still performs a physical RAM preflight and will refuse
 # contexts the local machine cannot actually hold. The local README explains this split.
 max_context_size = 1048576
-# Keep the model request aligned with the released preserved-thinking example and the
-# current exact C generation buffer instead of deriving a huge output budget from 1M ctx.
-max_output_size = 4096
+# K3's published verifier uses output budgets up to 98,304 tokens (MMMU, thinking
+# max). The resident worker accepts this when --worker-context covers prompt + output.
+max_output_size = 98304
 capabilities = ["thinking", "always_thinking", "tool_use"]
 display_name = "K3 Local Benchmark"
 support_efforts = ["max"]

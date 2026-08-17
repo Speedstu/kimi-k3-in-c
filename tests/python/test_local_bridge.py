@@ -102,6 +102,41 @@ class LocalBridgeTests(unittest.TestCase):
                 }
             )
 
+    def test_resident_worker_accepts_official_98304_output_budget(self):
+        k3 = self.make_k3()
+        k3.backend.context = 131072
+        prepared = k3._prepare(
+            {
+                "messages": [{"role": "user", "content": "benchmark"}],
+                "thinking": {"type": "enabled", "effort": "max", "keep": "all"},
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "max_completion_tokens": 98304,
+            }
+        )
+        self.assertEqual(prepared["max_tokens"], 98304)
+
+    def test_resident_worker_rejects_budget_beyond_configured_context(self):
+        k3 = self.make_k3()
+        k3.backend.context = 65536
+        with self.assertRaisesRegex(ValueError, "raise --worker-context"):
+            k3._prepare(
+                {
+                    "messages": [{"role": "user", "content": "benchmark"}],
+                    "max_completion_tokens": 98304,
+                }
+            )
+
+    def test_nonresident_fallback_keeps_legacy_output_ceiling(self):
+        k3 = self.make_k3()
+        with self.assertRaisesRegex(ValueError, "one-shot compatibility"):
+            k3._prepare(
+                {
+                    "messages": [{"role": "user", "content": "benchmark"}],
+                    "max_completion_tokens": 4097,
+                }
+            )
+
     def test_unsupported_penalty_is_rejected(self):
         k3 = self.make_k3()
         with self.assertRaisesRegex(ValueError, "presence_penalty"):
