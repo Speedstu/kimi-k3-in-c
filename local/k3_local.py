@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import ctypes
 import html
 import ipaddress
 import json
@@ -216,7 +217,7 @@ class BackendConfig:
     model_dir: Path
     trunk_dir: Path
     binary: Path
-    preset: str = "laptop"
+    preset: str = "auto"
     threads: int | None = None
     cache_gb: float | None = None
     trunk_gb: float | None = None
@@ -559,6 +560,121 @@ class CBackend:
                 return generated, data
 
 
+# Exact resident-memory policy.  This is deliberately kept in Python because the local
+# bridge already owns process startup and can query the host before the huge C worker is
+# created.  The values below are storage/residency budgets, never model approximations.
+#
+# Why trunk-first? Released-K3 measurements show every low-memory token sweeps ~108.81 GB
+# of dense trunk but only ~25.83 GB of routed experts; expert LRU retention is negligible
+# below tens of GB. The old local-service default (3/1) therefore left most of a 32 GB
+# laptop unused for the one cache where every extra resident layer saves guaranteed I/O.
+_K3_AUTO_FULL_TRUNK_GB = 111.0
+_K3_AUTO_CACHE_FLOOR_GB = 0.5
+_K3_AUTO_TRUNK_FLOOR_GB = 2.5
+_K3_EXACT_HEAD_GB = 4.70
+_K3_RECURRENT_AND_MISC_GB = 0.75
+_K3_KV_BYTES_PER_POSITION = 2_370_000.0
+_K3_AUTO_KV_HOT_POSITIONS = 2048
+
+
+def _available_physical_memory_bytes() -> int:
+    """Best-effort currently available physical memory, cross-platform, no dependency."""
+    if os.name == "nt":
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        state = MEMORYSTATUSEX()
+        state.dwLength = ctypes.sizeof(state)
+        try:
+            ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(state))
+        except (AttributeError, OSError):
+            ok = 0
+        return int(state.ullAvailPhys) if ok else 0
+
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+
+    # Portable fallback.  On platforms where AVPHYS_PAGES is unavailable, return zero
+    # rather than guessing from total RAM and risking swap/reclaim on a 1.56 TB workload.
+    try:
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        if pages > 0 and page_size > 0:
+            return pages * page_size
+    except (AttributeError, OSError, ValueError):
+        pass
+    return 0
+
+
+def _auto_worker_budgets(
+    available_gb: float,
+    *,
+    prefill_mb: float = 256.0,
+    worker_context: int = 1024,
+) -> tuple[float, float]:
+    """Return exact trunk/cache budgets without driving the machine into reclaim.
+
+    `available_gb` is memory available BEFORE worker startup.  Reserve the model head,
+    recurrent/misc state, configured transient prefill, a bounded hot KV working set and
+    a host safety margin.  Everything left goes to the exact trunk until it is fully
+    resident; only then does extra memory feed the expert cache.
+
+    The full worker can reserve a 1M-position KV virtually, so reserving all configured
+    positions here would incorrectly require terabytes at startup.  Physical KV pages are
+    demand-committed.  We reserve up to 2048 hot positions (~4.85 GB) and leave an
+    additional 8%/1.5 GB host margin; long-context requests remain governed by the
+    worker's demand paging and request/context checks.
+    """
+    if not (available_gb > 0.0):
+        raise ValueError("available_gb must be > 0")
+    if not (prefill_mb > 0.0):
+        raise ValueError("prefill_mb must be > 0")
+    if worker_context < 2:
+        raise ValueError("worker_context must be >= 2")
+
+    hot_positions = min(int(worker_context), _K3_AUTO_KV_HOT_POSITIONS)
+    kv_hot_gb = hot_positions * _K3_KV_BYTES_PER_POSITION / 1e9
+    prefill_gb = prefill_mb * (1024.0 * 1024.0) / 1e9
+    host_margin = max(1.5, 0.08 * available_gb)
+    fixed = _K3_EXACT_HEAD_GB + _K3_RECURRENT_AND_MISC_GB + prefill_gb + kv_hot_gb
+    allocator = available_gb - fixed - host_margin
+
+    # On a heavily loaded or genuinely tiny machine, do not pretend an aggressive auto
+    # plan is safe. The historical 3/1 preset remains available explicitly as `laptop`.
+    minimum = _K3_AUTO_TRUNK_FLOOR_GB + _K3_AUTO_CACHE_FLOOR_GB
+    if allocator < minimum:
+        raise RuntimeError(
+            f"auto memory has only {allocator:.1f} GB left for trunk/cache after exact "
+            f"fixed costs and safety margin; need at least {minimum:.1f} GB. "
+            "Close memory-heavy apps or pass --preset laptop explicitly."
+        )
+
+    if allocator >= _K3_AUTO_FULL_TRUNK_GB + _K3_AUTO_CACHE_FLOOR_GB:
+        trunk = _K3_AUTO_FULL_TRUNK_GB
+        cache = allocator - trunk
+    else:
+        cache = _K3_AUTO_CACHE_FLOOR_GB
+        trunk = allocator - cache
+
+    # Stable command lines/logs, while leaving sub-100 MB precision irrelevant to layer
+    # residency and O_DIRECT slots.
+    return round(trunk, 2), round(cache, 2)
+
+
 class ResidentCBackend:
     """One warm C process: weights/index/trunk/cache and the active KV/KDA state stay live."""
 
@@ -584,11 +700,28 @@ class ResidentCBackend:
         atexit.register(self.close)
 
     def _budgets(self) -> tuple[float, float]:
+        # Explicit values always win, independently, just as they do in the one-shot CLI.
+        if self.cfg.preset == "auto":
+            available = _available_physical_memory_bytes()
+            if available <= 0:
+                raise RuntimeError(
+                    "resident --preset auto could not read available physical memory; "
+                    "pass a named preset or explicit --trunk-gb/--cache-gb"
+                )
+            auto_trunk, auto_cache = _auto_worker_budgets(
+                available / 1e9,
+                prefill_mb=self.cfg.prefill_mb,
+                worker_context=self.cfg.worker_context,
+            )
+            trunk = self.cfg.trunk_gb if self.cfg.trunk_gb is not None else auto_trunk
+            cache = self.cfg.cache_gb if self.cfg.cache_gb is not None else auto_cache
+            return float(trunk), float(cache)
+
         defaults = self._PRESET_BUDGETS.get(self.cfg.preset)
         if defaults is None:
             raise ValueError(
                 f"resident worker cannot resolve preset {self.cfg.preset!r}; "
-                "use a named fixed preset or explicit --trunk-gb/--cache-gb"
+                "use auto, a named fixed preset, or explicit --trunk-gb/--cache-gb"
             )
         trunk = self.cfg.trunk_gb if self.cfg.trunk_gb is not None else defaults[0]
         cache = self.cfg.cache_gb if self.cfg.cache_gb is not None else defaults[1]
@@ -596,6 +729,12 @@ class ResidentCBackend:
 
     def _command(self) -> list[str]:
         trunk_gb, cache_gb = self._budgets()
+        if self.cfg.preset == "auto":
+            print(
+                f"resident auto memory: trunk {trunk_gb:.2f} GB / "
+                f"expert cache {cache_gb:.2f} GB "
+                f"(available before worker {_available_physical_memory_bytes()/1e9:.1f} GB)"
+            )
         cmd = [
             str(self.cfg.worker_binary),
             str(self.cfg.model_dir),
@@ -1419,7 +1558,7 @@ def main() -> None:
         default="auto",
         help="official K3 vision attention implementation (default auto)",
     )
-    sp.add_argument("--preset", default="laptop")
+    sp.add_argument("--preset", default="auto")
     sp.add_argument("--threads", type=int)
     sp.add_argument("--cache-gb", type=float)
     sp.add_argument("--trunk-gb", type=float)
