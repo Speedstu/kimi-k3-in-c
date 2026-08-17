@@ -1,0 +1,27 @@
+{
+  "source": "MoonshotAI/Kimi-K3 README benchmark table snapshot, 2026-08-17",
+  "sampling_contract": {
+    "reasoning_effort": "max",
+    "temperature": 1.0,
+    "single_step_top_p": 0.95,
+    "agentic_top_p": 1.0
+  },
+  "code": {
+    "deepswe": 67.5,
+    "programbench": 77.8,
+    "terminal_bench_2_1": 88.3,
+    "kimi_code_bench_2_0": 72.9
+  },
+  "agentic": {
+    "browsecomp": 91.2,
+    "deepsearchqa_f1": 95.0,
+    "researchrubrics": 76.2
+  },
+  "cyber": {
+    "cybench": null
+  },
+  "notes": [
+    "cybench has no K3 Max score in the pinned public K3 table; measure teacher and student with the exact same local harness before claiming a cyber win.",
+    "Do not train on held-out benchmark test items used by this gate."
+  ]
+}
