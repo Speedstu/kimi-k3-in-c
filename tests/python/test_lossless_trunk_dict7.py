@@ -64,7 +64,7 @@ class Dict7LosslessTests(unittest.TestCase):
         a = np.empty(n * 2, dtype=np.uint8)
         a[0::2], a[1::2] = low, high
         raw = a.tobytes()
-        p7, d7, _ = mod.encode_block_dict7(raw)
+        p7, _dictionary7, _ = mod.encode_block_dict7(raw)
         p15, _, _ = mod.encode_block_dict15(raw)
         self.assertLess(len(p7), len(p15))
         codec, payload, dictionary, _ = mod.choose_block_codec(raw)
