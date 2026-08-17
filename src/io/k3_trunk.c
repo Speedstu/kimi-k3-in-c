@@ -166,6 +166,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
                 if (!co || co->t != J_STR) { fprintf(stderr, "k3_trunk: layer %d block %d has no codec\n", i, bi); goto bad; }
                 if (!strcmp(co->str, "raw")) b->codec = 0;
                 else if (!strcmp(co->str, "dict15")) b->codec = 1;
+                else if (!strcmp(co->str, "dict7")) b->codec = 2;
                 else { fprintf(stderr, "k3_trunk: layer %d block %d unknown codec %s\n", i, bi, co->str); goto bad; }
                 if (b->raw_off != expect_raw || b->raw_nbytes <= 0 || b->stored_nbytes <= 0 ||
                     b->encoded_nbytes <= 0 || b->encoded_nbytes > b->stored_nbytes ||
@@ -173,13 +174,15 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
                     fprintf(stderr, "k3_trunk: layer %d block %d has invalid geometry\n", i, bi);
                     goto bad;
                 }
-                if (b->codec == 1) {
+                if (b->codec == 1 || b->codec == 2) {
+                    const int dict_n = b->codec == 1 ? K3_DICT15_SIZE : K3_DICT7_SIZE;
                     jval *da = json_get(bo, "dict");
-                    if (!da || da->t != J_ARR || da->len != K3_DICT15_SIZE) {
-                        fprintf(stderr, "k3_trunk: layer %d block %d needs a 15-byte dictionary\n", i, bi);
+                    if (!da || da->t != J_ARR || da->len != dict_n) {
+                        fprintf(stderr, "k3_trunk: layer %d block %d needs a %d-byte dictionary\n",
+                                i, bi, dict_n);
                         goto bad;
                     }
-                    for (int di = 0; di < K3_DICT15_SIZE; di++) {
+                    for (int di = 0; di < dict_n; di++) {
                         if (!da->kids[di] || da->kids[di]->t != J_NUM ||
                             da->kids[di]->num < 0 || da->kids[di]->num > 255) {
                             fprintf(stderr, "k3_trunk: layer %d block %d bad dictionary\n", i, bi);
@@ -420,7 +423,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
                "reuse it as 2 x %.2f GB slots (no extra trunk RAM)\n",
                (double)arena_bytes / 1e9, tr->n_layers - 1, (double)ring_slot / 1e9);
     if (codec_slot > 0)
-        printf("              lossless dict15 blocks: %.2f GB codec scratch per ring slot "
+        printf("              adaptive lossless blocks: %.2f GB codec scratch per ring slot "
                "(counted in trunk budget)\n", (double)codec_slot / 1e9);
     printf("              reads use %s\n",
            tr->direct ? "O_DIRECT (page cache bypassed)" : "buffered I/O");
@@ -542,11 +545,19 @@ static int load_run(K3Trunk *tr, int L, unsigned char *dst, int scratch_slot)
                 return -1;
             }
             const double td = now_s();
-            const size_t used = k3_dict15_decode(out, (size_t)b->raw_nbytes, scratch,
-                                                  (size_t)b->encoded_nbytes, b->dict);
+            size_t used;
+            if (b->codec == 1)
+                used = k3_dict15_decode(out, (size_t)b->raw_nbytes, scratch,
+                                        (size_t)b->encoded_nbytes, b->dict);
+            else if (b->codec == 2)
+                used = k3_dict7_decode(out, (size_t)b->raw_nbytes, scratch,
+                                       (size_t)b->encoded_nbytes, b->dict);
+            else
+                used = SIZE_MAX;
             tr->decode_seconds += now_s() - td;
             if (used == SIZE_MAX) {
-                fprintf(stderr, "k3_trunk: corrupt dict15 block layer %d block %d\n", L, bi);
+                fprintf(stderr, "k3_trunk: corrupt compressed block layer %d block %d codec %d\n",
+                        L, bi, b->codec);
                 return -1;
             }
         }

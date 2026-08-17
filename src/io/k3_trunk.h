@@ -71,7 +71,7 @@ typedef struct {
     int64_t encoded_nbytes; /* payload bytes before O_DIRECT padding */
     int64_t raw_off;        /* destination offset in the reconstructed layer run */
     int64_t raw_nbytes;
-    int     codec;          /* 0 raw, 1 dict15 */
+    int     codec;          /* 0 raw, 1 dict15, 2 dict7 */
     unsigned char dict[K3_DICT15_SIZE];
 } K3TrunkBlock;
 
