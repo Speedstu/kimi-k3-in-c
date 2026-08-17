@@ -1,0 +1,52 @@
+name: Prefill BF16 batch row-pair probe
+
+on:
+  push:
+    branches: [speedboost/prefill-bf16-rowpair-probe]
+    paths:
+      - '.github/workflows/prefill-bf16-rowpair-probe.yml'
+      - '.github/patches/stage_bf16_batch_rowpair_probe.py'
+      - 'benchmarks/bench_prefill_bf16_rowpair.c'
+
+permissions:
+  contents: write
+
+jobs:
+  exactness-and-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Apply test-only helper
+        run: |
+          set -euo pipefail
+          python3 .github/patches/stage_bf16_batch_rowpair_probe.py
+      - name: Build production helper benchmark
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          cc -O3 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_bf16_pair.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off benchmarks/bench_prefill_bf16_rowpair.c /tmp/k3_ops_bf16_pair.o -o /tmp/bench_bf16_pair -lm -fopenmp -pthread
+      - name: Exactness and repeated medians
+        run: |
+          set -euo pipefail
+          : > /tmp/bf16-rowpair-results.txt
+          echo "head=${GITHUB_SHA}" | tee -a /tmp/bf16-rowpair-results.txt
+          for n in 1 4; do
+            echo "=== OMP_NUM_THREADS=$n ===" | tee -a /tmp/bf16-rowpair-results.txt
+            OMP_NUM_THREADS=$n /tmp/bench_bf16_pair | tee -a /tmp/bf16-rowpair-results.txt
+          done
+          test "$(grep -c 'PREFILL BF16 ROWPAIR EXACTNESS PASS' /tmp/bf16-rowpair-results.txt)" -eq 2
+      - name: Publish probe result
+        run: |
+          set -euo pipefail
+          cp /tmp/bf16-rowpair-results.txt benchmarks/PREFILL_BF16_ROWPAIR_PROBE.txt
+          git restore src/core/k3_ops.c
+          git config user.name 'Speedstu'
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add benchmarks/PREFILL_BF16_ROWPAIR_PROBE.txt
+          git commit -m 'probe: record BF16 batch row-pair medians'
+          git push origin HEAD:speedboost/prefill-bf16-rowpair-probe
