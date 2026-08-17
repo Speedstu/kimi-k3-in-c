@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import unittest
 
-from local.k3_local import LocalK3, _is_loopback_host, parse_xtml
+from local.k3_local import (
+    BackendConfig, LocalK3, _auto_worker_budgets,
+    _is_loopback_host, parse_xtml,
+)
 
 
 class FakeTokenizer:
@@ -193,6 +196,37 @@ class LocalBridgeTests(unittest.TestCase):
         delta, previous = LocalK3._safe_delta("abc", "abcé")
         self.assertEqual(delta, "é")
         self.assertEqual(previous, "abcé")
+
+    def test_auto_worker_budget_uses_32gb_for_exact_trunk_not_expert_lru(self):
+        trunk, cache = _auto_worker_budgets(32.0, prefill_mb=256.0, worker_context=1024)
+        self.assertGreater(trunk, 18.0)
+        self.assertLess(trunk, 24.0)
+        self.assertEqual(cache, 0.5)
+
+    def test_auto_worker_budget_reserves_hot_kv_for_large_virtual_context(self):
+        small_ctx = _auto_worker_budgets(32.0, prefill_mb=256.0, worker_context=1024)
+        huge_ctx = _auto_worker_budgets(32.0, prefill_mb=256.0, worker_context=1048576)
+        self.assertLess(huge_ctx[0], small_ctx[0])
+        self.assertEqual(huge_ctx[1], 0.5)
+        # Virtual 1M context must not reserve 1M physical KV rows at startup.
+        self.assertGreater(huge_ctx[0], 14.0)
+
+    def test_auto_worker_budget_fills_trunk_before_expert_cache(self):
+        trunk, cache = _auto_worker_budgets(192.0, prefill_mb=256.0, worker_context=1024)
+        self.assertEqual(trunk, 111.0)
+        self.assertGreater(cache, 0.5)
+
+    def test_auto_worker_budget_fails_closed_when_host_is_too_busy(self):
+        with self.assertRaisesRegex(RuntimeError, "Close memory-heavy apps"):
+            _auto_worker_budgets(8.0, prefill_mb=256.0, worker_context=1024)
+
+    def test_default_backend_config_is_machine_aware(self):
+        cfg = BackendConfig(
+            model_dir=__import__('pathlib').Path('/model'),
+            trunk_dir=__import__('pathlib').Path('/trunk'),
+            binary=__import__('pathlib').Path('/bin/k3'),
+        )
+        self.assertEqual(cfg.preset, "auto")
 
     def test_loopback_guard(self):
         self.assertTrue(_is_loopback_host("127.0.0.1"))
