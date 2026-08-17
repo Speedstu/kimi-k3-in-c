@@ -1,0 +1,49 @@
+head=eb1603839de971e35e577c7a66425ec69e990d86
+=== OMP_NUM_THREADS=1 ===
+threads=1
+moe-down in=7168 out=3584 batch=2 float=9.989ms xdouble=11.214ms speedup=0.8908x
+moe-down in=7168 out=3584 batch=4 float=16.076ms xdouble=18.362ms speedup=0.8755x
+moe-down in=7168 out=3584 batch=8 float=29.647ms xdouble=36.499ms speedup=0.8123x
+moe-up in=3584 out=7168 batch=2 float=10.073ms xdouble=11.293ms speedup=0.8920x
+moe-up in=3584 out=7168 batch=4 float=16.019ms xdouble=18.382ms speedup=0.8715x
+moe-up in=3584 out=7168 batch=8 float=27.052ms xdouble=35.940ms speedup=0.7527x
+shared-up in=7168 out=6144 batch=2 float=17.041ms xdouble=19.054ms speedup=0.8944x
+shared-up in=7168 out=6144 batch=4 float=27.416ms xdouble=31.384ms speedup=0.8736x
+shared-up in=7168 out=6144 batch=8 float=47.840ms xdouble=62.566ms speedup=0.7646x
+mla-qb in=1536 out=18432 batch=2 float=10.938ms xdouble=12.332ms speedup=0.8870x
+mla-qb in=1536 out=18432 batch=4 float=17.660ms xdouble=20.372ms speedup=0.8669x
+mla-qb in=1536 out=18432 batch=8 float=30.045ms xdouble=40.689ms speedup=0.7384x
+mla-kvb in=512 out=24576 batch=2 float=4.951ms xdouble=5.545ms speedup=0.8929x
+mla-kvb in=512 out=24576 batch=4 float=7.929ms xdouble=8.806ms speedup=0.9004x
+mla-kvb in=512 out=24576 batch=8 float=12.856ms xdouble=17.326ms speedup=0.7420x
+kda-main in=7168 out=12288 batch=2 float=34.133ms xdouble=38.233ms speedup=0.8928x
+kda-main in=7168 out=12288 batch=4 float=54.859ms xdouble=62.745ms speedup=0.8743x
+kda-main in=7168 out=12288 batch=8 float=95.627ms xdouble=125.469ms speedup=0.7622x
+dense-down in=33792 out=7168 batch=2 float=92.913ms xdouble=94.712ms speedup=0.9810x
+dense-down in=33792 out=7168 batch=4 float=150.836ms xdouble=164.830ms speedup=0.9151x
+dense-down in=33792 out=7168 batch=8 float=270.198ms xdouble=308.576ms speedup=0.8756x
+PREFILL BF16 BATCH XDOUBLE EXACTNESS PASS
+=== OMP_NUM_THREADS=4 ===
+threads=4
+moe-down in=7168 out=3584 batch=2 float=4.342ms xdouble=4.985ms speedup=0.8711x
+moe-down in=7168 out=3584 batch=4 float=7.615ms xdouble=9.087ms speedup=0.8380x
+moe-down in=7168 out=3584 batch=8 float=15.858ms xdouble=27.258ms speedup=0.5818x
+moe-up in=3584 out=7168 batch=2 float=4.352ms xdouble=5.012ms speedup=0.8683x
+moe-up in=3584 out=7168 batch=4 float=7.535ms xdouble=9.068ms speedup=0.8310x
+moe-up in=3584 out=7168 batch=8 float=14.021ms xdouble=17.656ms speedup=0.7941x
+shared-up in=7168 out=6144 batch=2 float=7.464ms xdouble=8.567ms speedup=0.8713x
+shared-up in=7168 out=6144 batch=4 float=13.042ms xdouble=14.563ms speedup=0.8956x
+shared-up in=7168 out=6144 batch=8 float=27.011ms xdouble=30.763ms speedup=0.8781x
+mla-qb in=1536 out=18432 batch=2 float=4.823ms xdouble=5.522ms speedup=0.8735x
+mla-qb in=1536 out=18432 batch=4 float=8.168ms xdouble=10.089ms speedup=0.8095x
+mla-qb in=1536 out=18432 batch=8 float=15.929ms xdouble=31.712ms speedup=0.5023x
+mla-kvb in=512 out=24576 batch=2 float=2.193ms xdouble=2.463ms speedup=0.8901x
+mla-kvb in=512 out=24576 batch=4 float=3.602ms xdouble=4.192ms speedup=0.8592x
+mla-kvb in=512 out=24576 batch=8 float=6.540ms xdouble=10.583ms speedup=0.6180x
+kda-main in=7168 out=12288 batch=2 float=14.917ms xdouble=17.107ms speedup=0.8720x
+kda-main in=7168 out=12288 batch=4 float=26.150ms xdouble=29.187ms speedup=0.8960x
+kda-main in=7168 out=12288 batch=8 float=54.309ms xdouble=62.035ms speedup=0.8755x
+dense-down in=33792 out=7168 batch=2 float=40.859ms xdouble=47.039ms speedup=0.8686x
+dense-down in=33792 out=7168 batch=4 float=71.657ms xdouble=86.215ms speedup=0.8311x
+dense-down in=33792 out=7168 batch=8 float=148.825ms xdouble=238.741ms speedup=0.6234x
+PREFILL BF16 BATCH XDOUBLE EXACTNESS PASS
