@@ -1,0 +1,47 @@
+name: Prefill batch xdouble probe
+
+on:
+  push:
+    branches: [speedboost/prefill-batch-xdouble]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_prefill_batch_xdouble.c'
+      - '.github/workflows/prefill-batch-xdouble-probe.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  exactness-and-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Build exact production helpers
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          cc -O3 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_test.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off benchmarks/bench_prefill_batch_xdouble.c /tmp/k3_ops_test.o -o /tmp/prefill_batch_xd -lm -fopenmp -pthread
+      - name: Repeated production-shape medians
+        run: |
+          set -euo pipefail
+          : > /tmp/prefill-batch-xdouble-results.txt
+          echo "head=${GITHUB_SHA}" | tee -a /tmp/prefill-batch-xdouble-results.txt
+          for n in 1 2 4; do
+            echo "=== OMP_NUM_THREADS=$n ===" | tee -a /tmp/prefill-batch-xdouble-results.txt
+            OMP_NUM_THREADS=$n /tmp/prefill_batch_xd | tee -a /tmp/prefill-batch-xdouble-results.txt
+          done
+          test "$(grep -c 'PREFILL BATCH XDOUBLE EXACTNESS PASS' /tmp/prefill-batch-xdouble-results.txt)" -eq 3
+      - name: Publish probe results on branch
+        run: |
+          set -euo pipefail
+          cp /tmp/prefill-batch-xdouble-results.txt benchmarks/PREFILL_BATCH_XDOUBLE_PROBE.txt
+          git config user.name 'Speedstu'
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add benchmarks/PREFILL_BATCH_XDOUBLE_PROBE.txt
+          git commit -m 'probe: record batched xdouble medians'
+          git push origin HEAD:speedboost/prefill-batch-xdouble
