@@ -38,7 +38,7 @@ jobs:
           python-version: '3.12'
       - name: Python lint and local bridge tests
         run: |
-          python -m pip install --quiet ruff
+          python -m pip install --quiet ruff numpy
           ruff check local/ tests/python/ --output-format=github
           python -m compileall -q local/ tests/python/
           python -m unittest discover -s tests/python -p 'test_*.py' -v
