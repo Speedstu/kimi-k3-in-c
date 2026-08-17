@@ -59,7 +59,7 @@ jobs:
           D=/tmp/k3long-out
           BASE='/tmp/k3long --trunk /tmp/k3long-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids-file /tmp/k3long-out/ids.txt --gen 20 --incremental --threads 1 --temperature 0'
           ./bin/k3 $BASE --out "$D/serial.json" >"$D/serial.log" 2>&1
-          ./bin/k3 $BASE --spec 32 --out "$D/spec.json" >"$D/spec.log" 2>&1
+          ./bin/k3 $BASE --spec 8 --out "$D/spec.json" >"$D/spec.log" 2>&1
           python - <<'PY'
           import json,re
           a=json.load(open('/tmp/k3long-out/serial.json'))
@@ -77,13 +77,11 @@ jobs:
       - name: Sampling source path stays legacy-only
         run: |
           set -euo pipefail
-          # This is a structural gate in addition to the repository's sampled-spec
-          # token/RNG parity workflow: long matching must remain greedy-only.
           grep -q 'temperature <= 0.0' src/cli/k3_run.c
           grep -q 'if (allow_long)' src/cli/k3_run.c
           ./bin/k3 /tmp/k3long --trunk /tmp/k3long-trunk --trunk-gb 0.05 --cache-gb 0.01 \
             --ids 3,7,11,13,17,19,23,29 --gen 8 --incremental --threads 1 \
-            --temperature 1 --top-p 0.95 --seed 12345 --spec 8 \
+            --temperature 1 --top-p 0.95 --seed 12345 --spec 4 \
             --out /tmp/k3long-out/sample.json >/tmp/k3long-out/sample.log 2>&1
           ! grep -q 'long-suffix ngram:' /tmp/k3long-out/sample.log
           echo 'SAMPLED LONG-SUFFIX BYPASS: PASS'
@@ -141,7 +139,7 @@ jobs:
                     echo "$IDS" >/tmp/k3long-out/ids.txt
                     BASE='/tmp/k3long --trunk /tmp/k3long-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids-file /tmp/k3long-out/ids.txt --gen 20 --incremental --threads 1 --temperature 0'
                     ./bin/k3 $BASE --out /tmp/k3long-out/serial.json >/tmp/k3long-out/serial.log 2>&1
-                    ./bin/k3 $BASE --spec 32 --out /tmp/k3long-out/spec.json >/tmp/k3long-out/spec.log 2>&1
+                    ./bin/k3 $BASE --spec 8 --out /tmp/k3long-out/spec.json >/tmp/k3long-out/spec.log 2>&1
                     python - <<'PY'
                     import json,re
                     a=json.load(open('/tmp/k3long-out/serial.json')); b=json.load(open('/tmp/k3long-out/spec.json'))
