@@ -1,0 +1,50 @@
+name: Stage adaptive BF16 row-pair kernel
+
+on:
+  push:
+    branches: [speedboost/prefill-bf16-rowpair]
+    paths:
+      - '.github/workflows/stage-bf16-rowpair.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Apply production patch
+        run: |
+          set -euo pipefail
+          python3 .github/patches/stage_production_bf16_rowpair.py
+
+      - name: Strict AVX2 build and full regression suite
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Direct old-vs-rowpair bit parity
+        run: |
+          set -euo pipefail
+          cc -O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_rowpair.o
+          cc -O2 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off benchmarks/bench_bf16_rowpair_exact.c /tmp/k3_ops_rowpair.o -o /tmp/bf16_rowpair_exact -lm -fopenmp -pthread
+          OMP_NUM_THREADS=1 /tmp/bf16_rowpair_exact
+          OMP_NUM_THREADS=2 /tmp/bf16_rowpair_exact
+
+      - name: Commit production source
+        run: |
+          set -euo pipefail
+          git config user.name 'Speedstu'
+          git config user.email '164693733+Speedstu@users.noreply.github.com'
+          git add src/core/k3_ops.c
+          git commit -m 'Use adaptive exact BF16 row-pair prefill kernel'
+          git push origin HEAD:speedboost/prefill-bf16-rowpair
