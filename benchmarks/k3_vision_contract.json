@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "model": "moonshotai/Kimi-K3",
+  "snapshot_date": "2026-08-17",
+  "official_source": "https://huggingface.co/moonshotai/Kimi-K3",
+  "media_placeholder_token_id": 163605,
+  "accepted_processor_media": ["image", "image_url"],
+  "vision": {
+    "patch_size": 14,
+    "hidden_size": 1024,
+    "intermediate_size": 4096,
+    "attention_heads": 12,
+    "hidden_layers": 27,
+    "merge_kernel_size": [2, 2],
+    "merge_type": "sd2_tpool",
+    "projector_type": "patchmergerv2",
+    "qkv_hidden_size": 1536
+  },
+  "language_hidden_size": 7168,
+  "runtime_contract": {
+    "processor": "official local KimiK3Processor",
+    "vision_tower": "official MoonViT3dPretrainedModel",
+    "projector": "official PatchMergerMLPV2",
+    "language_boundary": "projected image rows replace media placeholder before exact C language-model prefill",
+    "unsupported_media": ["video", "audio"]
+  }
+}
