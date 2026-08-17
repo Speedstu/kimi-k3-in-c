@@ -1,0 +1,241 @@
+name: Official K3 Vendor Verifier
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Official verifier suite to execute'
+        required: true
+        type: choice
+        options:
+          - preflight
+          - ocrbench
+          - mmmu
+          - ocr_mmmu
+          - beam_generate
+          - beam_judge
+          - deepswe_gate
+        default: ocr_mmmu
+      max_connections:
+        description: 'Concurrent benchmark requests; 1 is safest for a laptop'
+        required: true
+        default: '1'
+      beam_limit:
+        description: '0 = all 700 BEAM questions; >0 = bring-up only (never full parity)'
+        required: true
+        default: '0'
+      deepswe_score:
+        description: 'Pier/Kimi Code measured DeepSWE score for deepswe_gate only'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  official-verifier:
+    runs-on: [self-hosted, k3-full-checkpoint]
+    timeout-minutes: 7200
+    env:
+      K3_VENDOR_CHECKOUT: ${{ runner.temp }}/Kimi-Vendor-Verifier
+      K3_RESULT_DIR: ${{ runner.temp }}/k3-vendor-results
+      K3_BASE_URL: http://127.0.0.1:8000/v1
+      K3_API_KEY: local-only
+      K3_MODEL_NAME: kimi-k3-local
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate runner and exact checkpoint
+        if: ${{ inputs.suite != 'deepswe_gate' && inputs.suite != 'beam_judge' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${K3_MODEL_DIR:-}" && test -d "$K3_MODEL_DIR" || {
+            echo 'K3_MODEL_DIR must point to the released full K3 checkpoint.' >&2; exit 2; }
+          test -n "${K3_TRUNK_DIR:-}" && test -d "$K3_TRUNK_DIR" || {
+            echo 'K3_TRUNK_DIR must point to the exact packed/lossless trunk.' >&2; exit 2; }
+          python3 - <<'PY'
+          import json, os
+          c=json.load(open(os.path.join(os.environ['K3_MODEL_DIR'],'config.json')))
+          assert c['num_hidden_layers']==93
+          assert c['hidden_size']==7168
+          assert c['num_experts']==896
+          assert c['num_experts_per_token']==16
+          print('RELEASED K3 CHECKPOINT SHAPE PASS')
+          PY
+          command -v git-lfs >/dev/null || command -v git >/dev/null
+
+      - name: Build exact C runtime and oracle
+        if: ${{ inputs.suite != 'deepswe_gate' && inputs.suite != 'beam_judge' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make -j"$(nproc)"
+          make test -j"$(nproc)"
+
+      - name: Create local K3 API environment
+        if: ${{ inputs.suite != 'deepswe_gate' && inputs.suite != 'beam_judge' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYBIN="${K3_PYTHON:-python3}"
+          "$PYBIN" - <<'PY'
+          import sys
+          assert sys.version_info >= (3, 12), sys.version
+          PY
+          VENV="$RUNNER_TEMP/k3-local-venv"
+          rm -rf "$VENV"
+          "$PYBIN" -m venv --system-site-packages "$VENV"
+          "$VENV/bin/python" -m pip install --upgrade pip
+          "$VENV/bin/python" -m pip install 'transformers==4.56.2' 'safetensors>=0.5' 'numpy>=1.26' 'Pillow>=10' 'tiktoken>=0.9'
+          "$VENV/bin/python" - <<'PY'
+          import torch, transformers
+          print('torch', torch.__version__, 'cuda', torch.cuda.is_available())
+          print('transformers', transformers.__version__)
+          PY
+          echo "K3_LOCAL_PY=$VENV/bin/python" >> "$GITHUB_ENV"
+
+      - name: Start exact localhost K3 service
+        if: ${{ inputs.suite != 'deepswe_gate' && inputs.suite != 'beam_judge' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$K3_RESULT_DIR"
+          THREADS="${K3_THREADS:-$(nproc)}"
+          EXTRA=()
+          if [ -n "${K3_DRAFT_TRUNK_DIR:-}" ]; then
+            test -d "$K3_DRAFT_TRUNK_DIR"
+            EXTRA+=(--draft-trunk "$K3_DRAFT_TRUNK_DIR")
+            EXTRA+=(--draft-trunk-gb "${K3_DRAFT_TRUNK_GB:-32}")
+            EXTRA+=(--draft-topk "${K3_DRAFT_TOPK:-4}")
+            EXTRA+=(--spec "${K3_SPEC:-8}")
+          fi
+          nohup "$K3_LOCAL_PY" local/k3_local.py serve \
+            --model-dir "$K3_MODEL_DIR" \
+            --trunk "$K3_TRUNK_DIR" \
+            --preset "${K3_PRESET:-laptop}" \
+            --threads "$THREADS" \
+            --worker-context 1048576 \
+            --vision-device "${K3_VISION_DEVICE:-auto}" \
+            --vision-attention "${K3_VISION_ATTENTION:-auto}" \
+            "${EXTRA[@]}" \
+            >"$K3_RESULT_DIR/server.log" 2>&1 &
+          PID=$!
+          echo "K3_SERVER_PID=$PID" >> "$GITHUB_ENV"
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null; then
+              echo "LOCAL K3 SERVICE READY pid=$PID threads=$THREADS"
+              exit 0
+            fi
+            if ! kill -0 "$PID" 2>/dev/null; then
+              cat "$K3_RESULT_DIR/server.log" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          cat "$K3_RESULT_DIR/server.log" >&2
+          exit 1
+
+      - name: Checkout exact Moonshot Vendor Verifier commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$K3_RESULT_DIR"
+          python3 benchmarks/k3_vendor_verifier.py prepare "$K3_VENDOR_CHECKOUT"
+
+      - name: Install pinned Vendor Verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYBIN="${K3_PYTHON:-python3}"
+          VENV="$RUNNER_TEMP/k3-vendor-venv"
+          rm -rf "$VENV"
+          "$PYBIN" -m venv "$VENV"
+          "$VENV/bin/python" -m pip install --upgrade pip
+          "$VENV/bin/python" -m pip install -e "$K3_VENDOR_CHECKOUT"
+          echo "K3_VENDOR_PY=$VENV/bin/python" >> "$GITHUB_ENV"
+
+      - name: Moonshot API preflight
+        if: ${{ inputs.suite == 'preflight' || inputs.suite == 'ocrbench' || inputs.suite == 'mmmu' || inputs.suite == 'ocr_mmmu' || inputs.suite == 'beam_generate' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$K3_VENDOR_PY" benchmarks/k3_vendor_verifier.py preflight "$K3_VENDOR_CHECKOUT" \
+            --base-url "$K3_BASE_URL" --api-key "$K3_API_KEY" --model "$K3_MODEL_NAME" --jobs 1
+
+      - name: Official OCRBench K3 Max gate
+        if: ${{ inputs.suite == 'ocrbench' || inputs.suite == 'ocr_mmmu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$K3_VENDOR_PY" benchmarks/k3_vendor_verifier.py inspect "$K3_VENDOR_CHECKOUT" ocrbench \
+            --base-url "$K3_BASE_URL" --api-key "$K3_API_KEY" --model "$K3_MODEL_NAME" \
+            --max-connections '${{ inputs.max_connections }}' \
+            --log-dir "$K3_RESULT_DIR/ocr-inspect" --result "$K3_RESULT_DIR/ocrbench.json"
+
+      - name: Official MMMU Pro Vision K3 Max gate
+        if: ${{ inputs.suite == 'mmmu' || inputs.suite == 'ocr_mmmu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$K3_VENDOR_PY" benchmarks/k3_vendor_verifier.py inspect "$K3_VENDOR_CHECKOUT" mmmu \
+            --base-url "$K3_BASE_URL" --api-key "$K3_API_KEY" --model "$K3_MODEL_NAME" \
+            --max-connections '${{ inputs.max_connections }}' \
+            --log-dir "$K3_RESULT_DIR/mmmu-inspect" --result "$K3_RESULT_DIR/mmmu.json"
+
+      - name: Official BEAM 1M generation
+        if: ${{ inputs.suite == 'beam_generate' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          LIMIT='${{ inputs.beam_limit }}'
+          "$K3_VENDOR_PY" benchmarks/k3_vendor_verifier.py beam-generate "$K3_VENDOR_CHECKOUT" \
+            --base-url "$K3_BASE_URL" --api-key "$K3_API_KEY" --model "$K3_MODEL_NAME" \
+            --tokenizer "$K3_MODEL_DIR" --concurrency '${{ inputs.max_connections }}' \
+            --limit "$LIMIT" --output "$K3_RESULT_DIR/beam_answers.jsonl"
+          if [ "$LIMIT" != 0 ]; then
+            echo 'Partial BEAM generation completed; this is intentionally NOT a parity score.'
+          fi
+
+      - name: Official BEAM judge and target gate
+        if: ${{ inputs.suite == 'beam_judge' }}
+        shell: bash
+        env:
+          JUDGE_BASE_URL: ${{ secrets.K3_BEAM_JUDGE_BASE_URL }}
+          JUDGE_API_KEY: ${{ secrets.K3_BEAM_JUDGE_API_KEY }}
+          JUDGE_MODEL: ${{ secrets.K3_BEAM_JUDGE_MODEL }}
+        run: |
+          set -euo pipefail
+          test -n "$JUDGE_BASE_URL" && test -n "$JUDGE_API_KEY" && test -n "$JUDGE_MODEL" || {
+            echo 'Configure K3_BEAM_JUDGE_BASE_URL/API_KEY/MODEL repository secrets.' >&2; exit 2; }
+          test -n "${K3_BEAM_ANSWERS:-}" && test -f "$K3_BEAM_ANSWERS" || {
+            echo 'K3_BEAM_ANSWERS must point to a full 700-item official generation file.' >&2; exit 2; }
+          "$K3_VENDOR_PY" benchmarks/k3_vendor_verifier.py beam-judge "$K3_VENDOR_CHECKOUT" \
+            --answers "$K3_BEAM_ANSWERS" --output "$K3_RESULT_DIR/beam_judged.jsonl" \
+            --judge-base-url "$JUDGE_BASE_URL" --judge-api-key "$JUDGE_API_KEY" \
+            --judge-model "$JUDGE_MODEL" --concurrency '${{ inputs.max_connections }}'
+
+      - name: Official DeepSWE Pier score gate
+        if: ${{ inputs.suite == 'deepswe_gate' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCORE='${{ inputs.deepswe_score }}'
+          test -n "$SCORE" || {
+            echo 'Provide the score measured by the official Pier + Kimi Code DeepSWE run.' >&2; exit 2; }
+          "$K3_VENDOR_PY" benchmarks/k3_vendor_verifier.py deepswe-gate "$SCORE"
+
+      - name: Stop local K3 service
+        if: ${{ always() && inputs.suite != 'deepswe_gate' && inputs.suite != 'beam_judge' }}
+        shell: bash
+        run: |
+          if [ -n "${K3_SERVER_PID:-}" ]; then kill "$K3_SERVER_PID" 2>/dev/null || true; fi
+
+      - name: Publish verifier evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: k3-official-vendor-verifier-${{ inputs.suite }}
+          path: ${{ runner.temp }}/k3-vendor-results
+          if-no-files-found: warn
