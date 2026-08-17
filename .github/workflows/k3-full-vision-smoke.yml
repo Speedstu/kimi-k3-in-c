@@ -1,0 +1,55 @@
+name: K3 full-checkpoint vision smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Vision smoke device (cpu is slowest but most conservative)'
+        required: true
+        default: 'cpu'
+      attention:
+        description: 'Official K3 attention implementation'
+        required: true
+        default: 'eager'
+
+permissions:
+  contents: read
+
+jobs:
+  full-vision:
+    runs-on: [self-hosted, k3-full-checkpoint]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - name: Refuse incomplete full-checkpoint runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${K3_MODEL_DIR:-}" && test -d "$K3_MODEL_DIR" || {
+            echo 'K3_MODEL_DIR must point to the released full K3 checkpoint.' >&2
+            exit 2
+          }
+          test -f "$K3_MODEL_DIR/model.safetensors.index.json"
+          test -f "$K3_MODEL_DIR/config.json"
+      - name: Create isolated official K3 vision environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          VENV="${RUNNER_TEMP}/k3-vision-venv"
+          rm -rf "$VENV"
+          python3 -m venv "$VENV"
+          "$VENV/bin/python" -m pip install --upgrade pip
+          "$VENV/bin/python" -m pip install \
+            'torch>=2.6' 'transformers==4.56.2' 'safetensors>=0.5' \
+            'numpy>=1.26' 'Pillow>=10' 'tiktoken>=0.9'
+          echo "K3_VISION_PY=${VENV}/bin/python" >> "$GITHUB_ENV"
+      - name: Load released MoonViT/projector and process deterministic image
+        shell: bash
+        env:
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
+        run: |
+          set -euo pipefail
+          "$K3_VISION_PY" benchmarks/k3_full_vision_smoke.py "$K3_MODEL_DIR" \
+            --device '${{ inputs.device }}' \
+            --attention '${{ inputs.attention }}'
