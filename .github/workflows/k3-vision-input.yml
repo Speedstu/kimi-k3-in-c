@@ -35,7 +35,7 @@ jobs:
       - name: Build exact tiny fixture and media sidecar
         run: |
           set -euo pipefail
-          python -m pip install --quiet numpy torch safetensors --index-url https://download.pytorch.org/whl/cpu || true
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install --quiet numpy safetensors
           rm -rf /tmp/k3mm /tmp/k3mm-trunk /tmp/k3mm-q4 /tmp/k3mm-out
           mkdir -p /tmp/k3mm-out
@@ -105,7 +105,7 @@ jobs:
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config user.email '41898282+Speedstu@users.noreply.github.com'
           git add src/cli/k3_run.c src/cli/k3_worker.c
           git commit -m 'feat: add exact mixed text-media prefill path' || true
           git fetch origin "${{ github.ref_name }}"
