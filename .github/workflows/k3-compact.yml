@@ -22,12 +22,14 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install small research-tool dependencies
-        run: python -m pip install --quiet numpy ruff
+        run: |
+          python -m pip install --quiet numpy ruff
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
       - name: Lint and Python unit gates
         run: |
           set -euo pipefail
-          ruff check compact/ tests/python/test_k3_compact.py tests/python/test_k3_compact_q3.py --output-format=github
-          python -m compileall -q compact/ tests/python/test_k3_compact.py tests/python/test_k3_compact_q3.py
+          ruff check compact/ tests/python/test_k3_compact*.py --output-format=github
+          python -m compileall -q compact/ tests/python/test_k3_compact*.py
           python -m unittest discover -s tests/python -p 'test_k3_compact*.py' -v
       - name: Portable Q3 C kernel contract
         run: |
