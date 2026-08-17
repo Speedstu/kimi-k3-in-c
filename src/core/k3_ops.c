@@ -922,6 +922,14 @@ static void k3_matmul_mxfp4_batch(float *y, int ystride,
                                    const unsigned char *scales,
                                    int in, int rows, int group);
 
+#if defined(__AVX2__)
+static void k3_matmul_mxfp4_batch_xd(float *y, int ystride,
+                                      const double *const *xs, int batch,
+                                      const unsigned char *packed,
+                                      const unsigned char *scales,
+                                      int in, int rows, int group);
+#endif
+
 void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                     int T, int *idx, float *wt, float *scratch)
 {
@@ -1039,6 +1047,26 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         bedn = bact + (size_t)T * I;             /* [T][Ll]  */
     }
 
+#if defined(__AVX2__)
+    /* The exact batch kernel otherwise repeats float->double conversion for every
+     * output row and every MXFP4 group. The chunk latents are reused by many experts,
+     * so widen them once. `bactd` is reused expert-by-expert after SiTU. Released K3
+     * needs at most 64*(3584+3072)*8 ~= 3.25 MiB here. */
+    static int no_prefill_batch_xdouble = -1;
+    if (no_prefill_batch_xdouble < 0)
+        no_prefill_batch_xdouble = getenv("K3_NO_PREFILL_BATCH_XDOUBLE") ? 1 : 0;
+    double *xdbuf = NULL, *zzd = NULL, *bactd = NULL;
+    if (bbuf && !no_prefill_batch_xdouble) {
+        const size_t xdn = (size_t)T * ((size_t)Ll + I);
+        xdbuf = (double *)malloc(xdn * sizeof(double));
+        if (!xdbuf)
+            k3_fatal_oom("MoE prefill batched MXFP4 xdouble", xdn * sizeof(double));
+        zzd = xdbuf;                              /* [T][Ll] */
+        bactd = zzd + (size_t)T * Ll;            /* [T][I]  */
+        for (size_t i = 0; i < (size_t)T * Ll; i++) zzd[i] = (double)zz[i];
+    }
+#endif
+
     static int no_prefill_pipeline = -1;
     if (no_prefill_pipeline < 0)
         no_prefill_pipeline = getenv("K3_NO_PREFILL_PIPELINE") ? 1 : 0;
@@ -1119,20 +1147,52 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             } else {
                 const float *xp[K3_PREFILL_BATCH_MAX];
                 const float *ap[K3_PREFILL_BATCH_MAX];
-                for (int b = 0; b < nb; b++) xp[b] = zz + (size_t)bt[b] * Ll;
+#if defined(__AVX2__)
+                const double *xpd[K3_PREFILL_BATCH_MAX];
+                const double *apd[K3_PREFILL_BATCH_MAX];
+#endif
+                for (int b = 0; b < nb; b++) {
+                    xp[b] = zz + (size_t)bt[b] * Ll;
+#if defined(__AVX2__)
+                    if (xdbuf) xpd[b] = zzd + (size_t)bt[b] * Ll;
+#endif
+                }
 
-                k3_matmul_mxfp4_batch(bgu, 2 * I, xp, nb,
-                                      q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
-                k3_matmul_mxfp4_batch(bgu + I, 2 * I, xp, nb,
-                                      q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
+#if defined(__AVX2__)
+                if (xdbuf) {
+                    k3_matmul_mxfp4_batch_xd(bgu, 2 * I, xpd, nb,
+                                             q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
+                    k3_matmul_mxfp4_batch_xd(bgu + I, 2 * I, xpd, nb,
+                                             q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
+                } else
+#endif
+                {
+                    k3_matmul_mxfp4_batch(bgu, 2 * I, xp, nb,
+                                          q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
+                    k3_matmul_mxfp4_batch(bgu + I, 2 * I, xp, nb,
+                                          q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
+                }
                 for (int b = 0; b < nb; b++) {
                     float *ab = bact + (size_t)b * I;
                     k3_situ_glu(ab, bgu + (size_t)b * 2 * I,
                                 I, c->situ_b1, c->situ_b2);
                     ap[b] = ab;
+#if defined(__AVX2__)
+                    if (xdbuf) {
+                        double *abd = bactd + (size_t)b * I;
+                        for (int i = 0; i < I; i++) abd[i] = (double)ab[i];
+                        apd[b] = abd;
+                    }
+#endif
                 }
-                k3_matmul_mxfp4_batch(bedn, Ll, ap, nb,
-                                      q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
+#if defined(__AVX2__)
+                if (xdbuf)
+                    k3_matmul_mxfp4_batch_xd(bedn, Ll, apd, nb,
+                                             q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
+                else
+#endif
+                    k3_matmul_mxfp4_batch(bedn, Ll, ap, nb,
+                                          q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
                 for (int b = 0; b < nb; b++)
                     memcpy(contrib + ((size_t)bt[b] * K + bj[b]) * Ll,
                            bedn + (size_t)b * Ll, (size_t)Ll * sizeof(float));
@@ -1148,6 +1208,10 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
 
     /* Routed MXFP4 batch scratch is dead before the dense BF16 tail. Releasing it here
      * keeps the exact prefill optimization essentially flat in peak RSS. */
+#if defined(__AVX2__)
+    free(xdbuf);
+    xdbuf = NULL;
+#endif
     free(bbuf);
     bbuf = NULL;
 
@@ -2263,11 +2327,11 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
     }
 }
 
-#if defined(__AVX2__) && defined(K3_TEST_INTERNALS)
-/* Candidate for prompt prefill only: same exact batched MXFP4 arithmetic as
- * k3_matmul_mxfp4_batch, but the caller has already widened every activation from
- * float to double once. This removes cvtps2pd from every row/group replay while still
- * decoding each packed weight group only once across the activation batch. */
+#if defined(__AVX2__)
+/* Exact prompt-prefill companion to k3_matmul_mxfp4_batch. The caller has already
+ * widened every activation from float to double once, eliminating repeated cvtps2pd
+ * while preserving the float-batch kernel's per-token FMA lanes, group order, scale
+ * accumulation and final float rounding exactly. */
 static void k3_matmul_mxfp4_batch_xd(float *y, int ystride,
                                       const double *const *xs, int batch,
                                       const unsigned char *packed,
@@ -2345,6 +2409,7 @@ static void k3_matmul_mxfp4_batch_xd(float *y, int ystride,
     }
 }
 
+#ifdef K3_TEST_INTERNALS
 void k3_test_matmul_mxfp4_batch_xd(float *y, int ystride,
                                     const double *const *xs, int batch,
                                     const unsigned char *packed,
@@ -2360,6 +2425,7 @@ void k3_test_matmul_mxfp4_batch_float(float *y, int ystride,
                                        const unsigned char *packed,
                                        const unsigned char *scales,
                                        int in, int rows, int group);
+#endif
 #endif
 
 /* Batched exact MXFP4 matvec for prompt prefill.
