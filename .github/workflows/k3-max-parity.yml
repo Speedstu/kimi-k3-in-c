@@ -1,0 +1,225 @@
+name: K3 Max parity integration
+
+on:
+  push:
+    branches: [speedboost/k3-max-parity]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Apply pending exact transforms
+        run: |
+          set -euo pipefail
+          python tools/patch_greedy_spec32.py
+          python tools/patch_k3_max_parity.py
+
+      - name: Lint bridge, manifests and score gate
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet ruff
+          ruff check local/ tests/python/ benchmarks/k3_score_gate.py tools/patch_greedy_spec32.py tools/patch_k3_max_parity.py --output-format=github
+          python -m compileall -q local/ tests/python/ benchmarks/k3_score_gate.py
+          python -m unittest discover -s tests/python -p 'test_*.py' -v
+          python - <<'PY'
+          import json, tomllib
+          ref=json.load(open('benchmarks/k3_max_reference.json'))
+          assert ref['model_context']==1048576
+          assert ref['vendor_verifier_max_output_tokens']==98304
+          assert ref['sampling']=={
+              'reasoning_effort':'max','temperature':1.0,
+              'single_step_top_p':0.95,'agentic_top_p':1.0,
+              'preserve_thinking':True,
+          }
+          expected={
+              'local/kimi-code-local.toml.example':4096,
+              'local/kimi-code-benchmark.toml.example':98304,
+          }
+          for path, out in expected.items():
+              cfg=tomllib.load(open(path,'rb'))
+              model=cfg['models'][cfg['default_model']]
+              assert model['max_context_size']==1048576
+              assert model['max_output_size']==out
+              assert cfg['thinking']=={'enabled':True,'effort':'max','keep':'all'}
+          print('K3 profile manifest PASS')
+          PY
+
+      - name: Score gate is fail closed
+        run: |
+          set -euo pipefail
+          cp benchmarks/k3_max_reference.json /tmp/measured.json
+          python benchmarks/k3_score_gate.py /tmp/measured.json
+          python - <<'PY'
+          import json
+          p='/tmp/measured.json'; x=json.load(open(p)); del x['scores']['coding']['DeepSWE']
+          open('/tmp/incomplete.json','w').write(json.dumps(x))
+          PY
+          if python benchmarks/k3_score_gate.py /tmp/incomplete.json; then
+            echo 'score gate incorrectly accepted missing benchmark' >&2
+            exit 1
+          fi
+          python benchmarks/k3_score_gate.py /tmp/incomplete.json --allow-missing
+
+      - name: Strict AVX2 build and full weightless oracle
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build exact tiny checkpoint
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3max /tmp/k3max-trunk /tmp/k3max-out
+          mkdir -p /tmp/k3max-out
+          python tools/make_tiny_checkpoint.py /tmp/k3max --seed 2100 --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3max/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3max /tmp/k3max-trunk "$NLAYERS"
+
+      - name: Greedy spec16 really exceeds width 8 and stays token exact
+        run: |
+          set -euo pipefail
+          B='/tmp/k3max --trunk /tmp/k3max-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6,8,10,12,14 --gen 40 --incremental --threads 1 --temperature 0'
+          D='--draft-trunk /tmp/k3max-trunk --draft-trunk-gb 0.05 --draft-topk 2'
+          ./bin/k3 $B --out /tmp/k3max-out/serial.json >/tmp/k3max-out/serial.log 2>&1
+          ./bin/k3 $B $D --spec 16 --out /tmp/k3max-out/spec16.json >/tmp/k3max-out/spec16.log 2>&1
+          python - <<'PY'
+          import json,re
+          a=json.load(open('/tmp/k3max-out/serial.json')); b=json.load(open('/tmp/k3max-out/spec16.json'))
+          assert a['generated_ids']==b['generated_ids'] and a['full_ids']==b['full_ids']
+          log=open('/tmp/k3max-out/spec16.log').read()
+          m=re.search(r'speculative peak proposed width: (\d+)',log)
+          assert m and 8 < int(m.group(1)) <= 16, (m.group(1) if m else log[-1000:])
+          print('GREEDY SPEC16 EXACT PASS peak',m.group(1))
+          PY
+
+      - name: Sampled spec16 retains historical spec8 seeded stream
+        run: |
+          set -euo pipefail
+          B='/tmp/k3max --trunk /tmp/k3max-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids 3,7,11,5,9,2,4,6 --gen 20 --incremental --threads 1 --temperature 1 --top-p 0.95 --seed 424242'
+          D='--draft-trunk /tmp/k3max-trunk --draft-trunk-gb 0.05 --draft-topk 2'
+          ./bin/k3 $B $D --spec 8 --out /tmp/k3max-out/s8.json >/tmp/k3max-out/s8.log 2>&1
+          ./bin/k3 $B $D --spec 16 --out /tmp/k3max-out/s16.json >/tmp/k3max-out/s16.log 2>&1
+          python - <<'PY'
+          import json
+          a=json.load(open('/tmp/k3max-out/s8.json')); b=json.load(open('/tmp/k3max-out/s16.json'))
+          assert a['generated_ids']==b['generated_ids'] and a['full_ids']==b['full_ids']
+          print('SAMPLED SPEC16 CAP8 SEEDED PARITY PASS')
+          PY
+
+      - name: Resident worker accepts output budgets beyond legacy 4096
+        run: |
+          set -euo pipefail
+          ./bin/k3 /tmp/k3max --trunk /tmp/k3max-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --ids 3,7,11,5,9 --gen 1 --incremental --temperature 0 --out /tmp/k3max-out/one.json >/dev/null
+          STOP=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3max-out/one.json'))['generated_ids'][0])
+          PY
+          )
+          printf 'REQ 77 5 4097 0 1 1 %s\n3 7 11 5 9\nQUIT\n' "$STOP" | \
+            ./bin/k3-worker /tmp/k3max --trunk /tmp/k3max-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+              --context 5000 --threads 1 >/tmp/k3max-out/worker-long.log 2>&1
+          grep -q '^@K3TOKEN 77 ' /tmp/k3max-out/worker-long.log
+          grep -q '^@K3DONE 77 1 ' /tmp/k3max-out/worker-long.log
+          ! grep -q '^@K3ERROR 77 ' /tmp/k3max-out/worker-long.log
+          echo 'RESIDENT >4096 OUTPUT BUDGET PASS'
+
+      - name: Resident sampled spec16 matches sampled cap8 one-shot
+        run: |
+          set -euo pipefail
+          printf 'REQ 88 8 20 1 0.95 424242 -1\n3 7 11 5 9 2 4 6\nQUIT\n' | \
+            ./bin/k3-worker /tmp/k3max --trunk /tmp/k3max-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+              --context 64 --threads 1 --draft-trunk /tmp/k3max-trunk --draft-trunk-gb 0.05 \
+              --draft-topk 2 --spec 16 >/tmp/k3max-out/worker-s16.log 2>&1
+          python - <<'PY'
+          import json
+          expected=json.load(open('/tmp/k3max-out/s8.json'))['generated_ids']
+          got=[]
+          for line in open('/tmp/k3max-out/worker-s16.log'):
+              if line.startswith('@K3TOKEN 88 '): got.append(int(line.split()[2]))
+          assert got==expected,(got,expected)
+          print('RESIDENT SAMPLED CAP8 SEEDED PARITY PASS')
+          PY
+
+      - name: Persist validated implementation
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/cli/k3_run.c src/cli/k3_worker.c local/k3_local.py local/kimi-code-benchmark.toml.example local/README.md tests/python/test_local_bridge.py .github/workflows/local-parity.yml benchmarks/
+          git commit -m 'feat: remove artificial K3 Max reasoning ceiling with exact parity' || true
+          rm -f tools/patch_greedy_spec32.py tools/patch_k3_max_parity.py .github/workflows/greedy-spec32.yml
+          cat > .github/workflows/k3-max-parity.yml <<'YAML'
+          name: K3 Max parity gate
+          on:
+            workflow_dispatch:
+            pull_request:
+              paths:
+                - 'src/cli/k3_run.c'
+                - 'src/cli/k3_worker.c'
+                - 'local/**'
+                - 'benchmarks/k3_max_reference.json'
+                - 'benchmarks/k3_score_gate.py'
+                - 'tests/python/**'
+                - '.github/workflows/k3-max-parity.yml'
+          permissions:
+            contents: read
+          jobs:
+            parity:
+              runs-on: ubuntu-latest
+              timeout-minutes: 35
+              steps:
+                - uses: actions/checkout@v7
+                - uses: actions/setup-python@v7
+                  with:
+                    python-version: '3.12'
+                - name: Bridge/profile/score gates
+                  run: |
+                    set -euo pipefail
+                    python -m pip install --quiet ruff
+                    ruff check local/ tests/python/ benchmarks/k3_score_gate.py --output-format=github
+                    python -m unittest discover -s tests/python -p 'test_*.py' -v
+                    cp benchmarks/k3_max_reference.json /tmp/measured.json
+                    python benchmarks/k3_score_gate.py /tmp/measured.json
+                - name: Strict model oracle
+                  run: |
+                    set -euo pipefail
+                    sudo apt-get update -qq
+                    sudo apt-get install -y --no-install-recommends libomp-dev
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+                - name: Static K3 Max parity invariants
+                  run: |
+                    set -euo pipefail
+                    grep -q '#define K3_SPEC_SAMPLE_MAX 8' src/cli/k3_run.c
+                    grep -q '#define K3_SPEC_MAX 32' src/cli/k3_run.c
+                    grep -q 'request_spec_n = K3_SPEC_SAMPLE_MAX' src/cli/k3_worker.c
+                    ! grep -q 'gen > K3_MAX_GEN) bad = 1' src/cli/k3_worker.c
+                    grep -q 'max_output_size = 98304' local/kimi-code-benchmark.toml.example
+          YAML
+          git add -A
+          git commit -m 'ci: make K3 Max parity gate permanent' || true
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
