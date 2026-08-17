@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 
 from local.k3_local import (
-    BackendConfig, LocalK3, ResidentCBackend, _auto_worker_budgets,
+    BackendConfig, LocalK3, _auto_worker_budgets,
     _is_loopback_host, parse_xtml,
 )
 
