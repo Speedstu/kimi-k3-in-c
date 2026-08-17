@@ -1,0 +1,163 @@
+name: Long-suffix speculation parity
+
+on:
+  push:
+    branches: [speedboost/long-suffix-spec]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Stage confidence-gated long-suffix drafter
+        run: python tools/patch_long_suffix_spec.py
+
+      - name: Strict AVX2 build and full oracle
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Build long-context-match tiny fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3long /tmp/k3long-trunk /tmp/k3long-out
+          mkdir -p /tmp/k3long-out
+          # The final 12-token suffix occurred once as a whole, while its last four
+          # tokens also occurred with a conflicting continuation. Legacy 4/3 matching
+          # therefore has weak/ambiguous evidence; the long-suffix path has one strong
+          # 12-token historical match to propose from.
+          IDS='3,7,11,13,17,19,23,29,31,37,41,43,5,6,7,8,31,37,41,43,9,10,12,14,3,7,11,13,17,19,23,29,31,37,41,43'
+          python tools/make_tiny_checkpoint.py /tmp/k3long --seed 2701 --prompt-ids "$IDS"
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3long/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3long /tmp/k3long-trunk "$NLAYERS"
+          echo "$IDS" >/tmp/k3long-out/ids.txt
+
+      - name: Long-suffix proposals remain exact-model authoritative
+        run: |
+          set -euo pipefail
+          D=/tmp/k3long-out
+          BASE='/tmp/k3long --trunk /tmp/k3long-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids-file /tmp/k3long-out/ids.txt --gen 20 --incremental --threads 1 --temperature 0'
+          ./bin/k3 $BASE --out "$D/serial.json" >"$D/serial.log" 2>&1
+          ./bin/k3 $BASE --spec 32 --out "$D/spec.json" >"$D/spec.log" 2>&1
+          python - <<'PY'
+          import json,re
+          a=json.load(open('/tmp/k3long-out/serial.json'))
+          b=json.load(open('/tmp/k3long-out/spec.json'))
+          assert b['generated_ids']==a['generated_ids'], (a['generated_ids'],b['generated_ids'])
+          assert b['full_ids']==a['full_ids']
+          log=open('/tmp/k3long-out/spec.log').read()
+          m=re.search(r'long-suffix ngram: (\d+) rounds, (\d+) proposed, max matched context (\d+) tokens',log)
+          assert m, log[-4000:]
+          rounds, proposed, match=map(int,m.groups())
+          assert rounds>0 and proposed>0 and match>=8, (rounds,proposed,match)
+          print('LONG-SUFFIX EXACT PARITY PASS',{'rounds':rounds,'proposed':proposed,'max_match':match})
+          PY
+
+      - name: Sampling source path stays legacy-only
+        run: |
+          set -euo pipefail
+          # This is a structural gate in addition to the repository's sampled-spec
+          # token/RNG parity workflow: long matching must remain greedy-only.
+          grep -q 'temperature <= 0.0' src/cli/k3_run.c
+          grep -q 'if (allow_long)' src/cli/k3_run.c
+          ./bin/k3 /tmp/k3long --trunk /tmp/k3long-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --ids 3,7,11,13,17,19,23,29 --gen 8 --incremental --threads 1 \
+            --temperature 1 --top-p 0.95 --seed 12345 --spec 8 \
+            --out /tmp/k3long-out/sample.json >/tmp/k3long-out/sample.log 2>&1
+          ! grep -q 'long-suffix ngram:' /tmp/k3long-out/sample.log
+          echo 'SAMPLED LONG-SUFFIX BYPASS: PASS'
+
+      - name: Persist validated source and permanent gate
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/cli/k3_run.c
+          git commit -m 'perf: draft long repeated suffixes for exact greedy verification'
+          rm tools/patch_long_suffix_spec.py
+          cat > .github/workflows/long-suffix-spec-parity.yml <<'YAML'
+          name: Long-suffix speculation parity
+          on:
+            workflow_dispatch:
+            pull_request:
+              paths:
+                - 'src/cli/k3_run.c'
+                - '.github/workflows/long-suffix-spec-parity.yml'
+          permissions:
+            contents: read
+          jobs:
+            exactness:
+              runs-on: ubuntu-latest
+              timeout-minutes: 40
+              steps:
+                - uses: actions/checkout@v7
+                - uses: actions/setup-python@v7
+                  with:
+                    python-version: '3.12'
+                - name: Strict AVX2 build and full oracle
+                  run: |
+                    set -euo pipefail
+                    sudo apt-get update -qq
+                    sudo apt-get install -y --no-install-recommends libomp-dev
+                    make clean
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+                    make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+                - name: Greedy long suffix is exercised and token-exact
+                  run: |
+                    set -euo pipefail
+                    python -m pip install --quiet numpy
+                    python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+                    rm -rf /tmp/k3long /tmp/k3long-trunk /tmp/k3long-out
+                    mkdir -p /tmp/k3long-out
+                    IDS='3,7,11,13,17,19,23,29,31,37,41,43,5,6,7,8,31,37,41,43,9,10,12,14,3,7,11,13,17,19,23,29,31,37,41,43'
+                    python tools/make_tiny_checkpoint.py /tmp/k3long --seed 2701 --prompt-ids "$IDS"
+                    NLAYERS=$(python - <<'PY'
+                    import json
+                    print(json.load(open('/tmp/k3long/config.json'))['num_hidden_layers'])
+                    PY
+                    )
+                    python tools/pack_trunk.py /tmp/k3long /tmp/k3long-trunk "$NLAYERS"
+                    echo "$IDS" >/tmp/k3long-out/ids.txt
+                    BASE='/tmp/k3long --trunk /tmp/k3long-trunk --trunk-gb 0.05 --cache-gb 0.01 --ids-file /tmp/k3long-out/ids.txt --gen 20 --incremental --threads 1 --temperature 0'
+                    ./bin/k3 $BASE --out /tmp/k3long-out/serial.json >/tmp/k3long-out/serial.log 2>&1
+                    ./bin/k3 $BASE --spec 32 --out /tmp/k3long-out/spec.json >/tmp/k3long-out/spec.log 2>&1
+                    python - <<'PY'
+                    import json,re
+                    a=json.load(open('/tmp/k3long-out/serial.json')); b=json.load(open('/tmp/k3long-out/spec.json'))
+                    assert a['generated_ids']==b['generated_ids'] and a['full_ids']==b['full_ids']
+                    log=open('/tmp/k3long-out/spec.log').read()
+                    m=re.search(r'long-suffix ngram: (\d+) rounds, (\d+) proposed, max matched context (\d+) tokens',log)
+                    assert m and int(m.group(1))>0 and int(m.group(2))>0 and int(m.group(3))>=8
+                    print('LONG-SUFFIX SPEC EXACT PARITY PASS',m.groups())
+                    PY
+                - name: Sampling cannot enter long matcher
+                  run: |
+                    grep -q 'temperature <= 0.0' src/cli/k3_run.c
+                    grep -q 'if (allow_long)' src/cli/k3_run.c
+          YAML
+          git add -A
+          git commit -m 'ci: make long-suffix exactness gate permanent'
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
