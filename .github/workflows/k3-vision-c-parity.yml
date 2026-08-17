@@ -1,0 +1,74 @@
+name: K3 mixed-prefill parity
+
+on:
+  push:
+    branches: [speedboost/k3-vision-input]
+  pull_request:
+    paths:
+      - 'src/cli/k3_run.c'
+      - 'src/cli/k3_worker.c'
+      - '.github/workflows/k3-vision-c-parity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Strict build and language-model oracle
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+      - name: Exact mixed-embedding fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy safetensors
+          rm -rf /tmp/k3mm /tmp/k3mm-trunk /tmp/k3mm-out
+          mkdir -p /tmp/k3mm-out
+          python tools/make_tiny_checkpoint.py /tmp/k3mm --seed 2600 --prompt-ids 3,7,11,6,5,9
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3mm/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3mm /tmp/k3mm-trunk "$NLAYERS"
+          python - <<'PY'
+          import struct
+          from safetensors.numpy import load_file
+          w=load_file('/tmp/k3mm/model.safetensors')['language_model.model.embed_tokens.weight']
+          rows=w[[11,6]].astype('<f4')
+          with open('/tmp/k3mm-out/media.bin','wb') as f:
+              f.write(struct.pack('<8sIIII', b'K3MMF1\0',1,rows.shape[1],1,0))
+              f.write(struct.pack('<I',rows.shape[0])); f.write(rows.tobytes())
+          PY
+          BASE='/tmp/k3mm --trunk /tmp/k3mm-trunk --trunk-gb 0.05 --cache-gb 0.01 --context 64 --threads 1'
+          printf 'REQ 1 6 8 0 1 1 -1\n3 7 11 6 5 9\nQUIT\n' | ./bin/k3-worker $BASE >/tmp/k3mm-out/text.log 2>&1
+          printf 'REQMM 2 5 8 0 1 1 -1 15 /tmp/k3mm-out/media.bin\n3 7 15 5 9\nQUIT\n' | ./bin/k3-worker $BASE >/tmp/k3mm-out/mm.log 2>&1
+          printf 'REQMM 3 5 8 0 1 1 -1 15 /tmp/k3mm-out/media.bin\n3 7 15 5 9\nQUIT\n' | ./bin/k3-worker $BASE --draft-trunk /tmp/k3mm-trunk --draft-trunk-gb 0.05 --draft-topk 2 --spec 4 >/tmp/k3mm-out/draft.log 2>&1
+          python - <<'PY'
+          def toks(path,rid):
+              return [int(x.split()[2]) for x in open(path) if x.startswith(f'@K3TOKEN {rid} ')]
+          ref=toks('/tmp/k3mm-out/text.log',1)
+          assert len(ref)==8
+          assert toks('/tmp/k3mm-out/mm.log',2)==ref
+          assert toks('/tmp/k3mm-out/draft.log',3)==ref
+          print('K3 MIXED PREFILL EXACT PARITY PASS',ref)
+          PY
+      - name: Media protocol fails closed
+        run: |
+          set -euo pipefail
+          BASE='/tmp/k3mm --trunk /tmp/k3mm-trunk --trunk-gb 0.05 --cache-gb 0.01 --context 64 --threads 1'
+          printf bad >/tmp/k3mm-out/bad.bin
+          printf 'REQMM 4 5 2 0 1 1 -1 15 /tmp/k3mm-out/bad.bin\n3 7 15 5 9\nQUIT\n' | ./bin/k3-worker $BASE >/tmp/k3mm-out/bad.log 2>&1
+          grep -q '^@K3ERROR 4 2' /tmp/k3mm-out/bad.log
