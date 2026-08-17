@@ -1,0 +1,65 @@
+name: K3 Compact full-train preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_cuda_devices:
+        description: 'Minimum CUDA devices required on the training runner'
+        required: true
+        default: '1'
+        type: string
+      min_free_output_gb:
+        description: 'Minimum free output storage in decimal GB'
+        required: true
+        default: '250'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    # This label is intentionally distinct from the full-checkpoint inference runner.
+    # Register a real training host/cluster gateway with this label before dispatching.
+    runs-on: [self-hosted, k3-compact-train]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install preflight dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          # Torch is optional only when min_cuda_devices=0. Real training preflight normally
+          # requires it so GPU count is measured instead of guessed.
+          if [ "${{ inputs.min_cuda_devices }}" != "0" ]; then
+            python -m pip install --quiet torch
+          fi
+      - name: Refuse missing runner inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${K3_MODEL_DIR:?Set K3_MODEL_DIR on the self-hosted runner}"
+          : "${K3_COMPACT_TRAIN_MANIFEST:?Set K3_COMPACT_TRAIN_MANIFEST on the self-hosted runner}"
+          : "${K3_COMPACT_HELDOUT_HASHES:?Set K3_COMPACT_HELDOUT_HASHES on the self-hosted runner}"
+          : "${K3_COMPACT_OUTPUT_DIR:?Set K3_COMPACT_OUTPUT_DIR on the self-hosted runner}"
+          test -d "$K3_MODEL_DIR"
+          test -f "$K3_COMPACT_TRAIN_MANIFEST"
+          test -f "$K3_COMPACT_HELDOUT_HASHES"
+      - name: Full teacher/data/storage/GPU preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          MIN_FREE=$(( ${{ inputs.min_free_output_gb }} * 1000000000 ))
+          python compact/full_train_preflight.py \
+            --min-cuda-devices '${{ inputs.min_cuda_devices }}' \
+            --min-free-output-bytes "$MIN_FREE" \
+            --json-out k3-compact-preflight.json
+      - name: Upload immutable preflight evidence
+        uses: actions/upload-artifact@v6
+        with:
+          name: k3-compact-full-train-preflight
+          path: k3-compact-preflight.json
+          if-no-files-found: error
