@@ -126,16 +126,19 @@ int main(void)
 #ifdef _OPENMP
     printf("threads=%d\n", omp_get_max_threads());
 #endif
+    /* Projection families not covered by the first two sweeps. Together with those
+     * earlier shapes this covers every distinct released-K3 BF16 prefill geometry. */
     static const struct Shape shapes[] = {
-        {"moe-down",    7168,  3584},
-        {"moe-up",      3584,  7168},
-        {"shared-up",   7168,  6144},
-        {"mla-qb",      1536, 18432},
-        {"mla-kvb",      512, 24576},
-        {"kda-main",    7168, 12288},
-        {"dense-down", 33792,  7168},
+        {"mla-qa",       7168,  1536},
+        {"mla-kva",      7168,   576},
+        {"mla-kda-out", 12288,  7168},
+        {"shared-down",  6144,  7168},
+        {"kda-b",        7168,    96},
+        {"kda-fa",       7168,   128},
+        {"kda-fb",        128, 12288},
+        {"dense-up",     7168, 33792},
     };
-    const int batches[] = {16, 32, 64};
+    const int batches[] = {32, 64};
     for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
         for (size_t bi = 0; bi < sizeof(batches) / sizeof(batches[0]); bi++) {
             rs = 0xa53c9e17u ^ (uint32_t)(si * 0x9e3779b9u) ^ (uint32_t)batches[bi];
