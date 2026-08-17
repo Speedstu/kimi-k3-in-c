@@ -1,0 +1,82 @@
+name: Prefill batch xdouble parity
+
+on:
+  push:
+    branches: [speedboost/prefill-batch-xdouble]
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_prefill_batch_xdouble.c'
+      - '.github/workflows/prefill-batch-xdouble-parity.yml'
+  pull_request:
+    paths:
+      - 'src/core/k3_ops.c'
+      - 'benchmarks/bench_prefill_batch_xdouble.c'
+      - '.github/workflows/prefill-batch-xdouble-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exactness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Strict AVX2 build and full regression suite
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+
+      - name: Production-shape helper is bit-identical
+        run: |
+          set -euo pipefail
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off -DK3_TEST_INTERNALS -Iinclude -Iinclude/k3 -c src/core/k3_ops.c -o /tmp/k3_ops_test.o
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off benchmarks/bench_prefill_batch_xdouble.c /tmp/k3_ops_test.o -o /tmp/prefill_batch_xd -lm -fopenmp -pthread
+          OMP_NUM_THREADS=1 /tmp/prefill_batch_xd | tee /tmp/xd-1.log
+          OMP_NUM_THREADS=4 /tmp/prefill_batch_xd | tee /tmp/xd-4.log
+          grep -q 'PREFILL BATCH XDOUBLE EXACTNESS PASS' /tmp/xd-1.log
+          grep -q 'PREFILL BATCH XDOUBLE EXACTNESS PASS' /tmp/xd-4.log
+
+      - name: Generate streamed duplicate-expert tiny K3
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3-bxd /tmp/k3-bxd-trunk /tmp/k3-bxd-out
+          mkdir -p /tmp/k3-bxd-out
+          python tools/make_tiny_checkpoint.py /tmp/k3-bxd --seed 1234 \
+            --num-experts 80 --topk 16 \
+            --prompt-ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3-bxd/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3-bxd /tmp/k3-bxd-trunk "$NLAYERS"
+
+      - name: Float batch vs xdouble batch are end-to-end identical
+        run: |
+          set -euo pipefail
+          D=/tmp/k3-bxd-out
+          COMMON='/tmp/k3-bxd --trunk /tmp/k3-bxd-trunk --trunk-gb 0.05 --cache-gb 0.0004 --ids 3,7,11,5,9,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --gen 1 --incremental --threads 1 --temperature 0'
+          K3_NO_PREFILL_BATCH_XDOUBLE=1 ./bin/k3 $COMMON --dump-logits "$D/float.logits" --out "$D/float.json" >"$D/float.log" 2>&1
+          ./bin/k3 $COMMON --dump-logits "$D/xdouble.logits" --out "$D/xdouble.json" >"$D/xdouble.log" 2>&1
+          cmp "$D/float.logits" "$D/xdouble.logits"
+          python3 - <<'PY'
+          import json
+          d='/tmp/k3-bxd-out'
+          a=json.load(open(d+'/float.json'))
+          b=json.load(open(d+'/xdouble.json'))
+          assert a['generated_ids'] == b['generated_ids'], (a['generated_ids'], b['generated_ids'])
+          assert a['full_ids'] == b['full_ids']
+          print('prefill batch xdouble exact ids:', a['generated_ids'])
+          PY
+          echo 'PREFILL BATCH XDOUBLE END-TO-END PARITY PASS'
