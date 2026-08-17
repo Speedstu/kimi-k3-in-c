@@ -71,6 +71,7 @@ jobs:
           from pathlib import Path
           manifest=Path('/tmp/k3d7-lossless/trunk.json')
           x=json.load(open(manifest))
+          rawman=json.load(open('/tmp/k3d7-raw/trunk.json'))
           codecs=[b['codec'] for L in x['layers'] for b in L['blocks']]
           stored=sum(int(b['stored_nbytes']) for L in x['layers'] for b in L['blocks'])
           raw_size=os.path.getsize('/tmp/k3d7-raw/trunk.bin')
@@ -83,13 +84,17 @@ jobs:
           if 'dict7' not in codecs:
               spec=importlib.util.spec_from_file_location('lt',Path('tools/lossless_trunk.py'))
               lt=importlib.util.module_from_spec(spec); spec.loader.exec_module(lt)
-              b=x['layers'][0]['blocks'][0]
+              layer_index=0
+              b=x['layers'][layer_index]['blocks'][0]
+              src_layer=rawman['layers'][layer_index]
               with open('/tmp/k3d7-raw/trunk.bin','rb') as f:
-                  f.seek(int(b['raw_offset'])); raw=f.read(int(b['raw_nbytes']))
+                  f.seek(int(src_layer['file_off']) + int(b['raw_off']))
+                  raw=f.read(int(b['raw_nbytes']))
+              assert len(raw)==int(b['raw_nbytes'])
               payload,dictionary,escapes=lt.encode_block_dict7(raw)
               assert lt.align_up(len(payload)) <= int(b['stored_nbytes'])
               with open('/tmp/k3d7-lossless/trunk.bin','r+b') as f:
-                  f.seek(int(b['file_offset'])); f.write(payload)
+                  f.seek(int(b['file_off'])); f.write(payload)
                   f.write(b'\0'*(int(b['stored_nbytes'])-len(payload)))
               b['codec']='dict7'; b['encoded_nbytes']=len(payload)
               b['dict']=dictionary; b['escapes']=escapes
