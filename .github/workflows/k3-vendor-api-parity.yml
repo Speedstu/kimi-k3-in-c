@@ -1,0 +1,54 @@
+name: K3 vendor API parity
+
+on:
+  push:
+    branches: [speedboost/k3-official-verifier]
+  pull_request:
+    paths:
+      - 'local/k3_local.py'
+      - 'local/k3_vision.py'
+      - 'tests/python/**'
+      - 'benchmarks/k3_vendor_verifier_contract.json'
+      - 'benchmarks/k3_vendor_verifier.py'
+      - '.github/workflows/k3-vendor-api-parity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Local API and orchestrator regression suite
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy ruff
+          ruff check local/ tests/python/ benchmarks/k3_vendor_verifier.py --output-format=github
+          python -m compileall -q local/ tests/python/ benchmarks/k3_vendor_verifier.py
+          python -m unittest discover -s tests/python -p 'test_*.py' -v
+      - name: Pinned Vendor Verifier contract is internally consistent
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          x=json.load(open('benchmarks/k3_vendor_verifier_contract.json'))
+          assert x['schema']==1
+          assert x['upstream']['commit']=='3dad65a760a8867cda72f6dd8848d876a4e851b4'
+          assert x['local_endpoint']['base_url']=='http://127.0.0.1:8000/v1'
+          assert x['k3_max']=={
+              'thinking':True,'keep':'all','reasoning_effort':'max',
+              'temperature':1.0,'top_p':0.95,
+          }
+          assert x['official_targets']=={
+              'OCRBench':0.89,
+              'MMMU Pro Vision':0.82,
+              'BEAM (1M)':0.31,
+              'DeepSWE':0.675,
+          }
+          print('PINNED K3 VENDOR CONTRACT PASS')
+          PY

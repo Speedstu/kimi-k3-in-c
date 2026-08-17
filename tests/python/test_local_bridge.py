@@ -12,13 +12,17 @@ class FakeTokenizer:
     def __init__(self):
         self.render_call = None
 
-    def render(self, messages, tools, effort, tool_choice=None, response_format=None):
+    def render(
+        self, messages, tools, effort, tool_choice=None, response_format=None,
+        thinking_enabled=True,
+    ):
         self.render_call = {
             "messages": messages,
             "tools": tools,
             "effort": effort,
             "tool_choice": tool_choice,
             "response_format": response_format,
+            "thinking_enabled": thinking_enabled,
         }
         return [10, 11, 12]
 
@@ -75,15 +79,29 @@ class LocalBridgeTests(unittest.TestCase):
         self.assertEqual(result["choices"][0]["message"]["content"], "done")
         self.assertEqual(result["choices"][0]["finish_reason"], "stop")
 
-    def test_always_thinking_cannot_be_disabled(self):
+    def test_non_thinking_uses_official_template_switch_and_temperature(self):
         k3 = self.make_k3()
-        with self.assertRaisesRegex(ValueError, "always-thinking"):
-            k3.complete(
-                {
-                    "messages": [{"role": "user", "content": "x"}],
-                    "thinking": {"type": "disabled"},
-                }
-            )
+        result = k3.complete(
+            {
+                "messages": [{"role": "user", "content": "x"}],
+                "thinking": {"type": "disabled"},
+                "temperature": 0.6,
+                "top_p": 0.95,
+            }
+        )
+        self.assertFalse(k3.tokenizer.render_call["thinking_enabled"])
+        self.assertIsNotNone(result["choices"][0]["message"])
+
+    def test_vendor_sampling_constraints_fail_closed(self):
+        k3 = self.make_k3()
+        base = {"messages": [{"role": "user", "content": "x"}]}
+        for bad in (-0.1, 1.1, 2.0):
+            with self.assertRaisesRegex(ValueError, "temperature"):
+                k3._prepare({**base, "temperature": bad})
+        with self.assertRaisesRegex(ValueError, "top_p"):
+            k3._prepare({**base, "top_p": 0.8})
+        with self.assertRaisesRegex(ValueError, "temperature"):
+            k3._prepare({**base, "thinking": {"type": "disabled"}, "temperature": 1.0})
 
     def test_media_requires_resident_worker_not_silent_drop(self):
         k3 = self.make_k3()

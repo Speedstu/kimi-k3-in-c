@@ -270,15 +270,17 @@ class LocalTokenizer:
         reasoning_effort: str,
         tool_choice: Any = None,
         response_format: Any = None,
+        thinking_enabled: bool = True,
     ) -> list[int]:
         kwargs: dict[str, Any] = {
             "tokenize": True,
             "add_generation_prompt": True,
-            "thinking": True,
+            "thinking": thinking_enabled,
+        }
+        if thinking_enabled:
             # The local K3 encoder names this template kwarg thinking_effort.  The
             # compatible HTTP field remains reasoning_effort.
-            "thinking_effort": reasoning_effort,
-        }
+            kwargs["thinking_effort"] = reasoning_effort
         if tools is not None:
             kwargs["tools"] = tools
         if tool_choice is not None:
@@ -910,18 +912,22 @@ class LocalK3:
             )
 
         thinking = request.get("thinking")
+        thinking_enabled = True
         if isinstance(thinking, dict):
-            if thinking.get("type") == "disabled":
-                raise ValueError(
-                    "K3 is an always-thinking model; local parity mode cannot disable thinking"
-                )
+            thinking_type = thinking.get("type", "enabled")
+            if thinking_type not in {"enabled", "disabled"}:
+                raise ValueError("thinking.type must be enabled or disabled")
+            thinking_enabled = thinking_type != "disabled"
+            # Moonshot's current K3 contract gives thinking.effort precedence when both
+            # extension fields are present; reasoning_effort applies when effort is absent.
             effort = thinking.get("effort", request.get("reasoning_effort", "max"))
         else:
             effort = request.get("reasoning_effort", "max")
         if effort not in {"low", "high", "max"}:
             raise ValueError("thinking effort must be low, high, or max")
 
-        temperature = float(request.get("temperature", 1.0))
+        default_temperature = 1.0 if thinking_enabled else 0.6
+        temperature = float(request.get("temperature", default_temperature))
         top_p = float(request.get("top_p", 1.0))
         max_tokens = int(
             request.get("max_tokens", request.get("max_completion_tokens", 4096))
@@ -929,10 +935,16 @@ class LocalK3:
         seed = int(request.get("seed", 1))
         if max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
-        if temperature < 0.0:
-            raise ValueError("temperature must be >= 0")
-        if not 0.0 < top_p <= 1.0:
-            raise ValueError("top_p must be in (0,1]")
+        if thinking_enabled:
+            if not 0.0 <= temperature <= 1.0:
+                raise ValueError("thinking temperature must be in [0,1]")
+        elif temperature != 0.6:
+            raise ValueError("non-thinking K3 temperature is fixed at 0.6")
+        # The official verifier requires 0.95 and the K3 agentic recipe uses 1.0.
+        # Reject unrelated nucleus values rather than silently accepting a non-reference
+        # sampling policy.
+        if top_p not in {0.95, 1.0}:
+            raise ValueError("K3 top_p must be 0.95 or 1.0")
         if int(request.get("n", 1)) != 1:
             raise ValueError("the local K3 backend currently supports n=1 only")
         if request.get("stop") not in (None, [], ""):
@@ -951,6 +963,7 @@ class LocalK3:
                 reasoning_effort=effort,
                 tool_choice=request.get("tool_choice"),
                 response_format=request.get("response_format"),
+                thinking_enabled=thinking_enabled,
             )
             prompt_ids = vision.input_ids
             prompt_positions = vision.prompt_positions
@@ -963,6 +976,7 @@ class LocalK3:
                 effort,
                 request.get("tool_choice"),
                 request.get("response_format"),
+                thinking_enabled=thinking_enabled,
             )
             prompt_positions = len(prompt_ids)
         backend_context = getattr(self.backend, "context", None)
@@ -989,6 +1003,7 @@ class LocalK3:
             "prompt_positions": prompt_positions,
             "media_features": media_features,
             "media_placeholder": media_placeholder,
+            "thinking_enabled": thinking_enabled,
         }
 
     def _result(
