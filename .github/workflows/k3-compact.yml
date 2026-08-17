@@ -1,0 +1,64 @@
+name: K3 Compact specialist gates
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'compact/**'
+      - 'tests/python/test_k3_compact.py'
+      - '.github/workflows/k3-compact.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  compact-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install small research-tool dependencies
+        run: python -m pip install --quiet numpy ruff
+      - name: Lint and unit gates
+        run: |
+          set -euo pipefail
+          ruff check compact/ tests/python/test_k3_compact.py --output-format=github
+          python -m compileall -q compact/ tests/python/test_k3_compact.py
+          python -m unittest discover -s tests/python -p 'test_k3_compact.py' -v
+      - name: Enforce sub-100GB architecture envelope
+        run: |
+          set -euo pipefail
+          python compact/plan.py --json | tee /tmp/k3-compact-plan.json
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/k3-compact-plan.json'))
+          assert x['fits_checkpoint_budget'] is True
+          assert x['estimated_checkpoint_gb'] < 100.0
+          assert x['active_params_b'] < x['teacher_active_params_b']
+          print('K3-COMPACT ARCHITECTURE CONTRACT PASS')
+          PY
+      - name: Synthetic 896-to-48 expert-reduction smoke
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import numpy as np
+          rng=np.random.default_rng(11)
+          base=rng.normal(size=(48,64))
+          sketches=np.vstack([base[i % 48] + rng.normal(0,0.02,64) for i in range(896)])
+          usage=rng.integers(1,10000,size=896).astype(np.float64)
+          np.savez('/tmp/k3-expert-sketch.npz', sketches=sketches, usage=usage)
+          PY
+          python compact/expert_cluster.py /tmp/k3-expert-sketch.npz --k 48 --out /tmp/k3-clusters.json
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/k3-clusters.json'))
+          assert x['teacher_experts'] == 896
+          assert x['student_experts'] == 48
+          assert len(x['mapping']) == 896
+          assert len(x['clusters']) == 48
+          assert all(c['teacher_members'] for c in x['clusters'])
+          print('K3-COMPACT EXPERT REDUCTION CONTRACT PASS')
+          PY
