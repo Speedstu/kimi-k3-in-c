@@ -75,12 +75,12 @@ jobs:
           codecs=[b['codec'] for L in x['layers'] for b in L['blocks']]
           stored=sum(int(b['stored_nbytes']) for L in x['layers'] for b in L['blocks'])
           raw_size=os.path.getsize('/tmp/k3d7-raw/trunk.bin')
+          # Production adaptive selection is still independently gated to never spend
+          # more physical O_DIRECT bytes than raw. The forced integration block below is
+          # a fixture-only append so dict7 runtime dispatch is exercised even when this
+          # tiny random layer legitimately prefers dict15.
           assert stored <= raw_size, (stored,raw_size,codecs)
           assert set(codecs) <= {'raw','dict15','dict7'}
-          # Tiny layers often round dict15 and dict7 to the same 4K physical page. In that
-          # case the adaptive encoder correctly chooses faster dict15. Force one exact
-          # dict7 payload into the same allocation so the integration test exercises the
-          # real parser -> O_DIRECT -> dict7 decode -> matmul -> generated-token path.
           if 'dict7' not in codecs:
               spec=importlib.util.spec_from_file_location('lt',Path('tools/lossless_trunk.py'))
               lt=importlib.util.module_from_spec(spec); spec.loader.exec_module(lt)
@@ -92,17 +92,21 @@ jobs:
                   raw=f.read(int(b['raw_nbytes']))
               assert len(raw)==int(b['raw_nbytes'])
               payload,dictionary,escapes=lt.encode_block_dict7(raw)
-              assert lt.align_up(len(payload)) <= int(b['stored_nbytes'])
-              with open('/tmp/k3d7-lossless/trunk.bin','r+b') as f:
-                  f.seek(int(b['file_off'])); f.write(payload)
-                  f.write(b'\0'*(int(b['stored_nbytes'])-len(payload)))
+              alloc=lt.align_up(len(payload))
+              trunk=Path('/tmp/k3d7-lossless/trunk.bin')
+              with trunk.open('r+b') as f:
+                  f.seek(0, os.SEEK_END)
+                  off=lt.align_up(f.tell())
+                  if off > f.tell(): f.write(b'\0'*(off-f.tell()))
+                  f.write(payload); f.write(b'\0'*(alloc-len(payload)))
+              b['file_off']=off; b['stored_nbytes']=alloc
               b['codec']='dict7'; b['encoded_nbytes']=len(payload)
               b['dict']=dictionary; b['escapes']=escapes
               manifest.write_text(json.dumps(x,indent=2)+'\n')
               codecs=[bb['codec'] for L in x['layers'] for bb in L['blocks']]
           assert 'dict7' in codecs
           print('TINY ADAPTIVE CODECS', {k:codecs.count(k) for k in sorted(set(codecs))},
-                'stored/raw',stored,raw_size)
+                'adaptive-stored/raw',stored,raw_size)
           PY
           BASE='/tmp/k3d7 --cache-gb 0.01 --trunk-gb 0.05 --ids 3,7,11,13,17,19,23,29,31,37,41,43 --gen 12 --incremental --threads 1 --temperature 0'
           ./bin/k3 $BASE --trunk /tmp/k3d7-raw --out /tmp/k3d7-out/raw.json >/tmp/k3d7-out/raw.log 2>&1
