@@ -1,18 +1,25 @@
 import unittest
 
 import numpy as np
-import torch
 
 from compact.q3 import pack_matrix, row_bytes, unpack_matrix
-from compact.qat import (
-    Q3WeightQAT,
-    estimated_matrix_bytes,
-    fake_quant_q3,
-    initial_group_scales,
-    physical_bits_per_weight,
-)
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
+
+if torch is not None:
+    from compact.qat import (
+        Q3WeightQAT,
+        estimated_matrix_bytes,
+        fake_quant_q3,
+        initial_group_scales,
+        physical_bits_per_weight,
+    )
 
 
+@unittest.skipUnless(torch is not None, "Q3 QAT tests require PyTorch")
 class K3CompactQATTests(unittest.TestCase):
     def test_initial_fake_quant_matches_reference_exporter(self):
         rng = np.random.default_rng(91)
