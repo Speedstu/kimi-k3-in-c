@@ -5,7 +5,8 @@ on:
   pull_request:
     paths:
       - 'compact/**'
-      - 'tests/python/test_k3_compact.py'
+      - 'tests/python/test_k3_compact*.py'
+      - 'tests/unit/test_compact_q3.c'
       - '.github/workflows/k3-compact.yml'
 
 permissions:
@@ -22,12 +23,17 @@ jobs:
           python-version: '3.12'
       - name: Install small research-tool dependencies
         run: python -m pip install --quiet numpy ruff
-      - name: Lint and unit gates
+      - name: Lint and Python unit gates
         run: |
           set -euo pipefail
-          ruff check compact/ tests/python/test_k3_compact.py --output-format=github
-          python -m compileall -q compact/ tests/python/test_k3_compact.py
-          python -m unittest discover -s tests/python -p 'test_k3_compact.py' -v
+          ruff check compact/ tests/python/test_k3_compact.py tests/python/test_k3_compact_q3.py --output-format=github
+          python -m compileall -q compact/ tests/python/test_k3_compact.py tests/python/test_k3_compact_q3.py
+          python -m unittest discover -s tests/python -p 'test_k3_compact*.py' -v
+      - name: Portable Q3 C kernel contract
+        run: |
+          set -euo pipefail
+          cc -O2 -std=c99 -Wall -Wextra -Werror tests/unit/test_compact_q3.c -o /tmp/test_compact_q3 -lm
+          /tmp/test_compact_q3
       - name: Enforce sub-100GB architecture envelope
         run: |
           set -euo pipefail
@@ -38,6 +44,7 @@ jobs:
           assert x['fits_checkpoint_budget'] is True
           assert x['estimated_checkpoint_gb'] < 100.0
           assert x['active_params_b'] < x['teacher_active_params_b']
+          assert abs(x['effective_bits_per_weight'] - 3.125) < 1e-12
           print('K3-COMPACT ARCHITECTURE CONTRACT PASS')
           PY
       - name: Synthetic 896-to-48 expert-reduction smoke
