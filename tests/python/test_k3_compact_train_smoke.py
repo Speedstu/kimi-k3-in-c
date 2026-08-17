@@ -1,7 +1,7 @@
 import unittest
 
 try:
-    import torch  # noqa: F401
+    import torch
 except ModuleNotFoundError:
     torch = None
 
