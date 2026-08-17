@@ -1,0 +1,28 @@
+head=d747261c1d0a48283a1eb0c489e7ee1ede2e7c52
+=== OMP_NUM_THREADS=1 ===
+threads=1
+w1+w3 batch=2 float=6.139ms xdouble=5.678ms speedup=1.0812x
+w2 batch=2 float=3.076ms xdouble=2.608ms speedup=1.1795x
+w1+w3 batch=4 float=10.986ms xdouble=10.702ms speedup=1.0265x
+w2 batch=4 float=5.533ms xdouble=4.904ms speedup=1.1282x
+w1+w3 batch=8 float=18.743ms xdouble=19.696ms speedup=0.9516x
+w2 batch=8 float=11.206ms xdouble=11.033ms speedup=1.0157x
+PREFILL BATCH XDOUBLE EXACTNESS PASS
+=== OMP_NUM_THREADS=2 ===
+threads=2
+w1+w3 batch=2 float=3.600ms xdouble=3.224ms speedup=1.1168x
+w2 batch=2 float=1.755ms xdouble=1.498ms speedup=1.1718x
+w1+w3 batch=4 float=5.494ms xdouble=4.930ms speedup=1.1145x
+w2 batch=4 float=2.781ms xdouble=2.461ms speedup=1.1299x
+w1+w3 batch=8 float=9.429ms xdouble=9.452ms speedup=0.9976x
+w2 batch=8 float=5.036ms xdouble=4.784ms speedup=1.0526x
+PREFILL BATCH XDOUBLE EXACTNESS PASS
+=== OMP_NUM_THREADS=4 ===
+threads=4
+w1+w3 batch=2 float=2.940ms xdouble=2.754ms speedup=1.0676x
+w2 batch=2 float=1.475ms xdouble=1.300ms speedup=1.1341x
+w1+w3 batch=4 float=5.052ms xdouble=4.495ms speedup=1.1240x
+w2 batch=4 float=2.555ms xdouble=2.254ms speedup=1.1336x
+w1+w3 batch=8 float=8.922ms xdouble=7.429ms speedup=1.2010x
+w2 batch=8 float=4.442ms xdouble=3.509ms speedup=1.2657x
+PREFILL BATCH XDOUBLE EXACTNESS PASS
