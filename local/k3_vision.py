@@ -250,12 +250,14 @@ class K3VisionEncoder:
         reasoning_effort: str,
         tool_choice: Any = None,
         response_format: Any = None,
+        thinking_enabled: bool = True,
     ) -> VisionPrepared:
         kwargs: dict[str, Any] = {
             "add_generation_prompt": True,
-            "thinking": True,
-            "thinking_effort": reasoning_effort,
+            "thinking": thinking_enabled,
         }
+        if thinking_enabled:
+            kwargs["thinking_effort"] = reasoning_effort
         if tools is not None:
             kwargs["tools"] = tools
         if tool_choice is not None:
