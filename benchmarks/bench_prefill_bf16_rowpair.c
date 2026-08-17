@@ -8,8 +8,8 @@
 #include <omp.h>
 #endif
 
-#define MAXB 8
-#define REPS 5
+#define MAXB 64
+#define REPS 3
 
 extern void k3_test_matmul_bf16_batch_float(float *y, int ystride,
                                              const float *const *xs, int batch,
@@ -135,7 +135,7 @@ int main(void)
         {"kda-main",    7168, 12288},
         {"dense-down", 33792,  7168},
     };
-    const int batches[] = {2, 4, 8};
+    const int batches[] = {16, 32, 64};
     for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
         for (size_t bi = 0; bi < sizeof(batches) / sizeof(batches[0]); bi++) {
             rs = 0xa53c9e17u ^ (uint32_t)(si * 0x9e3779b9u) ^ (uint32_t)batches[bi];
