@@ -1,0 +1,94 @@
+name: K3 full-checkpoint benchmark gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      categories:
+        description: 'Comma-separated score categories to gate'
+        required: true
+        default: 'reasoning_knowledge,coding,agentic,vision'
+      tolerance:
+        description: 'Allowed absolute score deficit (0 = no regression)'
+        required: true
+        default: '0'
+
+# This workflow intentionally requires a self-hosted runner carrying the released full K3
+# checkpoint and the official benchmark harnesses. Hosted runners cannot truthfully prove
+# parity for a 1.56 TB checkpoint. A runner earns this label only after the operator has
+# installed the checkpoint/harness bundle and a `k3-max-benchmark` executable on PATH.
+# The executable must run the requested official suites against this repository's local
+# endpoint and write machine-readable results to $K3_BENCH_RESULTS.
+permissions:
+  contents: read
+
+jobs:
+  full-checkpoint:
+    runs-on: [self-hosted, k3-full-checkpoint]
+    timeout-minutes: 10080
+    env:
+      K3_BENCH_RESULTS: ${{ runner.temp }}/k3-max-results.json
+      K3_BENCH_CATEGORIES: ${{ inputs.categories }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Refuse incomplete benchmark runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v k3-max-benchmark >/dev/null || {
+            echo 'Missing k3-max-benchmark official-harness orchestrator on this self-hosted runner.' >&2
+            exit 2
+          }
+          test -n "${K3_MODEL_DIR:-}" && test -d "$K3_MODEL_DIR" || {
+            echo 'K3_MODEL_DIR must point to the released full K3 checkpoint.' >&2
+            exit 2
+          }
+          test -n "${K3_TRUNK_DIR:-}" && test -d "$K3_TRUNK_DIR" || {
+            echo 'K3_TRUNK_DIR must point to the exact packed trunk.' >&2
+            exit 2
+          }
+          python - <<'PY'
+          import json, os
+          cfg=json.load(open(os.path.join(os.environ['K3_MODEL_DIR'],'config.json')))
+          assert cfg['num_hidden_layers']==93, cfg.get('num_hidden_layers')
+          assert cfg['num_experts']==896, cfg.get('num_experts')
+          assert cfg['num_experts_per_tok']==16, cfg.get('num_experts_per_tok')
+          print('FULL CHECKPOINT SHAPE PASS')
+          PY
+
+      - name: Build exact local runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make -j"$(nproc)"
+          make test -j"$(nproc)"
+
+      - name: Execute official-harness benchmark bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "$K3_BENCH_RESULTS"
+          k3-max-benchmark \
+            --repo "$GITHUB_WORKSPACE" \
+            --model "$K3_MODEL_DIR" \
+            --trunk "$K3_TRUNK_DIR" \
+            --categories "$K3_BENCH_CATEGORIES" \
+            --output "$K3_BENCH_RESULTS"
+          test -s "$K3_BENCH_RESULTS"
+
+      - name: Fail closed on any K3 Max score regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python benchmarks/k3_score_gate.py "$K3_BENCH_RESULTS" \
+            --categories "${{ inputs.categories }}" \
+            --tolerance "${{ inputs.tolerance }}"
+
+      - name: Publish measured scores
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: k3-max-full-checkpoint-results
+          path: ${{ runner.temp }}/k3-max-results.json
+          if-no-files-found: warn
