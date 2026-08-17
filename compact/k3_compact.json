@@ -1,0 +1,53 @@
+{
+  "name": "K3-Compact-Specialist",
+  "status": "research_target_not_yet_trained",
+  "goal": "Beat measured K3 Max on code, sandboxed-cyber/CTF, and agentic benchmarks while fitting in <= 100 GB.",
+  "teacher": {
+    "name": "Kimi K3 Max",
+    "routed_layers": 92,
+    "experts_per_layer": 896,
+    "top_k": 16,
+    "trunk_params": 56743648000,
+    "params_per_expert": 33030144
+  },
+  "student": {
+    "layers": 93,
+    "preserve_kda_mla_map": true,
+    "routed_layers": 92,
+    "experts_per_layer": 48,
+    "top_k": 4,
+    "preserve_tokenizer": true,
+    "preserve_vision_frontend": true,
+    "target_weight_bits": 3.0,
+    "scale_group_size": 128,
+    "scale_bits": 16,
+    "unquantized_reserve_gb": 8.0,
+    "packaging_reserve_gb": 2.0,
+    "max_checkpoint_gb": 100.0
+  },
+  "training": {
+    "domain_mix": {
+      "code": 0.4,
+      "agentic": 0.25,
+      "sandboxed_cyber_ctf_and_defense": 0.2,
+      "general_retention": 0.15
+    },
+    "phases": [
+      "teacher_router_trace_and_expert_sketch_collection",
+      "48_way_expert_cluster_and_medoid_initialization",
+      "expert_activation_distillation_with_trunk_frozen",
+      "full_model_logit_hidden_router_distillation",
+      "verifier_reward_training_on_code_terminal_and_sandboxed_ctf",
+      "three_bit_quantization_aware_training",
+      "held_out_k3_max_head_to_head_evaluation"
+    ],
+    "no_eval_contamination": true,
+    "cyber_scope": "isolated CTF, defensive analysis, patching, detection, and explicitly authorized lab tasks only"
+  },
+  "acceptance": {
+    "must_fit_checkpoint_gb": 100.0,
+    "must_beat_teacher_in_every_target_domain": true,
+    "must_not_claim_win_without_measured_teacher_and_student_scores": true,
+    "general_retention_relative_floor": 0.97
+  }
+}
