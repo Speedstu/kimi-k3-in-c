@@ -37,7 +37,7 @@ jobs:
           set -euo pipefail
           python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install --quiet numpy safetensors
-          rm -rf /tmp/k3mm /tmp/k3mm-trunk /tmp/k3mm-q4 /tmp/k3mm-out
+          rm -rf /tmp/k3mm /tmp/k3mm-trunk /tmp/k3mm-out
           mkdir -p /tmp/k3mm-out
           python tools/make_tiny_checkpoint.py /tmp/k3mm --seed 2600 --prompt-ids 3,7,11,6,5,9
           NLAYERS=$(python - <<'PY'
@@ -46,7 +46,6 @@ jobs:
           PY
           )
           python tools/pack_trunk.py /tmp/k3mm /tmp/k3mm-trunk "$NLAYERS"
-          python tools/q4_trunk.py /tmp/k3mm-trunk /tmp/k3mm-q4
           python - <<'PY'
           import struct
           from safetensors.torch import load_file
@@ -80,7 +79,10 @@ jobs:
         run: |
           set -euo pipefail
           BASE='/tmp/k3mm --trunk /tmp/k3mm-trunk --trunk-gb 0.05 --cache-gb 0.01 --context 64 --threads 1'
-          DRAFT='--draft-trunk /tmp/k3mm-q4 --draft-trunk-gb 0.05 --draft-topk 2 --spec 4'
+          # Use the exact packed BF16 trunk as the proposal model in this boundary test.
+          # Q4 proposal arithmetic is parity-gated independently; here we only need to
+          # prove the mixed embedding prefill feeds target + draft identically.
+          DRAFT='--draft-trunk /tmp/k3mm-trunk --draft-trunk-gb 0.05 --draft-topk 2 --spec 4'
           printf 'REQMM 3 5 8 0 1 1 -1 15 /tmp/k3mm-out/media.bin\n3 7 15 5 9\nQUIT\n' | ./bin/k3-worker $BASE $DRAFT > /tmp/k3mm-out/mm-draft.log 2>&1
           python - <<'PY'
           def toks(path,rid):
