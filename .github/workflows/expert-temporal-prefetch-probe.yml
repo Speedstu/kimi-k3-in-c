@@ -1,0 +1,29 @@
+name: Expert temporal prefetch probe
+
+on:
+  push:
+    branches: [speedboost/expert-temporal-prefetch-probe]
+    paths:
+      - 'tools/analyze_expert_temporal_prefetch.py'
+      - '.github/workflows/expert-temporal-prefetch-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Compile and replay real full-model expert trace
+        run: |
+          set -euo pipefail
+          python -m py_compile tools/analyze_expert_temporal_prefetch.py
+          python tools/analyze_expert_temporal_prefetch.py tests/fixtures/expert_trace.bin \
+            | tee /tmp/expert-temporal-prefetch.txt
+          grep -Eq 'HIGH-PRECISION CANDIDATE|NO >=90% PRECISION' /tmp/expert-temporal-prefetch.txt
