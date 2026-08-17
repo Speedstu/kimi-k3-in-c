@@ -17,7 +17,6 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
 #define K3C_Q3_GROUP 128
 
@@ -66,8 +65,7 @@ static inline void k3c_matmul_q3(float *y, const float *x, const void *W,
         int col = 0;
         while (col < in) {
             const int n = in - col < K3C_Q3_GROUP ? in - col : K3C_Q3_GROUP;
-            uint16_t sb = 0;
-            memcpy(&sb, p, sizeof sb);
+            const uint16_t sb = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
             p += 2;
             const float scale = k3c_bf16f(sb);
             const unsigned char *codes = p;
