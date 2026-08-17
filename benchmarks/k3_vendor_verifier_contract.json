@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "snapshot_date": "2026-08-17",
+  "upstream": {
+    "repository": "https://github.com/MoonshotAI/Kimi-Vendor-Verifier.git",
+    "commit": "3dad65a760a8867cda72f6dd8848d876a4e851b4"
+  },
+  "local_endpoint": {
+    "base_url": "http://127.0.0.1:8000/v1",
+    "model": "kimi-k3-local",
+    "think_mode": "kimi"
+  },
+  "k3_max": {
+    "thinking": true,
+    "keep": "all",
+    "reasoning_effort": "max",
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
+  "official_targets": {
+    "OCRBench": 0.89,
+    "MMMU Pro Vision": 0.82,
+    "BEAM (1M)": 0.31,
+    "DeepSWE": 0.675
+  },
+  "official_eval_parameters": {
+    "OCRBench": {
+      "max_tokens": 16384,
+      "epochs": 1
+    },
+    "MMMU Pro Vision": {
+      "max_tokens": 98304,
+      "epochs": 1
+    },
+    "BEAM (1M)": {
+      "context": 1048576
+    },
+    "DeepSWE": {
+      "tasks": 113,
+      "agent": "kimi-code>=0.23.6",
+      "platform": "Pier"
+    }
+  },
+  "preflight": [
+    "tests/params",
+    "tests/tool_call_json_schema",
+    "tests/k3_features",
+    "tests/prompt_tokens"
+  ],
+  "policy": {
+    "upstream_commit_mismatch": "fail",
+    "preflight_failure": "fail",
+    "missing_measured_score": "fail_for_requested_suite",
+    "score_below_moonshot_target": "fail",
+    "default_absolute_tolerance": 0.0,
+    "full_suite_claim_requires_all_four_targets": true
+  }
+}
