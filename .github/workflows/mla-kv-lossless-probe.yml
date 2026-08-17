@@ -1,0 +1,71 @@
+name: MLA KV lossless RAM probe
+
+on:
+  push:
+    branches: [speedboost/mla-kv-lossless-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Stage diagnostic and build exact engine
+        run: |
+          set -euo pipefail
+          python tools/patch_mla_kv_dump.py
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libomp-dev
+          make clean
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' -j2
+          make ARCH='-mavx2 -mfma' CFLAGS='-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -mavx2 -mfma -fopenmp -pthread -ffp-contract=off' test -j2
+      - name: Generate exact tiny K3 and dump expanded MLA cache bytes
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          rm -rf /tmp/k3kv /tmp/k3kv-trunk /tmp/k3kv-out
+          mkdir -p /tmp/k3kv-out
+          IDS=$(python - <<'PY'
+          print(','.join(str(3 + ((i*17) % 61)) for i in range(48)))
+          PY
+          )
+          python tools/make_tiny_checkpoint.py /tmp/k3kv --seed 2901 --prompt-ids "$IDS"
+          NLAYERS=$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/k3kv/config.json'))['num_hidden_layers'])
+          PY
+          )
+          python tools/pack_trunk.py /tmp/k3kv /tmp/k3kv-trunk "$NLAYERS"
+          rm -f /tmp/k3kv-out/kv.bin
+          K3_DUMP_MLA_KV=/tmp/k3kv-out/kv.bin ./bin/k3 /tmp/k3kv \
+            --trunk /tmp/k3kv-trunk --trunk-gb 0.05 --cache-gb 0.01 \
+            --ids "$IDS" --gen 24 --context 128 --incremental --threads 1 --temperature 0 \
+            --out /tmp/k3kv-out/run.json >/tmp/k3kv-out/run.log 2>&1
+          test -s /tmp/k3kv-out/kv.bin
+      - name: Compare lossless representations
+        run: |
+          set -euo pipefail
+          python benchmarks/analyze_mla_kv_dump.py /tmp/k3kv-out/kv.bin \
+            --json-out /tmp/k3kv-out/result.json | tee /tmp/k3kv-out/result.log
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/k3kv-out/result.json'))
+          assert x['rows'] > 20 and x['layers'] > 0
+          assert 0 < x['best_ratio'] <= 1.1
+          print('MLA KV LOSSLESS PROBE',x['best'],x['best_ratio'])
+          PY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mla-kv-lossless-probe
+          path: |
+            /tmp/k3kv-out/result.json
+            /tmp/k3kv-out/result.log
+            /tmp/k3kv-out/run.log
