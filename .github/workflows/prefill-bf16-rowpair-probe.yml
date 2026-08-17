@@ -35,11 +35,11 @@ jobs:
           set -euo pipefail
           : > /tmp/bf16-rowpair-results.txt
           echo "head=${GITHUB_SHA}" | tee -a /tmp/bf16-rowpair-results.txt
-          for n in 1 4; do
+          for n in 1 2 4; do
             echo "=== OMP_NUM_THREADS=$n ===" | tee -a /tmp/bf16-rowpair-results.txt
             OMP_NUM_THREADS=$n /tmp/bench_bf16_pair | tee -a /tmp/bf16-rowpair-results.txt
           done
-          test "$(grep -c 'PREFILL BF16 ROWPAIR EXACTNESS PASS' /tmp/bf16-rowpair-results.txt)" -eq 2
+          test "$(grep -c 'PREFILL BF16 ROWPAIR EXACTNESS PASS' /tmp/bf16-rowpair-results.txt)" -eq 3
       - name: Publish probe result
         run: |
           set -euo pipefail
