@@ -1,4 +1,4 @@
-name: K3 vision bridge parity
+name: K3 vision bridge staging
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   bridge:
@@ -18,11 +18,20 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Stage bridge transform
-        run: python tools/patch_k3_vision_bridge.py
-      - name: Unit gates
+      - name: Apply bridge and unit gates
         run: |
           set -euo pipefail
+          python tools/patch_k3_vision_bridge.py
           python -m pip install --quiet numpy
           python -m compileall -q local/ tests/python/
           python -m unittest discover -s tests/python -p 'test_*.py' -v
+      - name: Persist validated bridge
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add local/k3_local.py
+          git commit -m 'feat: route K3 image input through official vision frontend' || true
+          git fetch origin "${{ github.ref_name }}"
+          git rebase "origin/${{ github.ref_name }}"
+          git push origin HEAD:${{ github.ref_name }}
