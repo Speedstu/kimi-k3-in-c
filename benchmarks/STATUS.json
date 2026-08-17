@@ -4,10 +4,21 @@
   "sampled_spec": "seeded_cap8_parity_validated",
   "resident_output_over_4096": "validated",
   "public_k3_max_profile": "pinned",
-  "full_checkpoint_scores": "requires_self_hosted_full_checkpoint_run",
-  "vision_input_runtime": "image_boundary_exactness_validated",
-  "vision_official_frontend": "implemented_selective_moonvit_projector",
-  "vision_full_checkpoint_smoke": "requires_self_hosted_full_checkpoint_run",
-  "vision_scores": "requires_self_hosted_full_checkpoint_benchmark_run",
-  "video_audio": "unsupported_fail_closed"
+  "image_input_runtime": "exact_mixed_embedding_boundary_validated",
+  "image_official_frontend": "selective_released_moonvit_projector_implemented",
+  "released_processor_media_scope": "image_and_image_url_only",
+  "nonreleased_media_types": "fail_closed",
+  "moonshot_vendor_verifier": "pinned_at_3dad65a760a8867cda72f6dd8848d876a4e851b4",
+  "moonshot_vendor_api_contract": "validated_in_github_actions",
+  "moonshot_vendor_targets": {
+    "OCRBench": 0.89,
+    "MMMU Pro Vision": 0.82,
+    "BEAM (1M)": 0.31,
+    "DeepSWE": 0.675
+  },
+  "official_ocr_mmmu_scores": "requires_self_hosted_k3_full_checkpoint_run",
+  "official_beam_score": "requires_full_700_generation_plus_explicit_official_judge_phase",
+  "official_deepswe_score": "requires_official_pier_plus_kimi_code_run",
+  "full_public_score_table": "requires_external_full_checkpoint_benchmark_harnesses",
+  "claim_policy": "never_report_full_score_parity_without_measured_full_checkpoint_evidence"
 }
