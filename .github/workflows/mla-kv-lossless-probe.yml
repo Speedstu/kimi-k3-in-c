@@ -45,11 +45,15 @@ jobs:
           )
           python tools/pack_trunk.py /tmp/k3kv /tmp/k3kv-trunk "$NLAYERS"
           rm -f /tmp/k3kv-out/kv.bin
-          K3_DUMP_MLA_KV=/tmp/k3kv-out/kv.bin ./bin/k3 /tmp/k3kv \
+          if ! K3_DUMP_MLA_KV=/tmp/k3kv-out/kv.bin ./bin/k3 /tmp/k3kv \
             --trunk /tmp/k3kv-trunk --trunk-gb 0.05 --cache-gb 0.01 \
             --ids "$IDS" --gen 24 --context 128 --incremental --threads 1 --temperature 0 \
-            --out /tmp/k3kv-out/run.json >/tmp/k3kv-out/run.log 2>&1
-          test -s /tmp/k3kv-out/kv.bin
+            --out /tmp/k3kv-out/run.json >/tmp/k3kv-out/run.log 2>&1; then
+              echo '=== exact tiny K3 stderr/stdout ===' >&2
+              cat /tmp/k3kv-out/run.log >&2
+              exit 1
+          fi
+          test -s /tmp/k3kv-out/kv.bin || { cat /tmp/k3kv-out/run.log >&2; exit 1; }
       - name: Compare lossless representations
         run: |
           set -euo pipefail
@@ -63,9 +67,11 @@ jobs:
           print('MLA KV LOSSLESS PROBE',x['best'],x['best_ratio'])
           PY
       - uses: actions/upload-artifact@v6
+        if: always()
         with:
           name: mla-kv-lossless-probe
           path: |
             /tmp/k3kv-out/result.json
             /tmp/k3kv-out/result.log
             /tmp/k3kv-out/run.log
+          if-no-files-found: warn
