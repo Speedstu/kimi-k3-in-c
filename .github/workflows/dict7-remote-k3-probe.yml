@@ -1,0 +1,45 @@
+name: Dict7 released-K3 range probe
+
+on:
+  push:
+    branches: [speedboost/dict7-lossless-trunk]
+    paths:
+      - 'benchmarks/probe_remote_bf16_dict7.py'
+      - '.github/workflows/dict7-remote-k3-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install probe dependencies
+        run: python -m pip install --quiet numpy requests
+      - name: Sample released BF16 trunk tensors by HTTP ranges only
+        run: |
+          set -euo pipefail
+          python benchmarks/probe_remote_bf16_dict7.py \
+            --repo moonshotai/Kimi-K3 --revision main \
+            --samples 10 --sample-mib 2 \
+            --json-out /tmp/dict7-real-k3.json \
+            | tee /tmp/dict7-real-k3.log
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/dict7-real-k3.json'))
+          assert len(x['samples']) >= 4
+          assert 0 < x['median_adaptive_physical'] <= 1.0
+          print('REAL K3 RANGE RATIO',x['median_adaptive_physical'],'dict7 wins',x['dict7_wins'])
+          PY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dict7-released-k3-range-probe
+          path: |
+            /tmp/dict7-real-k3.json
+            /tmp/dict7-real-k3.log
