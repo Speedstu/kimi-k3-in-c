@@ -3,10 +3,20 @@ name: Adaptive dict7 lossless trunk
 on:
   push:
     branches: [speedboost/dict7-lossless-trunk]
+  pull_request:
+    paths:
+      - 'src/io/k3_codec.h'
+      - 'src/io/k3_trunk.c'
+      - 'src/io/k3_trunk.h'
+      - 'tools/lossless_trunk.py'
+      - 'tests/unit/test_trunk_codec.c'
+      - 'tests/python/test_lossless_trunk_dict7.py'
+      - 'benchmarks/bench_dict7_codec.c'
+      - '.github/workflows/dict7-lossless-trunk.yml'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   exactness:
@@ -14,14 +24,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.ref_name }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-
-      - name: Stage adaptive dict7 codec
-        run: python tools/patch_dict7_lossless.py
 
       - name: Python packing and adaptive-selection gates
         run: |
@@ -71,10 +76,10 @@ jobs:
           raw_size=os.path.getsize('/tmp/k3d7-raw/trunk.bin')
           assert stored <= raw_size, (stored,raw_size,codecs)
           assert set(codecs) <= {'raw','dict15','dict7'}
-          # Tiny layers round both compressed representations to one 4K page, so adaptive
-          # selection correctly prefers faster dict15 on ties. Force exactly one block to
-          # dict7 *without changing its physical allocation* to exercise manifest parsing,
-          # O_DIRECT read, runtime dispatch and exact reconstruction end-to-end.
+          # Tiny layers often round dict15 and dict7 to the same 4K physical page. In that
+          # case the adaptive encoder correctly chooses faster dict15. Force one exact
+          # dict7 payload into the same allocation so the integration test exercises the
+          # real parser -> O_DIRECT -> dict7 decode -> matmul -> generated-token path.
           if 'dict7' not in codecs:
               spec=importlib.util.spec_from_file_location('lt',Path('tools/lossless_trunk.py'))
               lt=importlib.util.module_from_spec(spec); spec.loader.exec_module(lt)
@@ -86,7 +91,8 @@ jobs:
               with open('/tmp/k3d7-lossless/trunk.bin','r+b') as f:
                   f.seek(int(b['file_offset'])); f.write(payload)
                   f.write(b'\0'*(int(b['stored_nbytes'])-len(payload)))
-              b['codec']='dict7'; b['encoded_nbytes']=len(payload); b['dict']=dictionary; b['escapes']=escapes
+              b['codec']='dict7'; b['encoded_nbytes']=len(payload)
+              b['dict']=dictionary; b['escapes']=escapes
               manifest.write_text(json.dumps(x,indent=2)+'\n')
               codecs=[bb['codec'] for L in x['layers'] for bb in L['blocks']]
           assert 'dict7' in codecs
@@ -103,17 +109,3 @@ jobs:
           assert a['full_ids']==b['full_ids']
           print('ADAPTIVE DICT7 END-TO-END TOKEN PARITY PASS')
           PY
-
-      - name: Persist validated implementation
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/io/k3_codec.h src/io/k3_trunk.h src/io/k3_trunk.c tools/lossless_trunk.py tests/unit/test_trunk_codec.c
-          git commit -m 'perf: add adaptive fixed-3-bit dict7 lossless trunk codec'
-          rm tools/patch_dict7_lossless.py
-          git add -A
-          git commit -m 'ci: keep dict7 lossless parity and throughput gates'
-          git fetch origin "${{ github.ref_name }}"
-          git rebase "origin/${{ github.ref_name }}"
-          git push origin HEAD:${{ github.ref_name }}
