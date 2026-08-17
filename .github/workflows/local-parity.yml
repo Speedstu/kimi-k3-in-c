@@ -46,7 +46,11 @@ jobs:
         run: |
           python - <<'PY'
           import tomllib
-          for path in ['local/kimi-code-local.toml.example', 'local/kimi-code-benchmark.toml.example']:
+          expected_outputs = {
+              'local/kimi-code-local.toml.example': 4096,
+              'local/kimi-code-benchmark.toml.example': 98304,
+          }
+          for path, expected_output in expected_outputs.items():
               with open(path, 'rb') as f:
                   cfg = tomllib.load(f)
               provider = cfg['providers']['local-k3']
@@ -54,7 +58,7 @@ jobs:
               assert cfg['thinking']['enabled'] is True
               assert cfg['thinking']['effort'] == 'max'
               assert cfg['thinking']['keep'] == 'all'
-              assert cfg['models'][cfg['default_model']]['max_output_size'] == 4096
+              assert cfg['models'][cfg['default_model']]['max_output_size'] == expected_output
               print(path, 'PASS')
           PY
       - name: Build and sampler unit test

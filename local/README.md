@@ -144,8 +144,11 @@ turns, which is part of the intended K3 multi-turn/tool behavior.
 ### Benchmark profile
 
 `local/kimi-code-benchmark.toml.example` declares the official 1,048,576-token model
-window and uses autonomous permission mode. Use it only inside the disposable environment
-provided by the benchmark:
+window, a 98,304-token maximum output budget for the longest published K3 verifier profile,
+and autonomous permission mode. Use it only inside the disposable environment provided by
+the benchmark. Start the resident server with a `--worker-context` large enough for the
+rendered prompt plus that output ceiling; the bridge refuses undersized contexts rather
+than silently truncating reasoning:
 
 ```bash
 export KIMI_CODE_HOME="$PWD/.kimi-code-bench"
