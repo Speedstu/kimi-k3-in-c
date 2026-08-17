@@ -1,0 +1,7 @@
+# Install PyTorch separately for the target CPU/CUDA platform first.
+# K3's released config declares transformers_version 4.56.2; pin it for parity.
+transformers==4.56.2
+safetensors>=0.5
+numpy>=1.26
+Pillow>=10
+tiktoken>=0.9
