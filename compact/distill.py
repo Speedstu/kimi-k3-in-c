@@ -183,12 +183,14 @@ def specialist_distill_loss(
     teacher_chosen_logp: Tensor,
     teacher_rejected_logp: Tensor,
     pair_weight: Tensor | None = None,
-    weights: DistillWeights = DistillWeights(),
+    weights: DistillWeights | None = None,
     logit_temperature: float = 2.0,
     router_temperature: float = 1.0,
     margin_over_teacher: float = 0.25,
 ) -> dict[str, Tensor]:
     """Return named losses plus their weighted total for logging/training."""
+    if weights is None:
+        weights = DistillWeights()
     l_logits = logit_kl_loss(
         student_logits, teacher_logits, mask=token_mask, temperature=logit_temperature
     )
