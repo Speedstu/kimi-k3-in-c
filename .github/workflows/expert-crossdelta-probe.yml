@@ -1,0 +1,45 @@
+name: Expert cross-delta probe
+
+on:
+  push:
+    branches: [speedboost/expert-crossdelta-probe]
+    paths:
+      - 'benchmarks/probe_remote_expert_crossdelta.py'
+      - '.github/workflows/expert-crossdelta-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install range-probe dependency
+        run: python -m pip install --quiet requests
+      - name: Fetch only small ranges from released K3 experts
+        run: |
+          set -euo pipefail
+          python benchmarks/probe_remote_expert_crossdelta.py \
+            --repo moonshotai/Kimi-K3 --revision main \
+            --sample-mib 2 --experts 8 \
+            --json-out /tmp/expert-crossdelta.json \
+            | tee /tmp/expert-crossdelta.log
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/expert-crossdelta.json'))
+          assert x['pair_count'] >= 7
+          assert x['sample_bytes_per_expert'] <= 2*1024*1024
+          print('REMOTE RANGE PROBE COMPLETE; promising=',x['promising_for_larger_exact_probe'])
+          PY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: expert-crossdelta-probe
+          path: |
+            /tmp/expert-crossdelta.json
+            /tmp/expert-crossdelta.log
