@@ -204,7 +204,7 @@ int main(void)
 #ifdef _OPENMP
     printf("threads=%d\n", omp_get_max_threads());
 #endif
-    for (int b = 2; b <= 8; b *= 2) {
+    for (int b = 2; b <= 8; b++) {
         rng_state = 0x31415926u + (uint32_t)b;
         if (bench_pair(b)) return 1;
         rng_state = 0x27182818u + (uint32_t)b;
