@@ -260,6 +260,10 @@ static void worker_usage(FILE *f)
         "\n"
         "stdin protocol (ASCII whitespace separated):\n"
         "  REQ id n_prompt max_tokens temperature top_p seed stop_id <n_prompt ids...>\n"
+        "  REQMM id n_prompt max_tokens temperature top_p seed stop_id placeholder "
+        "FEATURE_FILE <n_prompt ids...>\n"
+        "    FEATURE_FILE: K3MMF1 little-endian projected media rows; REQMM always "
+        "re-prefills the full merged sequence\n"
         "  RESET\n  PING\n  QUIT\n"
         "\n"
         "stdout protocol:\n"
@@ -319,6 +323,130 @@ static int worker_prefill_to(Weights *w, WorkerVM *kv, WorkerVM *rope,
         w->cached = base + n;
     }
     return 0;
+}
+
+/* Same recurrent/KV path as worker_prefill_to, but the first-layer rows are already in
+ * K3 hidden space.  This is precisely where the official K3 implementation enters the
+ * language model after MoonViT + mm_projector + placeholder expansion. */
+static int worker_prefill_embeds_to(Weights *w, WorkerVM *kv, WorkerVM *rope,
+                                    const K3Cfg *c, K3Cache *cache,
+                                    const float *embeds, int target, int chunk,
+                                    float *lg, float *sc, float *h, float *br, float *ks)
+{
+    if (!w || !embeds || w->cached < 0 || w->cached >= target || chunk < 1) return -1;
+    while (w->cached < target) {
+        const int base = w->cached;
+        int n = target - base;
+        if (n > chunk) n = chunk;
+        w->input_embeds = embeds + (size_t)base * c->hidden;
+        const int rc = worker_forward(w, kv, rope, c, cache, NULL, n,
+                                      lg, sc, h, br, ks, NULL, NULL);
+        w->input_embeds = NULL;
+        if (rc != 0) return -1;
+        w->cached = base + n;
+    }
+    return 0;
+}
+
+/* REQMM feature sidecar.  Text token embeddings remain owned by C; the sidecar contains
+ * only projected image rows, already rounded to the exact dtype used by the official
+ * vision/projector path and serialized as their exact float32 values. */
+typedef struct {
+    float **image;
+    int *length;
+    int nimage;
+} WorkerMedia;
+
+static void worker_media_free(WorkerMedia *m)
+{
+    if (!m) return;
+    for (int i = 0; i < m->nimage; i++) free(m->image ? m->image[i] : NULL);
+    free(m->image); free(m->length);
+    memset(m, 0, sizeof *m);
+}
+
+static int worker_read_u32le(FILE *f, uint32_t *out)
+{
+    unsigned char b[4];
+    if (fread(b, 1, 4, f) != 4) return -1;
+    *out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return 0;
+}
+
+static int worker_media_load(const char *path, int hidden, int context, WorkerMedia *m)
+{
+    memset(m, 0, sizeof *m);
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    unsigned char magic[8]; uint32_t version = 0, h = 0, ni = 0, reserved = 0;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "K3MMF1\0", 7) != 0 ||
+        worker_read_u32le(f, &version) || worker_read_u32le(f, &h) ||
+        worker_read_u32le(f, &ni) || worker_read_u32le(f, &reserved) ||
+        version != 1 || h != (uint32_t)hidden || ni == 0 || ni > (uint32_t)context) {
+        fclose(f); return -1;
+    }
+    (void)reserved;
+    m->nimage = (int)ni;
+    m->image = (float **)calloc((size_t)m->nimage, sizeof(float *));
+    m->length = (int *)calloc((size_t)m->nimage, sizeof(int));
+    if (!m->image || !m->length) { fclose(f); worker_media_free(m); return -1; }
+    size_t total_rows = 0;
+    for (int i = 0; i < m->nimage; i++) {
+        uint32_t nr = 0;
+        if (worker_read_u32le(f, &nr) || nr == 0 || nr > (uint32_t)context ||
+            total_rows > (size_t)context - nr ||
+            (size_t)nr > SIZE_MAX / (size_t)hidden ||
+            (size_t)nr * (size_t)hidden > SIZE_MAX / sizeof(float)) {
+            fclose(f); worker_media_free(m); return -1;
+        }
+        total_rows += nr;
+        m->length[i] = (int)nr;
+        const size_t nf = (size_t)nr * (size_t)hidden;
+        m->image[i] = (float *)malloc(nf * sizeof(float));
+        if (!m->image[i] || fread(m->image[i], sizeof(float), nf, f) != nf) {
+            fclose(f); worker_media_free(m); return -1;
+        }
+    }
+    if (fgetc(f) != EOF) { fclose(f); worker_media_free(m); return -1; }
+    fclose(f);
+    return 0;
+}
+
+static float *worker_merge_media(const Weights *w, const K3Cfg *c,
+                                 const int *ids, int np, int placeholder,
+                                 const WorkerMedia *m, int context, int *nout)
+{
+    int found = 0; size_t rows = 0;
+    for (int i = 0; i < np; i++) {
+        if (ids[i] == placeholder) {
+            if (found >= m->nimage) return NULL;
+            if (rows > (size_t)context - (size_t)m->length[found]) return NULL;
+            rows += (size_t)m->length[found++];
+        } else {
+            if (rows >= (size_t)context) return NULL;
+            rows++;
+        }
+    }
+    if (found != m->nimage || rows == 0 || rows > (size_t)context ||
+        rows > SIZE_MAX / (size_t)c->hidden ||
+        rows * (size_t)c->hidden > SIZE_MAX / sizeof(float)) return NULL;
+    float *out = (float *)malloc(rows * (size_t)c->hidden * sizeof(float));
+    if (!out) return NULL;
+    size_t p = 0; int im = 0;
+    for (int i = 0; i < np; i++) {
+        if (ids[i] == placeholder) {
+            const size_t nf = (size_t)m->length[im] * c->hidden;
+            memcpy(out + p * (size_t)c->hidden, m->image[im], nf * sizeof(float));
+            p += (size_t)m->length[im++];
+        } else {
+            k3_embed_row(out + p * (size_t)c->hidden, w->mb.embed, w->mb.wdt,
+                         ids[i], c->hidden);
+            p++;
+        }
+    }
+    *nout = (int)rows;
+    return out;
 }
 
 int main(int argc, char **argv)
@@ -565,24 +693,31 @@ int main(int argc, char **argv)
             continue;
         }
         if (!strcmp(op, "QUIT")) { printf("@K3BYE\n"); break; }
-        if (strcmp(op, "REQ")) {
+        const int is_mm = !strcmp(op, "REQMM");
+        if (strcmp(op, "REQ") && !is_mm) {
             fprintf(stderr, "worker: unknown protocol opcode '%s'\n", op);
             break;
         }
 
         unsigned long long rid = 0, seed = 1;
-        int np = 0, gen = 0, stop_id = -1;
+        int np = 0, gen = 0, stop_id = -1, media_placeholder = -1;
+        char media_path[4096]; media_path[0] = 0;
         double temperature = 0.0, top_p = 1.0;
         if (scanf("%llu%d%d%lf%lf%llu%d", &rid, &np, &gen, &temperature,
                   &top_p, &seed, &stop_id) != 7) {
-            fprintf(stderr, "worker: truncated REQ header\n");
+            fprintf(stderr, "worker: truncated request header\n");
+            break;
+        }
+        if (is_mm && scanf("%d%4095s", &media_placeholder, media_path) != 2) {
+            fprintf(stderr, "worker: truncated REQMM media header\n");
             break;
         }
         int bad = 0;
-        if (np <= 0 || gen <= 0 || np + gen > context) bad = 1;
+        if (np <= 0 || gen <= 0 || (!is_mm && np + gen > context)) bad = 1;
         if (!isfinite(temperature) || temperature < 0.0 ||
             !isfinite(top_p) || top_p <= 0.0 || top_p > 1.0) bad = 1;
         if (stop_id < -1 || stop_id >= c.vocab || np > context) bad = 1;
+        if (is_mm && (media_placeholder < 0 || media_placeholder >= c.vocab)) bad = 1;
         for (int i = 0; i < np; i++) {
             long id;
             if (scanf("%ld", &id) != 1) {
@@ -592,9 +727,30 @@ int main(int argc, char **argv)
             if (id < 0 || id >= c.vocab) bad = 1;
             req[i] = (int)id;
         }
-        if (bad) { printf("@K3ERROR %llu 2\n", rid); continue; }
 
-        const int reuse_tokens = (history_len > 0 && np >= history_len &&
+        float *mixed_embeds = NULL;
+        int prompt_positions = np;
+        if (is_mm && !bad) {
+            WorkerMedia media;
+            if (worker_media_load(media_path, c.hidden, context, &media) != 0) {
+                bad = 1;
+            } else {
+                mixed_embeds = worker_merge_media(&w, &c, req, np, media_placeholder,
+                                                  &media, context, &prompt_positions);
+                worker_media_free(&media);
+                if (!mixed_embeds || prompt_positions + gen > context) bad = 1;
+            }
+        }
+        if (bad) {
+            free(mixed_embeds);
+            printf("@K3ERROR %llu 2\n", rid);
+            continue;
+        }
+
+        /* Media occupies a variable number of language-model positions, so token-prefix
+         * identity is not sufficient to reuse recurrent/KV state.  Re-prefill REQMM
+         * exactly; ordinary text REQ retains the existing warm-prefix optimization. */
+        const int reuse_tokens = (!is_mm && history_len > 0 && np >= history_len &&
                                   memcmp(req, seq, (size_t)history_len * sizeof(int)) == 0)
                                  ? history_len : 0;
         if (!reuse_tokens) {
@@ -606,8 +762,9 @@ int main(int argc, char **argv)
             }
             history_len = 0;
         }
-        memcpy(seq, req, (size_t)np * sizeof(int));
-        int T = np, nout = 0, failed = 0, stop_hit = 0;
+        if (is_mm) memset(seq, 0, (size_t)prompt_positions * sizeof(int));
+        else memcpy(seq, req, (size_t)np * sizeof(int));
+        int T = prompt_positions, nout = 0, failed = 0, stop_hit = 0;
         K3Sampler sampler, draft_sampler, accept_sampler;
         k3_sampler_init(&sampler, temperature, top_p, (uint64_t)seed);
         k3_sampler_init(&draft_sampler, temperature, top_p,
@@ -623,8 +780,17 @@ int main(int argc, char **argv)
          * intentionally trails the visible history by one emitted token between calls,
          * so this includes that pending token plus the new XTML/tool suffix. */
         int first_tok = -1;
-        if (w.cached >= np || worker_prefill_to(&w, &w_kv_mem, &w_rope_mem, &c, &cache,
-                                                  seq, np, prefill_cap, lg, sc, h, br, ks) != 0) {
+        int prefill_rc;
+        if (is_mm)
+            prefill_rc = (w.cached >= prompt_positions) ? -1 :
+                worker_prefill_embeds_to(&w, &w_kv_mem, &w_rope_mem, &c, &cache,
+                                         mixed_embeds, prompt_positions, prefill_cap,
+                                         lg, sc, h, br, ks);
+        else
+            prefill_rc = (w.cached >= np) ? -1 :
+                worker_prefill_to(&w, &w_kv_mem, &w_rope_mem, &c, &cache,
+                                  seq, np, prefill_cap, lg, sc, h, br, ks);
+        if (prefill_rc != 0) {
             failed = 1;
         } else {
             /* IMPORTANT: sample from exact logits NOW. Draft prefill reuses `lg` and
@@ -635,11 +801,20 @@ int main(int argc, char **argv)
             if (first_tok < 0) failed = 1;
         }
         if (draft_dir && !failed) {
-            if (dw.cached >= np || worker_prefill_to(&dw, &d_kv_mem, &d_rope_mem, &c, &cache,
-                                                     seq, np, prefill_cap, lg, sc, h, br, dks) != 0) {
-                failed = 1;
-            }
+            int draft_prefill_rc;
+            if (is_mm)
+                draft_prefill_rc = (dw.cached >= prompt_positions) ? -1 :
+                    worker_prefill_embeds_to(&dw, &d_kv_mem, &d_rope_mem, &c, &cache,
+                                             mixed_embeds, prompt_positions, prefill_cap,
+                                             lg, sc, h, br, dks);
+            else
+                draft_prefill_rc = (dw.cached >= np) ? -1 :
+                    worker_prefill_to(&dw, &d_kv_mem, &d_rope_mem, &c, &cache,
+                                      seq, np, prefill_cap, lg, sc, h, br, dks);
+            if (draft_prefill_rc != 0) failed = 1;
         }
+        free(mixed_embeds);
+        mixed_embeds = NULL;
 
         /* Commit only after both prefills succeed, but the token itself was sampled from
          * the exact logits before the draft was allowed to overwrite the shared buffer. */
@@ -670,7 +845,7 @@ int main(int argc, char **argv)
              * proposal/accept RNG draws and breaks same-seed parity even though the
              * marginal target distribution stays correct. Use the request-local horizon
              * here too; the worker's larger resident context is not generation budget. */
-            const int request_tmax = np + gen + 1;
+            const int request_tmax = prompt_positions + gen + 1;
             int request_spec_n = spec_n;
             if (temperature > 0.0 && request_spec_n > K3_SPEC_SAMPLE_MAX)
                 request_spec_n = K3_SPEC_SAMPLE_MAX;
