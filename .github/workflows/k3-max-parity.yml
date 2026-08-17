@@ -24,7 +24,7 @@ jobs:
       - name: Bridge/profile/score gates
         run: |
           set -euo pipefail
-          python -m pip install --quiet ruff
+          python -m pip install --quiet ruff numpy
           ruff check local/ tests/python/ benchmarks/k3_score_gate.py --output-format=github
           python -m unittest discover -s tests/python -p 'test_*.py' -v
           cp benchmarks/k3_max_reference.json /tmp/measured.json
