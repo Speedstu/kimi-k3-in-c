@@ -1,0 +1,45 @@
+name: Dict ladder released-K3 range probe
+
+on:
+  push:
+    branches: [speedboost/adaptive-dict-ladder-probe]
+    paths:
+      - 'benchmarks/probe_remote_bf16_dict_ladder.py'
+      - '.github/workflows/dict-ladder-range-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: python -m pip install --quiet requests
+      - name: Range-sample released K3 BF16 tensors
+        run: |
+          set -euo pipefail
+          python benchmarks/probe_remote_bf16_dict_ladder.py \
+            --repo moonshotai/Kimi-K3 --revision main \
+            --samples 24 --sample-mib 4 \
+            --json-out /tmp/dict-ladder.json \
+            | tee /tmp/dict-ladder.log
+          python - <<'PY'
+          import json
+          x=json.load(open('/tmp/dict-ladder.json'))
+          assert x['sample_count'] >= 8
+          assert 0 < x['adaptive_median_ratio'] <= 1.0
+          print('DICT LADDER RESULT',x['median_ratios'],x['adaptive_median_ratio'],x['winner_counts'])
+          PY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dict-ladder-released-k3-range-probe
+          path: |
+            /tmp/dict-ladder.json
+            /tmp/dict-ladder.log
