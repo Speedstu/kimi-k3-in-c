@@ -1,0 +1,9 @@
+{
+  "runtime_exactness": "validated_in_github_actions",
+  "greedy_spec32": "validated_exact",
+  "sampled_spec": "seeded_cap8_parity_validated",
+  "resident_output_over_4096": "validated",
+  "public_k3_max_profile": "pinned",
+  "full_checkpoint_scores": "requires_self_hosted_full_checkpoint_run",
+  "vision": "not_implemented_fail_closed"
+}
